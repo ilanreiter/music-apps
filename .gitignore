@@ -1,0 +1,29 @@
+# Node.js
+node_modules/
+dist/
+build/
+.env
+
+# macOS
+.DS_Store
+
+# Linux
+.Trash-*-*/
+
+# VS Code
+.vscode/
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# IDEs and other
+.idea/
+.project
+.classpath
+.cproject
+*.swp
+.bak
+*.tmp
