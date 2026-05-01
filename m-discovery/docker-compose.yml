@@ -10,6 +10,7 @@ services:
       DB_HOST: 192.168.0.236
       DB_PORT: 5432
       DB_NAME: music
+      GOOGLE_API_KEY: your_google_api_key_here
     ports:
       - "8001:8000"
     # volumes:

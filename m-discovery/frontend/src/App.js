@@ -101,12 +101,16 @@ function App() {
             </div>
             <div className="form-group">
               <label htmlFor="complexity">Complexity:</label>
-              <input
-                type="text"
+              <select
                 id="complexity"
                 value={complexity}
                 onChange={(e) => setComplexity(e.target.value)}
-              />
+              >
+                <option value="">Select Complexity</option>
+                <option value="low">Low</option>
+                <option value="medium">Medium</option>
+                <option value="high">High</option>
+              </select>
             </div>
             <button type="submit" disabled={loading}>
               {loading ? 'Discovering...' : 'Discover!'}
