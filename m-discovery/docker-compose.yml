@@ -1,0 +1,35 @@
+version: '3.8'
+
+services:
+  db:
+    image: postgres:13
+    environment:
+      POSTGRES_DB: music_discovery
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432" # Expose port for local access if needed
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U user -d music_discovery"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  app:
+    build: .
+    command: bash -c "while ! pg_isready -h db -p 5432 -U user -d music_discovery; do echo 'Waiting for db...'; sleep 1; done; python src/database.py && python src/main.py" # Run database setup then main app
+    environment:
+      DB_USER: user
+      DB_PASSWORD: password
+      DB_HOST: db # This must match the service name of the database container
+      DB_PORT: 5432
+      DB_NAME: music_discovery
+    depends_on:
+      - db
+    # volumes:
+    #   - .:/app # Mount the current directory into the container for live development
+    
+volumes:
+  db_data:
