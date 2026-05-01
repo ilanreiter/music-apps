@@ -61,7 +61,7 @@ docker-compose run app python src/discovery.py --seed "Blue in Green" --mood "me
 To run the Web UI (after Phase 3 implementation):
 1. Start the backend API service.
 2. Start the frontend development server or serve static files.
-3. Access the UI in your web browser (e.g., http://localhost:3000).
+3. Access the UI in your web browser (e.g., http://localhost:6000).
 
 🐳 Docker Setup
 To get started with Docker:
