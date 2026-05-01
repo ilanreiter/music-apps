@@ -7,7 +7,7 @@ A personalized music recommendation engine powered by Gemini 1.5 Pro. This tool 
 •	Self-Hosted Integration: Keep your "source of truth" for music taste in your own infrastructure.
 🏗️ System Architecture
 1. Data Layer (PostgreSQL)
-The app interacts with a local PostgreSQL database, typically run as a Docker container, to track what you already know.
+The app interacts with an external PostgreSQL database to track what you already know.
 -- Track your existing library
 CREATE TABLE known_tracks (
     id SERIAL PRIMARY KEY,
@@ -48,17 +48,18 @@ docker-compose run app python src/discovery.py --seed "Blue in Green" --mood "me
 🐳 Docker Setup
 To get started with Docker:
 1. Ensure Docker is installed and running on your system.
-2. Build and run the services:
+2. Configure your external PostgreSQL database connection details in the `docker-compose.yml` file under the `app` service's `environment` section.
+3. Build and run the application service:
    ```bash
-   docker-compose up --build -d
+   docker-compose up --build -d app
    ```
-   This will start the PostgreSQL database and the application container in the background.
-3. To run CLI commands (e.g., for initial database setup or running the main script):
+   This will build and start the application container, connecting to your external PostgreSQL database.
+4. To run CLI commands (e.g., for initial database setup or running the main script):
    ```bash
    docker-compose run app python src/database.py
    docker-compose run app python src/main.py
    ```
-4. To stop the services:
+5. To stop the application service:
    ```bash
    docker-compose down
    ```
@@ -68,7 +69,7 @@ To run this project, you will need:
 •	Google AI API Key (for Gemini)
 •	Spotify Developer Credentials (Client ID/Secret)
 •	YouTube Data API v3 (or ytmusicapi headers)
-•	PostgreSQL Connection String (managed via `docker-compose.yml` environment variables for the `db` service)
+•	PostgreSQL Connection Details (Host, Port, User, Password, Database Name - configured via `docker-compose.yml` environment variables for the `app` service)
 💡 Implementation Notes
 •	High-Fi Priority: Since the system uses Gemini, you can explicitly instruct the model to prefer "audiophile-grade" recordings or specific production styles common in your current collection.
 •	Filtering Logic: Because your library is large, the app will perform a Local Exclusion (comparing Gemini's output to your DB) rather than sending 100,000 track titles in the LLM prompt.
