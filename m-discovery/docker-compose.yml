@@ -3,12 +3,23 @@ version: '3.8'
 services:
   app:
     build: .
-    command: bash -c "python src/database.py && python src/main.py" # Run database setup then main app
+    command: uvicorn src.main:app --host 0.0.0.0 --port 8000
     environment:
       DB_USER: ilan
       DB_PASSWORD: ayelet90
       DB_HOST: 192.168.0.236
       DB_PORT: 5432
       DB_NAME: music
+    ports:
+      - "8001:8000"
     # volumes:
     #   - .:/app # Mount the current directory into the container for live development
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "3000:80"
+    depends_on:
+      - app
