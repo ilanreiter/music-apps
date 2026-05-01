@@ -5,6 +5,7 @@ A personalized music recommendation engine powered by Gemini 1.5 Pro. This tool 
 •	Fine-Tuned Control: Use parameters (mood, tempo, genre) to guide the LLM's "musicologist" logic.
 •	Cross-Platform: Generate playlists that can be synced to Spotify and YouTube Music.
 •	Self-Hosted Integration: Keep your "source of truth" for music taste in your own infrastructure.
+•	Web UI: Provide a modern and slick web interface for ongoing operation.
 🏗️ System Architecture
 1. Data Layer (PostgreSQL)
 The app interacts with an external PostgreSQL database to track what you already know.
@@ -27,23 +28,40 @@ CREATE TABLE discovery_history (
     track_list JSONB
 );
 
-2. The Gemini Engine
-The CLI translates your "sliders" into a descriptive prompt.
+2. Backend API (Python/FastAPI)
+A Python API layer built with FastAPI will serve data to the frontend, interacting with the database and the Gemini Engine.
+
+3. The Gemini Engine
+The CLI/API translates your "sliders" into a descriptive prompt.
 •	Input: A seed track + mood (0-100), tempo (BPM), complexity (low-high).
 •	Process: Gemini receives the seed and parameters, generates a candidate list, and the app cross-references this against your known_tracks table.
 •	Output: A curated JSON list of 10-20 tracks you haven't heard before.
+
+4. Frontend (React Application)
+A modern and slick web UI built with React, utilizing Material Design principles for an intuitive user experience.
+
 🚀 Development Phases
 Phase 1: Core CLI & Database Integration
-•	[ ] DB Connector: Python script to query the local Postgres instance.
+•	[x] DB Connector: Python script to query the local Postgres instance.
 •	[ ] Prompt Builder: Logic to convert numerical sliders into natural language descriptions (e.g., 70% Energy becomes "High-energy, driving rhythm").
 •	[ ] The "Known Filter": A post-processing step that removes any Gemini suggestions found in your DB.
 Phase 2: Streaming API Integration
 •	[ ] Spotify/YT Music Auth: Implement OAuth2 flows for account access.
 •	[ ] Library Sync: Script to pull your "Liked Songs" and playlists into the known_tracks table.
 •	[ ] Playlist Uploader: Automate the creation of a "Gemini Discovery [Date]" playlist on your chosen platform.
+Phase 3: Web UI Development
+•	[ ] Backend API: Implement FastAPI endpoints for known tracks, discovery history, and music discovery.
+•	[ ] Frontend Setup: Create a React project with routing and basic layout.
+•	[ ] UI Components: Develop components for displaying tracks, history, and discovery controls.
+•	[ ] API Integration: Connect frontend components to the backend API.
 🛠️ Usage Example (Concept)
 To run the application using Docker Compose:
 docker-compose run app python src/discovery.py --seed "Blue in Green" --mood "melancholy" --tempo 60 --exclude-known
+
+To run the Web UI (after Phase 3 implementation):
+1. Start the backend API service.
+2. Start the frontend development server or serve static files.
+3. Access the UI in your web browser (e.g., http://localhost:3000).
 
 🐳 Docker Setup
 To get started with Docker:
