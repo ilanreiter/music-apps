@@ -33,7 +33,7 @@ A Python API layer built with FastAPI will serve data to the frontend, interacti
 
 3. The Gemini Engine
 The CLI/API translates your "sliders" into a descriptive prompt.
-•	Input: A seed track + mood (0-100), tempo (BPM), complexity (low-high).
+•	Input: A seed track + mood (free-text, e.g., "melancholy", "energetic"), tempo (BPM, numerical), complexity (low-high, discrete values).
 •	Process: Gemini receives the seed and parameters, generates a candidate list, and the app cross-references this against your known_tracks table.
 •	Output: A curated JSON list of 10-20 tracks you haven't heard before.
 
