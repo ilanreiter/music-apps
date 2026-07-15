@@ -39,6 +39,28 @@ def create_tables():
             """)
             print("Table 'known_tracks' checked/created successfully.")
 
+            # Migrate known_tracks for local library ingestion: add tag/file columns.
+            # The same track_name+artist_name can legitimately appear on multiple
+            # files (compilations, live versions), so file_path replaces it as the
+            # identity for scanned rows; the old constraint is dropped accordingly.
+            cur.execute("""
+                ALTER TABLE known_tracks
+                    ADD COLUMN IF NOT EXISTS file_path TEXT,
+                    ADD COLUMN IF NOT EXISTS genre TEXT,
+                    ADD COLUMN IF NOT EXISTS year INTEGER,
+                    ADD COLUMN IF NOT EXISTS duration_seconds INTEGER,
+                    ADD COLUMN IF NOT EXISTS date_added TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
+            """)
+            cur.execute("""
+                ALTER TABLE known_tracks
+                    DROP CONSTRAINT IF EXISTS known_tracks_track_name_artist_name_key;
+            """)
+            cur.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS known_tracks_file_path_idx
+                    ON known_tracks (file_path) WHERE file_path IS NOT NULL;
+            """)
+            print("Table 'known_tracks' migrated for library scanning.")
+
             # Create discovery_history table
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS discovery_history (

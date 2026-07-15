@@ -1,42 +1,224 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import axios from 'axios';
 import './App.css';
 
+const LIBRARY_PAGE_SIZE = 100;
+const GROUP_QUEUE_LIMIT = 500;
+const VIEW_MODES = ['all', 'album', 'genre', 'decade'];
+
+function shuffleArray(arr) {
+  const copy = [...arr];
+  for (let i = copy.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [copy[i], copy[j]] = [copy[j], copy[i]];
+  }
+  return copy;
+}
+
 function App() {
-  const [knownTracks, setKnownTracks] = useState([]);
-  const [discoveryHistory, setDiscoveryHistory] = useState([]);
   const [discoveredTracks, setDiscoveredTracks] = useState([]);
-  const [seedTrack, setSeedTrack] = useState('');
+
+  const [seedTracks, setSeedTracks] = useState('');
+  const [genre, setGenre] = useState('');
   const [mood, setMood] = useState('');
   const [tempo, setTempo] = useState('');
-  const [complexity, setComplexity] = '';
+  const [complexity, setComplexity] = useState('');
+
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
+  const [activeTab, setActiveTab] = useState('discover');
 
-  const API_BASE_URL = '/api'; // Nginx will proxy /api to the backend
+  const [rootPath, setRootPath] = useState('');
+  const [scanning, setScanning] = useState(false);
+  const [scanResult, setScanResult] = useState(null);
+  const [scanError, setScanError] = useState(null);
+  const [stats, setStats] = useState(null);
+  const [statsLoading, setStatsLoading] = useState(false);
+  const pollRef = useRef(null);
+
+  // Library browsing: flat search/filter or grouped-by-album/genre/decade with drill-down
+  const [libraryMode, setLibraryMode] = useState('all');
+  const [drill, setDrill] = useState(null); // { by, key, label } once a group is opened
+  const [searchInput, setSearchInput] = useState('');
+  const [search, setSearch] = useState('');
+  const [filterGenre, setFilterGenre] = useState('');
+  const [filterDecade, setFilterDecade] = useState('');
+  const [genreOptions, setGenreOptions] = useState([]);
+  const [decadeOptions, setDecadeOptions] = useState([]);
+  const [groups, setGroups] = useState([]);
+  const [groupsLoading, setGroupsLoading] = useState(false);
+  const [libraryTracks, setLibraryTracks] = useState([]);
+  const [libraryTotal, setLibraryTotal] = useState(0);
+  const [libraryLoading, setLibraryLoading] = useState(false);
+
+  // Playback
+  const [queue, setQueue] = useState([]);
+  const [history, setHistory] = useState([]);
+  const [nowPlaying, setNowPlaying] = useState(null);
+  const [isPlaying, setIsPlaying] = useState(false);
+  const audioRef = useRef(null);
+
+  const API_BASE_URL = process.env.REACT_APP_API_URL || '/api';
 
   useEffect(() => {
-    fetchKnownTracks();
-    fetchDiscoveryHistory();
+    resumeScanIfRunning();
+    return () => {
+      if (pollRef.current) clearInterval(pollRef.current);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const fetchKnownTracks = async () => {
+  useEffect(() => {
+    if (activeTab === 'taste' && !stats) {
+      fetchStats();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeTab]);
+
+  // Debounce free-text search so we're not hitting the API on every keystroke.
+  useEffect(() => {
+    const t = setTimeout(() => setSearch(searchInput.trim()), 400);
+    return () => clearTimeout(t);
+  }, [searchInput]);
+
+  useEffect(() => {
+    if (activeTab !== 'library') return;
+    if (drill || libraryMode === 'all') {
+      fetchLibraryTracks(0);
+    } else {
+      fetchGroups();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeTab, libraryMode, drill, search, filterGenre, filterDecade]);
+
+  useEffect(() => {
+    if (activeTab !== 'library') return;
+    if (genreOptions.length === 0) {
+      axios.get(`${API_BASE_URL}/library/groups`, { params: { by: 'genre' } })
+        .then((r) => setGenreOptions(r.data))
+        .catch((err) => console.error('Error fetching genres:', err));
+    }
+    if (decadeOptions.length === 0) {
+      axios.get(`${API_BASE_URL}/library/groups`, { params: { by: 'decade' } })
+        .then((r) => setDecadeOptions(r.data))
+        .catch((err) => console.error('Error fetching decades:', err));
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeTab]);
+
+  const buildTrackFilterParams = () => {
+    const params = {};
+    if (search) params.search = search;
+    if (drill) {
+      if (drill.by === 'genre') params.genre = drill.key;
+      else if (drill.by === 'decade') params.decade = Number(drill.key);
+      else if (drill.by === 'album') {
+        const [artist, album] = drill.key.split('||');
+        params.artist = artist;
+        params.album = album;
+      }
+    } else if (libraryMode === 'all') {
+      if (filterGenre) params.genre = filterGenre;
+      if (filterDecade) params.decade = Number(filterDecade);
+    }
+    return params;
+  };
+
+  const fetchLibraryTracks = async (offset) => {
+    setLibraryLoading(true);
     try {
-      const response = await axios.get(`${API_BASE_URL}/tracks/known`);
-      setKnownTracks(response.data);
+      const params = { ...buildTrackFilterParams(), limit: LIBRARY_PAGE_SIZE, offset };
+      const response = await axios.get(`${API_BASE_URL}/tracks/known`, { params });
+      setLibraryTotal(response.data.total);
+      setLibraryTracks((prev) => (offset === 0 ? response.data.tracks : [...prev, ...response.data.tracks]));
     } catch (err) {
-      setError('Failed to fetch known tracks.');
-      console.error('Error fetching known tracks:', err);
+      console.error('Error fetching tracks:', err);
+    } finally {
+      setLibraryLoading(false);
     }
   };
 
-  const fetchDiscoveryHistory = async () => {
+  const fetchGroups = async () => {
+    setGroupsLoading(true);
     try {
-      const response = await axios.get(`${API_BASE_URL}/history`);
-      setDiscoveryHistory(response.data);
+      const params = { by: libraryMode };
+      if (search) params.search = search;
+      const response = await axios.get(`${API_BASE_URL}/library/groups`, { params });
+      setGroups(response.data);
     } catch (err) {
-      setError('Failed to fetch discovery history.');
-      console.error('Error fetching discovery history:', err);
+      console.error('Error fetching groups:', err);
+    } finally {
+      setGroupsLoading(false);
+    }
+  };
+
+  const fetchStats = async () => {
+    setStatsLoading(true);
+    try {
+      const response = await axios.get(`${API_BASE_URL}/library/stats`);
+      setStats(response.data);
+    } catch (err) {
+      console.error('Error fetching library stats:', err);
+    } finally {
+      setStatsLoading(false);
+    }
+  };
+
+  const pollScanStatus = () => {
+    if (pollRef.current) clearInterval(pollRef.current);
+    pollRef.current = setInterval(async () => {
+      try {
+        const response = await axios.get(`${API_BASE_URL}/library/scan/status`);
+        const data = response.data;
+        setScanResult(data);
+        if (data.status === 'done' || data.status === 'error') {
+          clearInterval(pollRef.current);
+          pollRef.current = null;
+          setScanning(false);
+          if (data.status === 'error') {
+            setScanError(data.error || 'Scan failed.');
+          } else {
+            setLibraryMode('all');
+            setDrill(null);
+            fetchLibraryTracks(0);
+            fetchStats();
+          }
+        }
+      } catch (err) {
+        clearInterval(pollRef.current);
+        pollRef.current = null;
+        setScanning(false);
+        setScanError('Lost connection while checking scan progress.');
+        console.error('Error checking scan status:', err);
+      }
+    }, 1500);
+  };
+
+  const resumeScanIfRunning = async () => {
+    try {
+      const response = await axios.get(`${API_BASE_URL}/library/scan/status`);
+      if (response.data.status === 'running') {
+        setScanning(true);
+        setScanResult(response.data);
+        pollScanStatus();
+      }
+    } catch (err) {
+      console.error('Error checking scan status:', err);
+    }
+  };
+
+  const handleScan = async (e) => {
+    e.preventDefault();
+    setScanning(true);
+    setScanError(null);
+    setScanResult(null);
+    try {
+      await axios.post(`${API_BASE_URL}/library/scan`, { root_path: rootPath });
+      pollScanStatus();
+    } catch (err) {
+      setScanError(err.response?.data?.detail || 'Failed to start scan. Please check the path and try again.');
+      console.error('Error starting scan:', err);
+      setScanning(false);
     }
   };
 
@@ -44,133 +226,468 @@ function App() {
     e.preventDefault();
     setLoading(true);
     setError(null);
+    setDiscoveredTracks([]);
     try {
       const response = await axios.post(`${API_BASE_URL}/discover`, {
-        seed_track: seedTrack,
+        seed_tracks: seedTracks,
+        genre: genre || null,
         mood: mood || null,
         tempo: tempo ? parseInt(tempo) : null,
         complexity: complexity || null,
-        exclude_known: true, // Always exclude known for now
+        exclude_known: true,
       });
       setDiscoveredTracks(response.data);
-      fetchDiscoveryHistory(); // Refresh history after new discovery
     } catch (err) {
-      setError('Failed to discover music. Please check your input and try again.');
+      setError('Failed to discover music. Please try again.');
       console.error('Error discovering music:', err);
     } finally {
       setLoading(false);
     }
   };
 
+  const startQueue = (tracks, { shuffle = false } = {}) => {
+    if (!tracks || tracks.length === 0) return;
+    const ordered = shuffle ? shuffleArray(tracks) : tracks;
+    setHistory([]);
+    setNowPlaying(ordered[0]);
+    setQueue(ordered.slice(1));
+    setIsPlaying(true);
+  };
+
+  const playTrackFromList = (track, list) => {
+    const index = list.findIndex((t) => t.id === track.id);
+    startQueue(index >= 0 ? list.slice(index) : [track]);
+  };
+
+  const togglePlay = () => {
+    if (!audioRef.current) return;
+    if (audioRef.current.paused) {
+      audioRef.current.play();
+    } else {
+      audioRef.current.pause();
+    }
+  };
+
+  const handleTrackPlayClick = (track, list) => {
+    if (nowPlaying && nowPlaying.id === track.id) {
+      togglePlay();
+    } else {
+      playTrackFromList(track, list);
+    }
+  };
+
+  const handleNext = () => {
+    setQueue((prevQueue) => {
+      if (prevQueue.length === 0) {
+        setIsPlaying(false);
+        return prevQueue;
+      }
+      setHistory((h) => (nowPlaying ? [...h, nowPlaying] : h));
+      setNowPlaying(prevQueue[0]);
+      setIsPlaying(true);
+      return prevQueue.slice(1);
+    });
+  };
+
+  const handlePrev = () => {
+    setHistory((prevHistory) => {
+      if (prevHistory.length === 0) return prevHistory;
+      const last = prevHistory[prevHistory.length - 1];
+      setQueue((q) => (nowPlaying ? [nowPlaying, ...q] : q));
+      setNowPlaying(last);
+      setIsPlaying(true);
+      return prevHistory.slice(0, -1);
+    });
+  };
+
+  const playGroup = async (group, { shuffle = false } = {}) => {
+    try {
+      const params = { limit: GROUP_QUEUE_LIMIT, offset: 0 };
+      if (group.by === 'genre') params.genre = group.key;
+      else if (group.by === 'decade') params.decade = Number(group.key);
+      else if (group.by === 'album') {
+        const [artist, album] = group.key.split('||');
+        params.artist = artist;
+        params.album = album;
+      }
+      const response = await axios.get(`${API_BASE_URL}/tracks/known`, { params });
+      startQueue(response.data.tracks, { shuffle });
+    } catch (err) {
+      console.error('Error queuing group playback:', err);
+    }
+  };
+
+  const viewLabel = (mode) => (mode === 'all' ? 'All Tracks' : `By ${mode.charAt(0).toUpperCase()}${mode.slice(1)}`);
+  const backLabel = drill && (drill.by === 'album' ? 'Albums' : drill.by === 'genre' ? 'Genres' : 'Decades');
+
   return (
-    <div className="App">
-      <header className="App-header">
-        <h1>Gemini Music Discovery</h1>
+    <div className="app">
+      <header className="app-header">
+        <h1>Music Discovery</h1>
+        <nav className="nav-tabs">
+          <button
+            className={activeTab === 'discover' ? 'active' : ''}
+            onClick={() => setActiveTab('discover')}
+          >
+            Discover
+          </button>
+          <button
+            className={activeTab === 'library' ? 'active' : ''}
+            onClick={() => setActiveTab('library')}
+          >
+            My Library
+          </button>
+          <button
+            className={activeTab === 'taste' ? 'active' : ''}
+            onClick={() => setActiveTab('taste')}
+          >
+            Taste Profile
+          </button>
+        </nav>
       </header>
-      <main>
-        <section className="discovery-form-section">
-          <h2>Discover New Music</h2>
-          <form onSubmit={handleDiscoverMusic}>
-            <div className="form-group">
-              <label htmlFor="seedTrack">Seed Track:</label>
+
+      <main className={nowPlaying ? 'with-player' : ''}>
+        {activeTab === 'discover' ? (
+          <section className="discover-section">
+            <form onSubmit={handleDiscoverMusic} className="discovery-form">
+              <div className="form-row">
+                <div className="form-group full">
+                  <label>Seed Tracks (artists, songs, or genres)</label>
+                  <input
+                    type="text"
+                    value={seedTracks}
+                    onChange={(e) => setSeedTracks(e.target.value)}
+                    placeholder="e.g., Metallica, Iron Maiden, Black Sabbath"
+                    required
+                  />
+                </div>
+              </div>
+
+              <div className="form-row">
+                <div className="form-group">
+                  <label>Genre</label>
+                  <select value={genre} onChange={(e) => setGenre(e.target.value)}>
+                    <option value="">Any Genre</option>
+                    <option value="rock">Rock</option>
+                    <option value="metal">Metal</option>
+                    <option value="electronic">Electronic</option>
+                    <option value="jazz">Jazz</option>
+                    <option value="classical">Classical</option>
+                    <option value="hip-hop">Hip-Hop</option>
+                    <option value="pop">Pop</option>
+                    <option value="indie">Indie</option>
+                  </select>
+                </div>
+                <div className="form-group">
+                  <label>Mood</label>
+                  <select value={mood} onChange={(e) => setMood(e.target.value)}>
+                    <option value="">Any Mood</option>
+                    <option value="energetic">Energetic</option>
+                    <option value="melancholic">Melancholic</option>
+                    <option value="uplifting">Uplifting</option>
+                    <option value="dark">Dark</option>
+                    <option value="calm">Calm</option>
+                    <option value="aggressive">Aggressive</option>
+                  </select>
+                </div>
+              </div>
+
+              <div className="form-row">
+                <div className="form-group">
+                  <label>Tempo (BPM)</label>
+                  <input
+                    type="number"
+                    value={tempo}
+                    onChange={(e) => setTempo(e.target.value)}
+                    placeholder="120"
+                  />
+                </div>
+                <div className="form-group">
+                  <label>Complexity</label>
+                  <select value={complexity} onChange={(e) => setComplexity(e.target.value)}>
+                    <option value="">Any</option>
+                    <option value="simple">Simple</option>
+                    <option value="moderate">Moderate</option>
+                    <option value="complex">Complex</option>
+                  </select>
+                </div>
+              </div>
+
+              <button type="submit" disabled={loading} className="discover-btn">
+                {loading ? 'Finding tracks...' : 'Discover'}
+              </button>
+
+              {error && <p className="error-message">{error}</p>}
+            </form>
+
+            {discoveredTracks.length > 0 && (
+              <div className="results">
+                <h2>Recommended Tracks</h2>
+                <div className="tracks-grid">
+                  {discoveredTracks.map((track, index) => (
+                    <div key={index} className="track-card">
+                      <div className="track-number">{index + 1}</div>
+                      <div className="track-info">
+                        <h3>{track.track_name}</h3>
+                        <p className="artist">{track.artist_name}</p>
+                        <p className="album">{track.album_name}</p>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </section>
+        ) : activeTab === 'library' ? (
+          <section className="library-section">
+            <form onSubmit={handleScan} className="scan-form">
+              <div className="form-group full">
+                <label>Library folder</label>
+                <div className="scan-row">
+                  <input
+                    type="text"
+                    value={rootPath}
+                    onChange={(e) => setRootPath(e.target.value)}
+                    placeholder="/music"
+                    required
+                  />
+                  <button type="submit" disabled={scanning} className="scan-btn">
+                    {scanning ? 'Scanning...' : 'Scan Library'}
+                  </button>
+                </div>
+                <p className="hint">Path as seen by the backend container (bind-mounted from MUSIC_LIBRARY_PATH).</p>
+              </div>
+              {scanError && <p className="error-message">{scanError}</p>}
+              {scanResult && scanResult.status !== 'idle' && (
+                <p className="scan-summary">
+                  {scanResult.status === 'running' ? 'Scanning… ' : scanResult.status === 'error' ? 'Scan failed after ' : 'Scan complete — '}
+                  {(scanResult.processed || 0).toLocaleString()} processed &middot; added {scanResult.added || 0} &middot; updated {scanResult.updated || 0}
+                  {scanResult.skipped > 0 ? ` · ${scanResult.skipped} unreadable` : ''}
+                </p>
+              )}
+            </form>
+
+            <div className="library-controls">
               <input
                 type="text"
-                id="seedTrack"
-                value={seedTrack}
-                onChange={(e) => setSeedTrack(e.target.value)}
-                required
+                className="search-input"
+                placeholder="Search tracks, artists, albums…"
+                value={searchInput}
+                onChange={(e) => setSearchInput(e.target.value)}
               />
+              <div className="view-tabs">
+                {VIEW_MODES.map((mode) => (
+                  <button
+                    key={mode}
+                    className={libraryMode === mode && !drill ? 'active' : ''}
+                    onClick={() => { setLibraryMode(mode); setDrill(null); }}
+                  >
+                    {viewLabel(mode)}
+                  </button>
+                ))}
+              </div>
+              {libraryMode === 'all' && !drill && (
+                <div className="filter-row">
+                  <select value={filterGenre} onChange={(e) => setFilterGenre(e.target.value)}>
+                    <option value="">All Genres</option>
+                    {genreOptions.map((g) => <option key={g.key} value={g.key}>{g.label} ({g.count})</option>)}
+                  </select>
+                  <select value={filterDecade} onChange={(e) => setFilterDecade(e.target.value)}>
+                    <option value="">All Decades</option>
+                    {decadeOptions.map((d) => <option key={d.key} value={d.key}>{d.label} ({d.count})</option>)}
+                  </select>
+                </div>
+              )}
             </div>
-            <div className="form-group">
-              <label htmlFor="mood">Mood:</label>
-              <input
-                type="text"
-                id="mood"
-                value={mood}
-                onChange={(e) => setMood(e.target.value)}
-              />
-            </div>
-            <div className="form-group">
-              <label htmlFor="tempo">Tempo (BPM):</label>
-              <input
-                type="number"
-                id="tempo"
-                value={tempo}
-                onChange={(e) => setTempo(e.target.value)}
-              />
-            </div>
-            <div className="form-group">
-              <label htmlFor="complexity">Complexity:</label>
-              <select
-                id="complexity"
-                value={complexity}
-                onChange={(e) => setComplexity(e.target.value)}
-              >
-                <option value="">Select Complexity</option>
-                <option value="low">Low</option>
-                <option value="medium">Medium</option>
-                <option value="high">High</option>
-              </select>
-            </div>
-            <button type="submit" disabled={loading}>
-              {loading ? 'Discovering...' : 'Discover!'}
-            </button>
-            {error && <p className="error-message">{error}</p>}
-          </form>
-        </section>
 
-        <section className="discovered-tracks-section">
-          <h2>Discovered Tracks</h2>
-          {discoveredTracks.length === 0 ? (
-            <p>No tracks discovered yet. Try a search!</p>
-          ) : (
-            <ul>
-              {discoveredTracks.map((track, index) => (
-                <li key={index}>
-                  <strong>{track.track_name}</strong> by {track.artist_name} ({track.album_name})
-                </li>
-              ))}
-            </ul>
-          )}
-        </section>
+            {drill && (
+              <div className="drill-header">
+                <button className="back-btn" onClick={() => setDrill(null)}>&larr; Back to {backLabel}</button>
+                <h2>{drill.label}</h2>
+                <div className="group-actions">
+                  <button className="group-action-btn" onClick={() => playGroup(drill)}>&#9654; Play All</button>
+                  <button className="group-action-btn" onClick={() => playGroup(drill, { shuffle: true })}>&#128256; Shuffle</button>
+                </div>
+              </div>
+            )}
 
-        <section className="known-tracks-section">
-          <h2>Your Known Tracks</h2>
-          {knownTracks.length === 0 ? (
-            <p>No known tracks found. Sync your library to see them here.</p>
-          ) : (
-            <ul>
-              {knownTracks.map((track) => (
-                <li key={track.id}>
-                  <strong>{track.track_name}</strong> by {track.artist_name} ({track.album_name})
-                </li>
-              ))}
-            </ul>
-          )}
-        </section>
+            {drill || libraryMode === 'all' ? (
+              <>
+                <div className="library-header">
+                  <h2>{drill ? '' : 'Your Library'}</h2>
+                  <span className="library-count">{libraryTotal.toLocaleString()} tracks</span>
+                </div>
+                {libraryTracks.length === 0 ? (
+                  <p className="empty-state">
+                    {libraryLoading ? 'Loading…' : 'No tracks found. Scan a folder above to get started.'}
+                  </p>
+                ) : (
+                  <div className="tracks-grid">
+                    {libraryTracks.map((track) => {
+                      const isCurrent = nowPlaying && nowPlaying.id === track.id;
+                      return (
+                        <div key={track.id} className={`track-card${isCurrent ? ' playing' : ''}`}>
+                          <button
+                            className="play-btn"
+                            onClick={() => handleTrackPlayClick(track, libraryTracks)}
+                            aria-label={isCurrent && isPlaying ? 'Pause' : 'Play'}
+                          >
+                            {isCurrent && isPlaying ? '❚❚' : '▶'}
+                          </button>
+                          <div className="track-thumb-wrap">
+                            <span className="track-thumb-fallback">{track.track_name.charAt(0).toUpperCase()}</span>
+                            <img
+                              className="track-thumb"
+                              src={`${API_BASE_URL}/tracks/${track.id}/artwork`}
+                              alt=""
+                              loading="lazy"
+                              onError={(e) => { e.target.style.display = 'none'; }}
+                            />
+                          </div>
+                          <div className="track-info">
+                            <h3>{track.track_name}</h3>
+                            <p className="artist">{track.artist_name}</p>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+                {libraryTracks.length < libraryTotal && (
+                  <button
+                    className="load-more-btn"
+                    disabled={libraryLoading}
+                    onClick={() => fetchLibraryTracks(libraryTracks.length)}
+                  >
+                    {libraryLoading ? 'Loading…' : `Load more (${libraryTracks.length.toLocaleString()} of ${libraryTotal.toLocaleString()})`}
+                  </button>
+                )}
+              </>
+            ) : (
+              <div className="groups-grid">
+                {groupsLoading ? (
+                  <p className="empty-state">Loading…</p>
+                ) : groups.length === 0 ? (
+                  <p className="empty-state">No {libraryMode}s found.</p>
+                ) : (
+                  groups.map((g) => (
+                    <div key={g.key} className="group-card">
+                      <div className="group-card-main" onClick={() => setDrill({ by: libraryMode, key: g.key, label: g.label })}>
+                        <h3>{g.label}</h3>
+                        <span className="group-count">{g.count.toLocaleString()} tracks</span>
+                      </div>
+                      <div className="group-card-actions">
+                        <button title="Play all" onClick={() => playGroup({ by: libraryMode, key: g.key })}>&#9654;</button>
+                        <button title="Shuffle" onClick={() => playGroup({ by: libraryMode, key: g.key }, { shuffle: true })}>&#128256;</button>
+                      </div>
+                    </div>
+                  ))
+                )}
+              </div>
+            )}
+          </section>
+        ) : (
+          <section className="taste-section">
+            {statsLoading && !stats ? (
+              <p className="empty-state">Loading taste profile...</p>
+            ) : !stats || stats.total_tracks === 0 ? (
+              <p className="empty-state">Scan your library to build a taste profile.</p>
+            ) : (
+              <>
+                <div className="stat-tiles">
+                  <div className="stat-tile">
+                    <span className="stat-value">{stats.total_tracks.toLocaleString()}</span>
+                    <span className="stat-label">Tracks</span>
+                  </div>
+                  <div className="stat-tile">
+                    <span className="stat-value">{stats.top_genres.length}</span>
+                    <span className="stat-label">Genres</span>
+                  </div>
+                  <div className="stat-tile">
+                    <span className="stat-value">{stats.top_artists.length}</span>
+                    <span className="stat-label">Top artists</span>
+                  </div>
+                  <div className="stat-tile">
+                    <span className="stat-value">{stats.tracks_by_decade.length}</span>
+                    <span className="stat-label">Decades spanned</span>
+                  </div>
+                </div>
 
-        <section className="discovery-history-section">
-          <h2>Discovery History</h2>
-          {discoveryHistory.length === 0 ? (
-            <p>No discovery history yet.</p>
-          ) : (
-            <ul>
-              {discoveryHistory.map((entry) => (
-                <li key={entry.id}>
-                  <h3>{entry.generated_at} - {entry.prompt_used}</h3>
-                  <ul>
-                    {entry.track_list.map((track, index) => (
-                      <li key={index}>
-                        {track.track_name} by {track.artist_name}
-                      </li>
-                    ))}
-                  </ul>
-                </li>
-              ))}
-            </ul>
-          )}
-        </section>
+                <BarChart title="Top Genres" entries={stats.top_genres} />
+                <BarChart title="Top Artists" entries={stats.top_artists} />
+                <BarChart title="Tracks by Decade" entries={stats.tracks_by_decade} />
+              </>
+            )}
+          </section>
+        )}
       </main>
+
+      <PlayerBar
+        track={nowPlaying}
+        isPlaying={isPlaying}
+        hasNext={queue.length > 0}
+        hasPrev={history.length > 0}
+        onNext={handleNext}
+        onPrev={handlePrev}
+        setIsPlaying={setIsPlaying}
+        audioRef={audioRef}
+        apiBase={API_BASE_URL}
+      />
+    </div>
+  );
+}
+
+function PlayerBar({ track, isPlaying, hasNext, hasPrev, onNext, onPrev, setIsPlaying, audioRef, apiBase }) {
+  if (!track) return null;
+  return (
+    <div className="player-bar">
+      <div className="player-thumb-wrap">
+        <img
+          src={`${apiBase}/tracks/${track.id}/artwork`}
+          alt=""
+          onError={(e) => { e.target.style.display = 'none'; }}
+        />
+      </div>
+      <div className="player-info">
+        <span className="player-title">{track.track_name}</span>
+        <span className="player-artist">{track.artist_name}</span>
+      </div>
+      <div className="player-controls">
+        <button className="player-btn" onClick={onPrev} disabled={!hasPrev} aria-label="Previous">&#9198;</button>
+        <audio
+          key={track.id}
+          ref={audioRef}
+          src={`${apiBase}/tracks/${track.id}/stream`}
+          autoPlay
+          controls
+          className="player-audio"
+          onPlay={() => setIsPlaying(true)}
+          onPause={() => setIsPlaying(false)}
+          onEnded={onNext}
+        />
+        <button className="player-btn" onClick={onNext} disabled={!hasNext} aria-label="Next">&#9197;</button>
+      </div>
+    </div>
+  );
+}
+
+function BarChart({ title, entries }) {
+  if (!entries || entries.length === 0) return null;
+  const max = Math.max(...entries.map((e) => e.count));
+  return (
+    <div className="bar-chart">
+      <h2>{title}</h2>
+      <div className="bar-list">
+        {entries.map((entry) => (
+          <div className="bar-row" key={entry.name}>
+            <span className="bar-label">{entry.name}</span>
+            <div className="bar-track">
+              <div className="bar-fill" style={{ width: `${(entry.count / max) * 100}%` }} />
+            </div>
+            <span className="bar-count">{entry.count.toLocaleString()}</span>
+          </div>
+        ))}
+      </div>
     </div>
   );
 }

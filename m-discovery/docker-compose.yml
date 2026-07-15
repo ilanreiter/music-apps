@@ -1,20 +1,14 @@
-version: '3.8'
-
 services:
   app:
     build: .
     command: uvicorn src.main:app --host 0.0.0.0 --port 8000
-    environment:
-      DB_USER: ilan
-      DB_PASSWORD: ayelet90
-      DB_HOST: 192.168.0.236
-      DB_PORT: 5432
-      DB_NAME: music
-      GOOGLE_API_KEY: your_google_api_key_here
+    env_file:
+      - .env
+    volumes:
+      - ${MUSIC_LIBRARY_PATH:-./music}:/music:ro
+      - artwork_cache:/app/artwork_cache
     ports:
       - "8001:8000"
-    # volumes:
-    #   - .:/app # Mount the current directory into the container for live development
 
   frontend:
     build:
@@ -24,3 +18,6 @@ services:
       - "6009:80"
     depends_on:
       - app
+
+volumes:
+  artwork_cache:

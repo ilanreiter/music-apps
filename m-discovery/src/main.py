@@ -1,15 +1,30 @@
-from fastapi import FastAPI, Depends, HTTPException, status
+from fastapi import FastAPI, Depends, HTTPException, Query, status
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from typing import List, Optional
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from .database import get_db_connection, create_tables
+from .library_scanner import run_scan
+from .artwork import get_or_create_thumbnail
 import google.generativeai as genai
 import os
 import json
 import re
+import threading
+
+EXTENSION_MIME_TYPES = {
+    '.mp3': 'audio/mpeg', '.flac': 'audio/flac', '.m4a': 'audio/mp4', '.mp4': 'audio/mp4',
+    '.ogg': 'audio/ogg', '.oga': 'audio/ogg', '.opus': 'audio/opus', '.wav': 'audio/wav',
+    '.aac': 'audio/aac', '.wma': 'audio/x-ms-wma',
+}
 
 app = FastAPI()
+
+# Single shared scan state: this is a personal single-user tool, so one in-flight
+# scan at a time is enough. Guarded by scan_lock to avoid two overlapping scans.
+scan_lock = threading.Lock()
+scan_progress = {"status": "idle"}
 
 # Configure Gemini API
 genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
@@ -31,11 +46,44 @@ class DiscoveryHistoryEntry(BaseModel):
     track_list: List[Track] # Assuming track_list is a JSONB array of tracks
 
 class DiscoveryParameters(BaseModel):
-    seed_track: str
+    seed_tracks: str
+    genre: Optional[str] = None
     mood: Optional[str] = None
     tempo: Optional[int] = None
     complexity: Optional[str] = None
     exclude_known: Optional[bool] = True
+
+class LibraryScanRequest(BaseModel):
+    root_path: str
+
+class ScanStatus(BaseModel):
+    status: str  # idle | running | done | error
+    root_path: Optional[str] = None
+    processed: Optional[int] = None
+    added: Optional[int] = None
+    updated: Optional[int] = None
+    skipped: Optional[int] = None
+    unreadable_files: Optional[List[str]] = None
+    error: Optional[str] = None
+
+class CountEntry(BaseModel):
+    name: str
+    count: int
+
+class LibraryStats(BaseModel):
+    total_tracks: int
+    top_genres: List[CountEntry]
+    top_artists: List[CountEntry]
+    tracks_by_decade: List[CountEntry]
+
+class TrackListResponse(BaseModel):
+    total: int
+    tracks: List[Track]
+
+class GroupEntry(BaseModel):
+    key: str
+    label: str
+    count: int
 
 # Dependency to get a database connection
 def get_db():
@@ -57,14 +105,193 @@ async def startup_event():
 async def read_root():
     return {"message": "Gemini Music Discovery API is running!"}
 
-@app.get("/api/tracks/known", response_model=List[Track])
-async def get_known_tracks(db: psycopg2.extensions.connection = Depends(get_db)):
+@app.get("/api/tracks/known", response_model=TrackListResponse)
+async def get_known_tracks(
+    search: Optional[str] = None,
+    genre: Optional[str] = None,
+    decade: Optional[int] = None,
+    album: Optional[str] = None,
+    artist: Optional[str] = None,
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    db: psycopg2.extensions.connection = Depends(get_db),
+):
     try:
+        where_clauses = []
+        params = {}
+        if search:
+            where_clauses.append("(track_name ILIKE %(search)s OR artist_name ILIKE %(search)s OR album_name ILIKE %(search)s)")
+            params['search'] = f"%{search}%"
+        if genre:
+            where_clauses.append("genre = %(genre)s")
+            params['genre'] = genre
+        if decade is not None:
+            where_clauses.append("year >= %(decade_start)s AND year < %(decade_end)s")
+            params['decade_start'] = decade
+            params['decade_end'] = decade + 10
+        if album:
+            where_clauses.append("album_name = %(album)s")
+            params['album'] = album
+        if artist:
+            where_clauses.append("artist_name = %(artist)s")
+            params['artist'] = artist
+
+        where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+
         cur = db.cursor(cursor_factory=RealDictCursor)
-        cur.execute("SELECT id, track_name, artist_name, album_name, is_favorite, last_played FROM known_tracks")
+        cur.execute(f"SELECT COUNT(*) AS count FROM known_tracks {where_sql}", params)
+        total = cur.fetchone()['count']
+
+        cur.execute(f"""
+            SELECT id, track_name, artist_name, album_name, is_favorite, last_played
+            FROM known_tracks {where_sql}
+            ORDER BY artist_name, album_name, track_name
+            LIMIT %(limit)s OFFSET %(offset)s
+        """, {**params, 'limit': limit, 'offset': offset})
         tracks = cur.fetchall()
         cur.close()
-        return tracks
+        return {"total": total, "tracks": tracks}
+    except Exception as e:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+@app.get("/api/library/groups", response_model=List[GroupEntry])
+async def get_library_groups(by: str, search: Optional[str] = None, db: psycopg2.extensions.connection = Depends(get_db)):
+    if by not in ("album", "genre", "decade"):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="by must be one of: album, genre, decade")
+    try:
+        search_sql = ""
+        params = {}
+        if search:
+            search_sql = "AND (track_name ILIKE %(search)s OR artist_name ILIKE %(search)s OR album_name ILIKE %(search)s)"
+            params['search'] = f"%{search}%"
+
+        cur = db.cursor()
+
+        if by == "genre":
+            cur.execute(f"""
+                SELECT genre, COUNT(*) FROM known_tracks
+                WHERE genre IS NOT NULL AND genre <> '' {search_sql}
+                GROUP BY genre ORDER BY COUNT(*) DESC
+            """, params)
+            groups = [{"key": row[0], "label": row[0], "count": row[1]} for row in cur.fetchall()]
+        elif by == "decade":
+            cur.execute(f"""
+                SELECT (year / 10) * 10 AS decade, COUNT(*) FROM known_tracks
+                WHERE year IS NOT NULL {search_sql}
+                GROUP BY decade ORDER BY decade
+            """, params)
+            groups = [{"key": str(row[0]), "label": f"{row[0]}s", "count": row[1]} for row in cur.fetchall()]
+        else:
+            cur.execute(f"""
+                SELECT album_name, artist_name, COUNT(*) FROM known_tracks
+                WHERE album_name IS NOT NULL AND album_name <> '' {search_sql}
+                GROUP BY album_name, artist_name ORDER BY artist_name, album_name
+            """, params)
+            groups = [
+                {"key": f"{row[1]}||{row[0]}", "label": f"{row[0]} — {row[1]}", "count": row[2]}
+                for row in cur.fetchall()
+            ]
+
+        cur.close()
+        return groups
+    except Exception as e:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+@app.get("/api/tracks/{track_id}/stream")
+async def stream_track(track_id: int, db: psycopg2.extensions.connection = Depends(get_db)):
+    try:
+        cur = db.cursor()
+        cur.execute("SELECT file_path FROM known_tracks WHERE id = %s", (track_id,))
+        row = cur.fetchone()
+        cur.close()
+    except Exception as e:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+    if not row or not row[0] or not os.path.isfile(row[0]):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Track file not found")
+
+    file_path = row[0]
+    media_type = EXTENSION_MIME_TYPES.get(os.path.splitext(file_path)[1].lower(), 'application/octet-stream')
+    return FileResponse(file_path, media_type=media_type)
+
+@app.get("/api/tracks/{track_id}/artwork")
+async def get_track_artwork(track_id: int, db: psycopg2.extensions.connection = Depends(get_db)):
+    try:
+        cur = db.cursor()
+        cur.execute("SELECT file_path FROM known_tracks WHERE id = %s", (track_id,))
+        row = cur.fetchone()
+        cur.close()
+    except Exception as e:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+    if not row or not row[0]:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No artwork available")
+
+    cache_path = get_or_create_thumbnail(track_id, row[0])
+    if not cache_path:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No artwork available")
+
+    return FileResponse(cache_path, media_type="image/jpeg")
+
+@app.post("/api/library/scan", response_model=ScanStatus, status_code=status.HTTP_202_ACCEPTED)
+async def scan_library(params: LibraryScanRequest):
+    if not scan_lock.acquire(blocking=False):
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="A scan is already running.")
+    try:
+        scan_progress.clear()
+        scan_progress.update(status="running", root_path=params.root_path)
+
+        def _run():
+            try:
+                run_scan(params.root_path, get_db_connection, scan_progress)
+            finally:
+                scan_lock.release()
+
+        threading.Thread(target=_run, daemon=True).start()
+        return scan_progress
+    except Exception:
+        scan_lock.release()
+        raise
+
+@app.get("/api/library/scan/status", response_model=ScanStatus)
+async def get_scan_status():
+    return scan_progress
+
+@app.get("/api/library/stats", response_model=LibraryStats)
+async def get_library_stats(db: psycopg2.extensions.connection = Depends(get_db)):
+    try:
+        cur = db.cursor()
+
+        cur.execute("SELECT COUNT(*) FROM known_tracks")
+        total_tracks = cur.fetchone()[0]
+
+        cur.execute("""
+            SELECT genre, COUNT(*) FROM known_tracks
+            WHERE genre IS NOT NULL AND genre <> ''
+            GROUP BY genre ORDER BY COUNT(*) DESC LIMIT 15
+        """)
+        top_genres = [{"name": row[0], "count": row[1]} for row in cur.fetchall()]
+
+        cur.execute("""
+            SELECT artist_name, COUNT(*) FROM known_tracks
+            GROUP BY artist_name ORDER BY COUNT(*) DESC LIMIT 15
+        """)
+        top_artists = [{"name": row[0], "count": row[1]} for row in cur.fetchall()]
+
+        cur.execute("""
+            SELECT (year / 10) * 10 AS decade, COUNT(*) FROM known_tracks
+            WHERE year IS NOT NULL
+            GROUP BY decade ORDER BY decade
+        """)
+        tracks_by_decade = [{"name": f"{row[0]}s", "count": row[1]} for row in cur.fetchall()]
+
+        cur.close()
+        return {
+            "total_tracks": total_tracks,
+            "top_genres": top_genres,
+            "top_artists": top_artists,
+            "tracks_by_decade": tracks_by_decade,
+        }
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
 
@@ -88,11 +315,13 @@ async def get_discovery_history(db: psycopg2.extensions.connection = Depends(get
 
 def _build_prompt(params: DiscoveryParameters) -> str:
     prompt_parts = [
-        f"I'm looking for music similar to '{params.seed_track}'.",
+        f"I'm looking for music similar to '{params.seed_tracks}'.",
         "Suggest 5-10 tracks that I might not have heard before.",
         "For each track, provide the track name, artist name, and album name.",
         "Format the output as a JSON array of objects, where each object has 'track_name', 'artist_name', and 'album_name' keys."
     ]
+    if params.genre:
+        prompt_parts.append(f"The genre should be: {params.genre}.")
     if params.mood:
         prompt_parts.append(f"The mood should be: {params.mood}.")
     if params.tempo:
