@@ -168,7 +168,8 @@ async def get_known_tracks(
     album: Optional[str] = None,
     artist: Optional[str] = None,
     has_artwork: Optional[bool] = None,
-    limit: int = Query(100, ge=1, le=500),
+    shuffle: bool = False,
+    limit: int = Query(100, ge=1, le=20000),
     offset: int = Query(0, ge=0),
     db: psycopg2.extensions.connection = Depends(get_db),
 ):
@@ -201,11 +202,15 @@ async def get_known_tracks(
         cur.execute(f"SELECT COUNT(*) AS count FROM known_tracks {where_sql}", params)
         total = cur.fetchone()['count']
 
+        # RANDOM() genuinely reshuffles the matching rows before truncating, so a
+        # shuffled fetch is a true uniform sample of the whole filtered set (not
+        # just the first page) and never repeats a row within the same request.
+        order_sql = "ORDER BY RANDOM()" if shuffle else "ORDER BY artist_name, album_name, track_name"
         cur.execute(f"""
             SELECT id, track_name, artist_name, album_name, genre, year, duration_seconds,
                    bitrate, sample_rate, channels, file_size_bytes, file_path, is_favorite, last_played
             FROM known_tracks {where_sql}
-            ORDER BY artist_name, album_name, track_name
+            {order_sql}
             LIMIT %(limit)s OFFSET %(offset)s
         """, {**params, 'limit': limit, 'offset': offset})
         tracks = cur.fetchall()

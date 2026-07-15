@@ -64,6 +64,7 @@ function App() {
   const [wiimStatus, setWiimStatus] = useState(null);
   const prevOutputDeviceRef = useRef(null);
   const wiimAdvancingRef = useRef(false);
+  const wiimHasStartedRef = useRef(false);
 
   const API_BASE_URL = process.env.REACT_APP_API_URL || '/api';
 
@@ -99,11 +100,21 @@ function App() {
 
   useEffect(() => {
     wiimAdvancingRef.current = false;
+    wiimHasStartedRef.current = false;
   }, [nowPlaying]);
 
   // Poll the device's real playback position so the UI reflects reality and we
   // can auto-advance the queue near end-of-track (there's no "onEnded" event to
-  // hook into like the local <audio> element has).
+  // hook into like the local <audio> element has). Two ways this can fire:
+  //  - "near end while still playing" - the common case, but the 2s poll
+  //    interval means a poll can land after the track has *already* stopped on
+  //    its own before ever seeing a "near end" tick, which silently killed
+  //    playback after one track (confirmed empirically: natural end-of-track
+  //    reports transport state STOPPED, i.e. status "stop", not "pause").
+  //  - "stopped on its own" - a fallback that catches exactly that case: if
+  //    we've confirmed the device actually started playing this track and it
+  //    later reports "stop" (not "pause", which is the user's own doing) without
+  //    us having asked for that, the track ended.
   useEffect(() => {
     if (!outputDevice || !nowPlaying) return;
     const interval = setInterval(async () => {
@@ -111,10 +122,16 @@ function App() {
         const response = await axios.get(`${API_BASE_URL}/wiim/devices/${outputDevice.id}/status`);
         setWiimStatus(response.data);
         const { reachable, status: playState, duration_ms: duration, position_ms: position } = response.data;
-        if (
-          reachable && playState === 'play' && duration > 0 &&
-          duration - position < 1500 && !wiimAdvancingRef.current
-        ) {
+        if (!reachable || wiimAdvancingRef.current) return;
+
+        if (playState === 'play') {
+          wiimHasStartedRef.current = true;
+        }
+
+        const nearEnd = playState === 'play' && duration > 0 && duration - position < 4000;
+        const stoppedOnItsOwn = playState === 'stop' && wiimHasStartedRef.current;
+
+        if (nearEnd || stoppedOnItsOwn) {
           wiimAdvancingRef.current = true;
           handleNext();
         }
@@ -365,9 +382,24 @@ function App() {
     });
   };
 
+  // Shuffle needs the *entire* matching set considered, not just one page of it -
+  // fetching a capped page and shuffling only that page means "shuffle all" would
+  // only ever draw from whatever happened to sort first alphabetically. The count
+  // query is cheap, so look up the true total first, then fetch everything in one
+  // truly-randomized (server-side ORDER BY RANDOM(), no repeats) request.
+  const fetchAllMatchingShuffled = async (params) => {
+    const countResponse = await axios.get(`${API_BASE_URL}/tracks/known`, { params: { ...params, limit: 1, offset: 0 } });
+    const total = countResponse.data.total;
+    if (total === 0) return [];
+    const fullResponse = await axios.get(`${API_BASE_URL}/tracks/known`, {
+      params: { ...params, limit: total, offset: 0, shuffle: true },
+    });
+    return fullResponse.data.tracks;
+  };
+
   const playGroup = async (group, { shuffle = false } = {}) => {
     try {
-      const params = { limit: GROUP_QUEUE_LIMIT, offset: 0 };
+      const params = {};
       if (group.by === 'genre') params.genre = group.key;
       else if (group.by === 'decade') params.decade = Number(group.key);
       else if (group.by === 'album') {
@@ -375,8 +407,12 @@ function App() {
         params.artist = artist;
         params.album = album;
       }
-      const response = await axios.get(`${API_BASE_URL}/tracks/known`, { params });
-      startQueue(response.data.tracks, { shuffle });
+      if (shuffle) {
+        startQueue(await fetchAllMatchingShuffled(params));
+      } else {
+        const response = await axios.get(`${API_BASE_URL}/tracks/known`, { params: { ...params, limit: GROUP_QUEUE_LIMIT, offset: 0 } });
+        startQueue(response.data.tracks);
+      }
     } catch (err) {
       console.error('Error queuing group playback:', err);
     }
@@ -384,9 +420,13 @@ function App() {
 
   const playCurrentFilter = async ({ shuffle = false } = {}) => {
     try {
-      const params = { ...buildTrackFilterParams(), limit: GROUP_QUEUE_LIMIT, offset: 0 };
-      const response = await axios.get(`${API_BASE_URL}/tracks/known`, { params });
-      startQueue(response.data.tracks, { shuffle });
+      const params = buildTrackFilterParams();
+      if (shuffle) {
+        startQueue(await fetchAllMatchingShuffled(params));
+      } else {
+        const response = await axios.get(`${API_BASE_URL}/tracks/known`, { params: { ...params, limit: GROUP_QUEUE_LIMIT, offset: 0 } });
+        startQueue(response.data.tracks);
+      }
     } catch (err) {
       console.error('Error queuing playback:', err);
     }
@@ -720,6 +760,7 @@ function App() {
 
       <PlayerBar
         track={nowPlaying}
+        queue={queue}
         isPlaying={effectiveIsPlaying}
         hasNext={queue.length > 0}
         hasPrev={history.length > 0}
@@ -759,7 +800,7 @@ function channelLabel(channels) {
 }
 
 function PlayerBar({
-  track, isPlaying, hasNext, hasPrev, onNext, onPrev, onTogglePlay, setIsPlaying, audioRef, apiBase,
+  track, queue, isPlaying, hasNext, hasPrev, onNext, onPrev, onTogglePlay, setIsPlaying, audioRef, apiBase,
   wiimDevices, outputDevice, setOutputDevice, wiimStatus,
 }) {
   const [expanded, setExpanded] = useState(false);
@@ -842,6 +883,31 @@ function PlayerBar({
             </div>
           )}
           </div>
+          {queue && queue.length > 0 && (
+            <div className="now-playing-queue">
+              <div className="now-playing-queue-header">
+                <h3>Up Next</h3>
+                <span className="queue-count">
+                  {queue.length.toLocaleString()} track{queue.length === 1 ? '' : 's'} queued
+                  {queue.length > 200 ? ' — showing first 200' : ''}
+                </span>
+              </div>
+              <div className="queue-list">
+                {queue.slice(0, 200).map((t, idx) => (
+                  <div className="queue-row" key={`${t.id}-${idx}`}>
+                    <span className="queue-position">{idx + 1}</span>
+                    <span className="queue-track-title">{t.track_name}</span>
+                    <span className="queue-track-artist">{t.artist_name}</span>
+                  </div>
+                ))}
+              </div>
+              {queue.length > 200 && (
+                <p className="queue-more-note">
+                  + {(queue.length - 200).toLocaleString()} more tracks queued (all {queue.length.toLocaleString()} will still play — this list just isn't showing all of them)
+                </p>
+              )}
+            </div>
+          )}
         </div>
       )}
       <div className="player-bar">
