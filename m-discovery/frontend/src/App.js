@@ -58,15 +58,73 @@ function App() {
   const [isPlaying, setIsPlaying] = useState(false);
   const audioRef = useRef(null);
 
+  // Output routing: null = play in this browser, otherwise cast to a WiiM device
+  const [wiimDevices, setWiimDevices] = useState([]);
+  const [outputDevice, setOutputDevice] = useState(null);
+  const [wiimStatus, setWiimStatus] = useState(null);
+  const prevOutputDeviceRef = useRef(null);
+  const wiimAdvancingRef = useRef(false);
+
   const API_BASE_URL = process.env.REACT_APP_API_URL || '/api';
 
   useEffect(() => {
     resumeScanIfRunning();
+    axios.get(`${API_BASE_URL}/wiim/devices`)
+      .then((r) => setWiimDevices(r.data))
+      .catch((err) => console.error('Error fetching WiiM devices:', err));
     return () => {
       if (pollRef.current) clearInterval(pollRef.current);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // Cast the current track to the selected WiiM device whenever it changes.
+  useEffect(() => {
+    if (!outputDevice || !nowPlaying) return;
+    axios.post(`${API_BASE_URL}/wiim/devices/${outputDevice.id}/play`, { track_id: nowPlaying.id })
+      .catch((err) => console.error('Error casting to WiiM:', err));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [outputDevice, nowPlaying]);
+
+  // Stop the previous device when switching output (to a different device, or back to the browser).
+  useEffect(() => {
+    const prev = prevOutputDeviceRef.current;
+    if (prev && prev.id !== outputDevice?.id) {
+      axios.post(`${API_BASE_URL}/wiim/devices/${prev.id}/stop`).catch(() => {});
+    }
+    prevOutputDeviceRef.current = outputDevice;
+    setWiimStatus(null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [outputDevice]);
+
+  useEffect(() => {
+    wiimAdvancingRef.current = false;
+  }, [nowPlaying]);
+
+  // Poll the device's real playback position so the UI reflects reality and we
+  // can auto-advance the queue near end-of-track (there's no "onEnded" event to
+  // hook into like the local <audio> element has).
+  useEffect(() => {
+    if (!outputDevice || !nowPlaying) return;
+    const interval = setInterval(async () => {
+      try {
+        const response = await axios.get(`${API_BASE_URL}/wiim/devices/${outputDevice.id}/status`);
+        setWiimStatus(response.data);
+        const { reachable, status: playState, duration_ms: duration, position_ms: position } = response.data;
+        if (
+          reachable && playState === 'play' && duration > 0 &&
+          duration - position < 1500 && !wiimAdvancingRef.current
+        ) {
+          wiimAdvancingRef.current = true;
+          handleNext();
+        }
+      } catch (err) {
+        console.error('Error polling WiiM status:', err);
+      }
+    }, 2000);
+    return () => clearInterval(interval);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [outputDevice, nowPlaying]);
 
   useEffect(() => {
     if (activeTab === 'taste' && !stats) {
@@ -260,6 +318,13 @@ function App() {
   };
 
   const togglePlay = () => {
+    if (outputDevice) {
+      const action = wiimStatus?.status === 'play' ? 'pause' : 'resume';
+      axios.post(`${API_BASE_URL}/wiim/devices/${outputDevice.id}/${action}`).catch((err) => {
+        console.error('Error toggling WiiM playback:', err);
+      });
+      return;
+    }
     if (!audioRef.current) return;
     if (audioRef.current.paused) {
       audioRef.current.play();
@@ -329,6 +394,7 @@ function App() {
 
   const viewLabel = (mode) => (mode === 'all' ? 'All Tracks' : `By ${mode.charAt(0).toUpperCase()}${mode.slice(1)}`);
   const backLabel = drill && (drill.by === 'album' ? 'Albums' : drill.by === 'genre' ? 'Genres' : 'Decades');
+  const effectiveIsPlaying = outputDevice ? wiimStatus?.status === 'play' : isPlaying;
 
   return (
     <div className="app">
@@ -546,9 +612,9 @@ function App() {
                           <button
                             className="play-btn"
                             onClick={() => handleTrackPlayClick(track, libraryTracks)}
-                            aria-label={isCurrent && isPlaying ? 'Pause' : 'Play'}
+                            aria-label={isCurrent && effectiveIsPlaying ? 'Pause' : 'Play'}
                           >
-                            {isCurrent && isPlaying ? '❚❚' : '▶'}
+                            {isCurrent && effectiveIsPlaying ? '❚❚' : '▶'}
                           </button>
                           <div className="track-thumb-wrap">
                             <span className="track-thumb-fallback">{track.track_name.charAt(0).toUpperCase()}</span>
@@ -640,7 +706,7 @@ function App() {
 
       <PlayerBar
         track={nowPlaying}
-        isPlaying={isPlaying}
+        isPlaying={effectiveIsPlaying}
         hasNext={queue.length > 0}
         hasPrev={history.length > 0}
         onNext={handleNext}
@@ -649,6 +715,10 @@ function App() {
         setIsPlaying={setIsPlaying}
         audioRef={audioRef}
         apiBase={API_BASE_URL}
+        wiimDevices={wiimDevices}
+        outputDevice={outputDevice}
+        setOutputDevice={setOutputDevice}
+        wiimStatus={wiimStatus}
       />
     </div>
   );
@@ -674,7 +744,10 @@ function channelLabel(channels) {
   return `${channels}ch`;
 }
 
-function PlayerBar({ track, isPlaying, hasNext, hasPrev, onNext, onPrev, onTogglePlay, setIsPlaying, audioRef, apiBase }) {
+function PlayerBar({
+  track, isPlaying, hasNext, hasPrev, onNext, onPrev, onTogglePlay, setIsPlaying, audioRef, apiBase,
+  wiimDevices, outputDevice, setOutputDevice, wiimStatus,
+}) {
   const [expanded, setExpanded] = useState(false);
   const [artistInfo, setArtistInfo] = useState(null);
   const [bioExpanded, setBioExpanded] = useState(false);
@@ -771,19 +844,55 @@ function PlayerBar({ track, isPlaying, hasNext, hasPrev, onNext, onPrev, onToggl
         </div>
         <div className="player-controls">
           <button className="player-btn" onClick={onPrev} disabled={!hasPrev} aria-label="Previous">&#9198;</button>
-          <audio
-            key={track.id}
-            ref={audioRef}
-            src={`${apiBase}/tracks/${track.id}/stream`}
-            autoPlay
-            controls
-            className="player-audio"
-            onPlay={() => setIsPlaying(true)}
-            onPause={() => setIsPlaying(false)}
-            onEnded={onNext}
-          />
+          {outputDevice ? (
+            <>
+              <button className="player-btn" onClick={onTogglePlay} aria-label={isPlaying ? 'Pause' : 'Play'}>
+                {isPlaying ? '❚❚' : '▶'}
+              </button>
+              <div className="wiim-progress">
+                <span className="wiim-progress-time">{formatDuration(Math.floor((wiimStatus?.position_ms || 0) / 1000))}</span>
+                <div className="bar-track wiim-progress-track">
+                  <div
+                    className="bar-fill"
+                    style={{
+                      width: wiimStatus?.duration_ms
+                        ? `${Math.min(100, (wiimStatus.position_ms / wiimStatus.duration_ms) * 100)}%`
+                        : '0%',
+                    }}
+                  />
+                </div>
+                <span className="wiim-progress-time">{formatDuration(Math.floor((wiimStatus?.duration_ms || 0) / 1000))}</span>
+              </div>
+            </>
+          ) : (
+            <audio
+              key={track.id}
+              ref={audioRef}
+              src={`${apiBase}/tracks/${track.id}/stream`}
+              autoPlay
+              controls
+              className="player-audio"
+              onPlay={() => setIsPlaying(true)}
+              onPause={() => setIsPlaying(false)}
+              onEnded={onNext}
+            />
+          )}
           <button className="player-btn" onClick={onNext} disabled={!hasNext} aria-label="Next">&#9197;</button>
         </div>
+        <select
+          className="output-picker"
+          value={outputDevice ? outputDevice.id : ''}
+          onChange={(e) => {
+            const id = e.target.value;
+            setOutputDevice(id ? wiimDevices.find((d) => d.id === id) || null : null);
+          }}
+          aria-label="Playback output"
+        >
+          <option value="">🔊 This Browser</option>
+          {wiimDevices.map((d) => (
+            <option key={d.id} value={d.id}>📡 {d.name}</option>
+          ))}
+        </select>
       </div>
     </div>
   );

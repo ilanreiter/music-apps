@@ -8,6 +8,7 @@ from .database import get_db_connection, create_tables
 from .library_scanner import run_scan
 from .artwork import get_or_create_thumbnail
 from .artist_info import get_artist_info, get_artist_photo_path
+from . import wiim
 import google.generativeai as genai
 import os
 import json
@@ -19,6 +20,7 @@ EXTENSION_MIME_TYPES = {
     '.ogg': 'audio/ogg', '.oga': 'audio/ogg', '.opus': 'audio/opus', '.wav': 'audio/wav',
     '.aac': 'audio/aac', '.wma': 'audio/x-ms-wma',
 }
+PUBLIC_BASE_URL = os.environ.get('PUBLIC_BASE_URL', 'http://localhost:8001')
 
 app = FastAPI()
 
@@ -104,6 +106,27 @@ class ArtistInfo(BaseModel):
     country: Optional[str] = None
     formed_year: Optional[str] = None
     website: Optional[str] = None
+
+class WiimDevice(BaseModel):
+    id: str
+    name: str
+    ip: str
+
+class WiimPlayRequest(BaseModel):
+    track_id: int
+
+class WiimVolumeRequest(BaseModel):
+    level: int
+
+class WiimStatus(BaseModel):
+    reachable: bool
+    status: Optional[str] = None
+    title: Optional[str] = None
+    artist: Optional[str] = None
+    album: Optional[str] = None
+    position_ms: Optional[int] = None
+    duration_ms: Optional[int] = None
+    volume: Optional[int] = None
 
 # Dependency to get a database connection
 def get_db():
@@ -273,6 +296,68 @@ def get_artist_photo_endpoint(name: str):
     if not photo_path:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No artist photo available")
     return FileResponse(photo_path, media_type="image/jpeg")
+
+def _get_wiim_device_or_404(device_id: str):
+    device = wiim.get_device(device_id)
+    if not device:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Unknown WiiM device")
+    return device
+
+@app.get("/api/wiim/devices", response_model=List[WiimDevice])
+def list_wiim_devices():
+    return wiim.list_devices()
+
+@app.post("/api/wiim/devices/{device_id}/play")
+def wiim_play(device_id: str, params: WiimPlayRequest, db: psycopg2.extensions.connection = Depends(get_db)):
+    device = _get_wiim_device_or_404(device_id)
+
+    cur = db.cursor()
+    cur.execute("SELECT id FROM known_tracks WHERE id = %s", (params.track_id,))
+    found = cur.fetchone()
+    cur.close()
+    if not found:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Track not found")
+
+    stream_url = f"{PUBLIC_BASE_URL}/api/tracks/{params.track_id}/stream"
+    if not wiim.play_url(device['ip'], stream_url):
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Could not reach WiiM device")
+    return {"status": "playing"}
+
+@app.post("/api/wiim/devices/{device_id}/pause")
+def wiim_pause(device_id: str):
+    device = _get_wiim_device_or_404(device_id)
+    if not wiim.pause(device['ip']):
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Could not reach WiiM device")
+    return {"status": "paused"}
+
+@app.post("/api/wiim/devices/{device_id}/resume")
+def wiim_resume(device_id: str):
+    device = _get_wiim_device_or_404(device_id)
+    if not wiim.resume(device['ip']):
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Could not reach WiiM device")
+    return {"status": "playing"}
+
+@app.post("/api/wiim/devices/{device_id}/stop")
+def wiim_stop(device_id: str):
+    device = _get_wiim_device_or_404(device_id)
+    if not wiim.stop(device['ip']):
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Could not reach WiiM device")
+    return {"status": "stopped"}
+
+@app.post("/api/wiim/devices/{device_id}/volume")
+def wiim_set_volume(device_id: str, params: WiimVolumeRequest):
+    device = _get_wiim_device_or_404(device_id)
+    if not wiim.set_volume(device['ip'], params.level):
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Could not reach WiiM device")
+    return {"status": "ok"}
+
+@app.get("/api/wiim/devices/{device_id}/status", response_model=WiimStatus)
+def wiim_get_status(device_id: str):
+    device = _get_wiim_device_or_404(device_id)
+    result = wiim.get_status(device['ip'])
+    if result is None:
+        return {"reachable": False}
+    return {"reachable": True, **result}
 
 @app.post("/api/library/scan", response_model=ScanStatus, status_code=status.HTTP_202_ACCEPTED)
 async def scan_library(params: LibraryScanRequest):

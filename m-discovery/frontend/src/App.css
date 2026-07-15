@@ -780,6 +780,36 @@ main.with-player {
   height: 32px;
 }
 
+.wiim-progress {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.wiim-progress-time {
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.wiim-progress-track {
+  flex: 1;
+}
+
+.output-picker {
+  flex-shrink: 0;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text-main);
+  font-size: 0.8rem;
+  padding: 8px 10px;
+  cursor: pointer;
+  max-width: 150px;
+}
+
 .now-playing-panel {
   position: fixed;
   inset: 0;
