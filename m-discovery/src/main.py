@@ -6,8 +6,9 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 from .database import get_db_connection, create_tables
 from .library_scanner import run_scan
-from .artwork import get_or_create_thumbnail
+from .artwork import get_or_create_thumbnail, check_artwork_presence
 from .artist_info import get_artist_info, get_artist_photo_path
+from .library_cleanup import find_duplicates, find_missing_tracks
 from . import wiim
 import google.generativeai as genai
 import os
@@ -28,6 +29,9 @@ app = FastAPI()
 # scan at a time is enough. Guarded by scan_lock to avoid two overlapping scans.
 scan_lock = threading.Lock()
 scan_progress = {"status": "idle"}
+
+artwork_check_lock = threading.Lock()
+artwork_check_progress = {"status": "idle"}
 
 # Configure Gemini API
 genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
@@ -75,6 +79,14 @@ class ScanStatus(BaseModel):
     updated: Optional[int] = None
     skipped: Optional[int] = None
     unreadable_files: Optional[List[str]] = None
+    error: Optional[str] = None
+
+class ArtworkCheckStatus(BaseModel):
+    status: str  # idle | running | done | error
+    processed: Optional[int] = None
+    total: Optional[int] = None
+    found: Optional[int] = None
+    missing: Optional[int] = None
     error: Optional[str] = None
 
 class CountEntry(BaseModel):
@@ -155,6 +167,7 @@ async def get_known_tracks(
     decade: Optional[int] = None,
     album: Optional[str] = None,
     artist: Optional[str] = None,
+    has_artwork: Optional[bool] = None,
     limit: int = Query(100, ge=1, le=500),
     offset: int = Query(0, ge=0),
     db: psycopg2.extensions.connection = Depends(get_db),
@@ -178,6 +191,9 @@ async def get_known_tracks(
         if artist:
             where_clauses.append("artist_name = %(artist)s")
             params['artist'] = artist
+        if has_artwork is not None:
+            where_clauses.append("has_artwork = %(has_artwork)s")
+            params['has_artwork'] = has_artwork
 
         where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
 
@@ -422,6 +438,59 @@ async def get_library_stats(db: psycopg2.extensions.connection = Depends(get_db)
         }
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+@app.get("/api/library/duplicates")
+async def get_duplicate_tracks(db: psycopg2.extensions.connection = Depends(get_db)):
+    try:
+        cur = db.cursor(cursor_factory=RealDictCursor)
+        cur.execute("""
+            SELECT id, track_name, artist_name, album_name, duration_seconds, bitrate, file_size_bytes
+            FROM known_tracks
+        """)
+        tracks = cur.fetchall()
+        cur.close()
+    except Exception as e:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+    return find_duplicates(tracks)
+
+@app.get("/api/library/missing-tracks")
+async def get_missing_tracks(db: psycopg2.extensions.connection = Depends(get_db)):
+    try:
+        cur = db.cursor()
+        cur.execute("""
+            SELECT artist_name, album_name, track_number, track_total
+            FROM known_tracks
+            WHERE album_name IS NOT NULL AND album_name <> '' AND track_number IS NOT NULL
+        """)
+        rows = cur.fetchall()
+        cur.close()
+    except Exception as e:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+    return find_missing_tracks(rows)
+
+@app.post("/api/library/check-artwork", response_model=ArtworkCheckStatus, status_code=status.HTTP_202_ACCEPTED)
+async def start_artwork_check():
+    if not artwork_check_lock.acquire(blocking=False):
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="An artwork check is already running.")
+    try:
+        artwork_check_progress.clear()
+        artwork_check_progress.update(status="running")
+
+        def _run():
+            try:
+                check_artwork_presence(get_db_connection, artwork_check_progress)
+            finally:
+                artwork_check_lock.release()
+
+        threading.Thread(target=_run, daemon=True).start()
+        return artwork_check_progress
+    except Exception:
+        artwork_check_lock.release()
+        raise
+
+@app.get("/api/library/check-artwork/status", response_model=ArtworkCheckStatus)
+async def get_artwork_check_status():
+    return artwork_check_progress
 
 @app.get("/api/history", response_model=List[DiscoveryHistoryEntry])
 async def get_discovery_history(db: psycopg2.extensions.connection = Depends(get_db)):

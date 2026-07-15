@@ -419,6 +419,12 @@ function App() {
           >
             Taste Profile
           </button>
+          <button
+            className={activeTab === 'cleanup' ? 'active' : ''}
+            onClick={() => setActiveTab('cleanup')}
+          >
+            Cleanup
+          </button>
         </nav>
       </header>
 
@@ -668,7 +674,7 @@ function App() {
               </div>
             )}
           </section>
-        ) : (
+        ) : activeTab === 'taste' ? (
           <section className="taste-section">
             {statsLoading && !stats ? (
               <p className="empty-state">Loading taste profile...</p>
@@ -701,6 +707,14 @@ function App() {
               </>
             )}
           </section>
+        ) : (
+          <CleanupTab
+            apiBase={API_BASE_URL}
+            activeTab={activeTab}
+            nowPlaying={nowPlaying}
+            isPlaying={effectiveIsPlaying}
+            onTrackPlayClick={handleTrackPlayClick}
+          />
         )}
       </main>
 
@@ -916,6 +930,255 @@ function BarChart({ title, entries }) {
         ))}
       </div>
     </div>
+  );
+}
+
+function CleanupTab({ apiBase, activeTab, nowPlaying, isPlaying, onTrackPlayClick }) {
+  const [subTab, setSubTab] = useState('duplicates');
+
+  const [duplicateGroups, setDuplicateGroups] = useState(null);
+  const [duplicatesLoading, setDuplicatesLoading] = useState(false);
+  const [duplicatesShown, setDuplicatesShown] = useState(30);
+
+  const [missingTracksAlbums, setMissingTracksAlbums] = useState(null);
+  const [missingTracksLoading, setMissingTracksLoading] = useState(false);
+
+  const [artworkCheckStatus, setArtworkCheckStatus] = useState(null);
+  const [missingArtworkTracks, setMissingArtworkTracks] = useState([]);
+  const [missingArtworkTotal, setMissingArtworkTotal] = useState(0);
+  const artworkPollRef = useRef(null);
+
+  const fetchDuplicates = async () => {
+    setDuplicatesLoading(true);
+    try {
+      const response = await axios.get(`${apiBase}/library/duplicates`);
+      setDuplicateGroups(response.data);
+    } catch (err) {
+      console.error('Error fetching duplicates:', err);
+    } finally {
+      setDuplicatesLoading(false);
+    }
+  };
+
+  const fetchMissingTracks = async () => {
+    setMissingTracksLoading(true);
+    try {
+      const response = await axios.get(`${apiBase}/library/missing-tracks`);
+      setMissingTracksAlbums(response.data);
+    } catch (err) {
+      console.error('Error fetching missing tracks:', err);
+    } finally {
+      setMissingTracksLoading(false);
+    }
+  };
+
+  const fetchMissingArtwork = async (offset) => {
+    try {
+      const response = await axios.get(`${apiBase}/tracks/known`, { params: { has_artwork: false, limit: 100, offset } });
+      setMissingArtworkTotal(response.data.total);
+      setMissingArtworkTracks((prev) => (offset === 0 ? response.data.tracks : [...prev, ...response.data.tracks]));
+    } catch (err) {
+      console.error('Error fetching missing-artwork tracks:', err);
+    }
+  };
+
+  const pollArtworkCheck = () => {
+    if (artworkPollRef.current) clearInterval(artworkPollRef.current);
+    artworkPollRef.current = setInterval(async () => {
+      try {
+        const response = await axios.get(`${apiBase}/library/check-artwork/status`);
+        setArtworkCheckStatus(response.data);
+        if (response.data.status === 'done' || response.data.status === 'error') {
+          clearInterval(artworkPollRef.current);
+          artworkPollRef.current = null;
+          if (response.data.status === 'done') fetchMissingArtwork(0);
+        }
+      } catch (err) {
+        clearInterval(artworkPollRef.current);
+        artworkPollRef.current = null;
+        console.error('Error polling artwork check status:', err);
+      }
+    }, 1500);
+  };
+
+  const startArtworkCheck = async () => {
+    try {
+      const response = await axios.post(`${apiBase}/library/check-artwork`);
+      setArtworkCheckStatus(response.data);
+      pollArtworkCheck();
+    } catch (err) {
+      console.error('Error starting artwork check:', err);
+    }
+  };
+
+  useEffect(() => {
+    if (activeTab !== 'cleanup') return;
+    if (subTab === 'duplicates' && duplicateGroups === null) fetchDuplicates();
+    if (subTab === 'missing-tracks' && missingTracksAlbums === null) fetchMissingTracks();
+    if (subTab === 'missing-artwork' && artworkCheckStatus === null) {
+      axios.get(`${apiBase}/library/check-artwork/status`).then((response) => {
+        setArtworkCheckStatus(response.data);
+        if (response.data.status === 'running') {
+          pollArtworkCheck();
+        } else if (response.data.status === 'done') {
+          fetchMissingArtwork(0);
+        }
+      }).catch((err) => console.error('Error checking artwork-check status:', err));
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeTab, subTab]);
+
+  useEffect(() => () => {
+    if (artworkPollRef.current) clearInterval(artworkPollRef.current);
+  }, []);
+
+  const bestTrack = (tracks) => tracks.reduce((best, t) => ((t.bitrate || 0) > (best.bitrate || 0) ? t : best), tracks[0]);
+
+  return (
+    <section className="cleanup-section">
+      <div className="view-tabs cleanup-subtabs">
+        <button className={subTab === 'duplicates' ? 'active' : ''} onClick={() => setSubTab('duplicates')}>Duplicates</button>
+        <button className={subTab === 'missing-tracks' ? 'active' : ''} onClick={() => setSubTab('missing-tracks')}>Missing Tracks</button>
+        <button className={subTab === 'missing-artwork' ? 'active' : ''} onClick={() => setSubTab('missing-artwork')}>Missing Artwork</button>
+      </div>
+
+      {subTab === 'duplicates' && (
+        <div className="cleanup-panel">
+          {duplicatesLoading ? (
+            <p className="empty-state">Scanning for duplicates…</p>
+          ) : !duplicateGroups || duplicateGroups.length === 0 ? (
+            <p className="empty-state">{duplicateGroups ? 'No duplicates found.' : 'Loading…'}</p>
+          ) : (
+            <>
+              <p className="cleanup-summary">
+                {duplicateGroups.length.toLocaleString()} duplicate group{duplicateGroups.length === 1 ? '' : 's'} found
+                {' '}({duplicateGroups.filter((g) => g.reason === 'exact').length} same title/artist, {duplicateGroups.filter((g) => g.reason === 'similar').length} similar spelling)
+              </p>
+              {duplicateGroups.slice(0, duplicatesShown).map((group, idx) => {
+                const keeper = bestTrack(group.tracks);
+                return (
+                  <div key={idx} className="dup-group">
+                    <div className="dup-group-header">
+                      <span className={`dup-reason-badge ${group.reason}`}>
+                        {group.reason === 'exact' ? 'Same title & artist' : 'Similar spelling'}
+                      </span>
+                      <span className="dup-group-count">{group.tracks.length} files</span>
+                    </div>
+                    {group.tracks.map((t) => (
+                      <div key={t.id} className={`dup-track${t.id === keeper.id ? ' suggested-keep' : ''}`}>
+                        <div className="dup-track-info">
+                          <span className="dup-track-title">{t.track_name}</span>
+                          <span className="dup-track-artist">{t.artist_name}{t.album_name ? ` · ${t.album_name}` : ''}</span>
+                        </div>
+                        <div className="dup-track-meta">
+                          {[
+                            t.bitrate ? `${Math.round(t.bitrate / 1000)}kbps` : null,
+                            t.duration_seconds ? formatDuration(t.duration_seconds) : null,
+                            t.file_size_bytes ? formatFileSize(t.file_size_bytes) : null,
+                          ].filter(Boolean).join(' · ')}
+                          {t.id === keeper.id && <span className="keep-badge">Best quality</span>}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                );
+              })}
+              {duplicatesShown < duplicateGroups.length && (
+                <button className="load-more-btn" onClick={() => setDuplicatesShown((n) => n + 30)}>
+                  Load more ({Math.min(duplicatesShown, duplicateGroups.length)} of {duplicateGroups.length})
+                </button>
+              )}
+            </>
+          )}
+        </div>
+      )}
+
+      {subTab === 'missing-tracks' && (
+        <div className="cleanup-panel">
+          {missingTracksLoading ? (
+            <p className="empty-state">Checking track numbers…</p>
+          ) : !missingTracksAlbums || missingTracksAlbums.length === 0 ? (
+            <p className="empty-state">
+              {missingTracksAlbums ? 'No gaps found in albums with track numbers.' : 'Loading…'}
+            </p>
+          ) : (
+            <>
+              <p className="cleanup-summary">
+                {missingTracksAlbums.length.toLocaleString()} album{missingTracksAlbums.length === 1 ? '' : 's'} with missing tracks
+              </p>
+              {missingTracksAlbums.map((album, idx) => (
+                <div key={idx} className="missing-album-row">
+                  <div className="missing-album-info">
+                    <span className="missing-album-title">{album.album_name}</span>
+                    <span className="missing-album-artist">{album.artist_name}</span>
+                  </div>
+                  <div className="missing-album-gap">
+                    Have {album.have_count} of {album.expected_total} &middot; missing #{album.missing_track_numbers.join(', #')}
+                  </div>
+                </div>
+              ))}
+            </>
+          )}
+        </div>
+      )}
+
+      {subTab === 'missing-artwork' && (
+        <div className="cleanup-panel">
+          <button
+            className="scan-btn"
+            onClick={startArtworkCheck}
+            disabled={artworkCheckStatus?.status === 'running'}
+          >
+            {artworkCheckStatus?.status === 'running' ? 'Checking…' : 'Check Artwork'}
+          </button>
+          {artworkCheckStatus && artworkCheckStatus.status !== 'idle' && (
+            <p className="scan-summary">
+              {artworkCheckStatus.status === 'running'
+                ? `Checking… ${(artworkCheckStatus.processed || 0).toLocaleString()} of ${(artworkCheckStatus.total || 0).toLocaleString()}`
+                : artworkCheckStatus.status === 'done'
+                  ? `Done — ${(artworkCheckStatus.found || 0).toLocaleString()} have artwork, ${(artworkCheckStatus.missing || 0).toLocaleString()} missing`
+                  : artworkCheckStatus.status === 'error' ? `Error: ${artworkCheckStatus.error}` : ''}
+            </p>
+          )}
+          {missingArtworkTracks.length > 0 && (
+            <>
+              <div className="library-header">
+                <h2>Missing Artwork</h2>
+                <span className="library-count">{missingArtworkTotal.toLocaleString()} tracks</span>
+              </div>
+              <div className="tracks-grid">
+                {missingArtworkTracks.map((track) => {
+                  const isCurrent = nowPlaying && nowPlaying.id === track.id;
+                  return (
+                    <div key={track.id} className={`track-card${isCurrent ? ' playing' : ''}`}>
+                      <button
+                        className="play-btn"
+                        onClick={() => onTrackPlayClick(track, missingArtworkTracks)}
+                        aria-label={isCurrent && isPlaying ? 'Pause' : 'Play'}
+                      >
+                        {isCurrent && isPlaying ? '❚❚' : '▶'}
+                      </button>
+                      <div className="track-thumb-wrap">
+                        <span className="track-thumb-fallback">{track.track_name.charAt(0).toUpperCase()}</span>
+                      </div>
+                      <div className="track-info">
+                        <h3>{track.track_name}</h3>
+                        <p className="artist">{track.artist_name}</p>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+              {missingArtworkTracks.length < missingArtworkTotal && (
+                <button className="load-more-btn" onClick={() => fetchMissingArtwork(missingArtworkTracks.length)}>
+                  Load more ({missingArtworkTracks.length.toLocaleString()} of {missingArtworkTotal.toLocaleString()})
+                </button>
+              )}
+            </>
+          )}
+        </div>
+      )}
+    </section>
   );
 }
 

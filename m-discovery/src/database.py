@@ -53,6 +53,9 @@ def create_tables():
                     ADD COLUMN IF NOT EXISTS sample_rate INTEGER,
                     ADD COLUMN IF NOT EXISTS channels INTEGER,
                     ADD COLUMN IF NOT EXISTS file_size_bytes BIGINT,
+                    ADD COLUMN IF NOT EXISTS track_number INTEGER,
+                    ADD COLUMN IF NOT EXISTS track_total INTEGER,
+                    ADD COLUMN IF NOT EXISTS has_artwork BOOLEAN,
                     ADD COLUMN IF NOT EXISTS date_added TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
             """)
             cur.execute("""

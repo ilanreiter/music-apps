@@ -1007,6 +1007,154 @@ main.with-player {
   background: var(--accent-hover);
 }
 
+.cleanup-subtabs {
+  margin-bottom: 20px;
+}
+
+.cleanup-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.cleanup-summary {
+  font-size: 0.85rem;
+  color: var(--text-muted);
+  margin-bottom: 6px;
+}
+
+.dup-group {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 14px 16px;
+}
+
+.dup-group-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 10px;
+}
+
+.dup-reason-badge {
+  font-size: 0.72rem;
+  font-weight: 600;
+  padding: 3px 9px;
+  border-radius: 20px;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.dup-reason-badge.exact {
+  background: var(--accent-soft);
+  color: var(--accent-hover);
+}
+
+.dup-reason-badge.similar {
+  background: rgba(234, 179, 8, 0.15);
+  color: #eab308;
+}
+
+.dup-group-count {
+  font-size: 0.78rem;
+  color: var(--text-muted);
+}
+
+.dup-track {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 7px 0;
+  border-top: 1px solid var(--border);
+}
+
+.dup-track:first-of-type {
+  border-top: none;
+}
+
+.dup-track.suggested-keep .dup-track-title {
+  color: var(--text-main);
+}
+
+.dup-track-info {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.dup-track-title {
+  font-size: 0.9rem;
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.dup-track-artist {
+  font-size: 0.78rem;
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.dup-track-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.keep-badge {
+  background: var(--accent);
+  color: white;
+  font-size: 0.68rem;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 20px;
+}
+
+.missing-album-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 12px 16px;
+}
+
+.missing-album-info {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.missing-album-title {
+  font-size: 0.9rem;
+  font-weight: 500;
+}
+
+.missing-album-artist {
+  font-size: 0.78rem;
+  color: var(--text-muted);
+}
+
+.missing-album-gap {
+  font-size: 0.78rem;
+  color: var(--text-muted);
+  text-align: right;
+  flex-shrink: 0;
+}
+
 @media (max-width: 600px) {
   .form-row {
     flex-direction: column;
@@ -1073,5 +1221,16 @@ main.with-player {
     width: 46px;
     height: 46px;
     font-size: 1.1rem;
+  }
+
+  .dup-track,
+  .missing-album-row {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 4px;
+  }
+
+  .missing-album-gap {
+    text-align: left;
   }
 }

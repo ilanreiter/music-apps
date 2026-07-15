@@ -12,6 +12,7 @@ ID3_FRAME_TO_FIELD = {
     'TCON': 'genre',
     'TDRC': 'date',
     'TYER': 'date',
+    'TRCK': 'tracknumber',
 }
 
 
@@ -26,6 +27,25 @@ def _extract_year(date_value):
         return None
     digits = ''.join(ch for ch in str(date_value)[:4] if ch.isdigit())
     return int(digits) if len(digits) == 4 else None
+
+
+def _extract_track_number(value):
+    # Tag is commonly "N" or "N/M" (track/total-tracks-on-album).
+    if not value:
+        return None, None
+    text = str(value).strip()
+    parts = text.split('/')
+    try:
+        number = int(''.join(ch for ch in parts[0] if ch.isdigit()) or 0) or None
+    except ValueError:
+        number = None
+    total = None
+    if len(parts) > 1:
+        try:
+            total = int(''.join(ch for ch in parts[1] if ch.isdigit()) or 0) or None
+        except ValueError:
+            total = None
+    return number, total
 
 
 def _from_raw_id3_frames(tags):
@@ -64,6 +84,7 @@ def read_tags(file_path):
     album_name = _first(tags.get('album'))
     genre = _first(tags.get('genre'))
     year = _extract_year(_first(tags.get('date')) or _first(tags.get('originaldate')))
+    track_number, track_total = _extract_track_number(_first(tags.get('tracknumber')))
 
     if not track_name or not artist_name:
         fallback_title, fallback_artist = _fallback_from_filename(file_path)
@@ -93,6 +114,8 @@ def read_tags(file_path):
         'sample_rate': sample_rate,
         'channels': channels,
         'file_size_bytes': file_size_bytes,
+        'track_number': track_number,
+        'track_total': track_total,
     }
 
 
@@ -108,11 +131,11 @@ def _upsert_track(cur, metadata):
     cur.execute("""
         INSERT INTO known_tracks (
             track_name, artist_name, album_name, genre, year, duration_seconds,
-            bitrate, sample_rate, channels, file_size_bytes, file_path
+            bitrate, sample_rate, channels, file_size_bytes, track_number, track_total, file_path
         )
         VALUES (
             %(track_name)s, %(artist_name)s, %(album_name)s, %(genre)s, %(year)s, %(duration_seconds)s,
-            %(bitrate)s, %(sample_rate)s, %(channels)s, %(file_size_bytes)s, %(file_path)s
+            %(bitrate)s, %(sample_rate)s, %(channels)s, %(file_size_bytes)s, %(track_number)s, %(track_total)s, %(file_path)s
         )
         ON CONFLICT (file_path) WHERE file_path IS NOT NULL DO UPDATE SET
             track_name = EXCLUDED.track_name,
@@ -124,7 +147,9 @@ def _upsert_track(cur, metadata):
             bitrate = EXCLUDED.bitrate,
             sample_rate = EXCLUDED.sample_rate,
             channels = EXCLUDED.channels,
-            file_size_bytes = EXCLUDED.file_size_bytes
+            file_size_bytes = EXCLUDED.file_size_bytes,
+            track_number = EXCLUDED.track_number,
+            track_total = EXCLUDED.track_total
         RETURNING (xmax = 0) AS inserted
     """, metadata)
     row = cur.fetchone()
