@@ -47,6 +47,19 @@ main.with-player {
   margin-bottom: 30px;
 }
 
+.app-brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.app-logo {
+  width: 30px;
+  height: 30px;
+  flex-shrink: 0;
+  border-radius: 8px;
+}
+
 .app-header h1 {
   font-size: 1.4rem;
   font-weight: 700;
@@ -86,6 +99,83 @@ main.with-player {
   background: var(--accent);
   color: white;
   box-shadow: 0 2px 10px rgba(99, 102, 241, 0.35);
+}
+
+.settings-btn {
+  flex-shrink: 0;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+  width: 38px;
+  height: 38px;
+  border-radius: 50%;
+  cursor: pointer;
+  font-size: 1.05rem;
+  transition: background 0.15s, color 0.15s;
+}
+
+.settings-btn:hover {
+  color: var(--text-main);
+  background: var(--bg-card-hover);
+}
+
+.settings-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.55);
+  padding: 20px;
+}
+
+.settings-modal {
+  width: 100%;
+  max-width: 520px;
+  max-height: 85vh;
+  overflow-y: auto;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 24px;
+  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.5);
+}
+
+.settings-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 20px;
+}
+
+.settings-header h2 {
+  font-size: 1.15rem;
+  font-weight: 700;
+}
+
+.settings-close {
+  background: var(--bg-input);
+  border: none;
+  color: var(--text-muted);
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  cursor: pointer;
+  font-size: 1.1rem;
+  line-height: 1;
+}
+
+.settings-close:hover {
+  color: var(--text-main);
+}
+
+.settings-modal .scan-form {
+  margin: 0;
+  padding: 0;
+  border: none;
+  box-shadow: none;
+  background: none;
 }
 
 .discovery-form {
@@ -441,7 +531,15 @@ main.with-player {
   margin-bottom: 20px;
 }
 
+.search-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
 .search-input {
+  flex: 1;
+  min-width: 0;
   width: 100%;
   padding: 11px 14px;
   background: var(--bg-card);
@@ -492,17 +590,68 @@ main.with-player {
 
 .filter-row {
   display: flex;
+  flex-wrap: wrap;
   gap: 10px;
 }
 
 .filter-row select {
-  flex: 1;
+  flex: 1 1 160px;
   padding: 9px 12px;
   background: var(--bg-input);
   border: 1px solid var(--border);
   border-radius: 8px;
   color: var(--text-main);
   font-size: 0.85rem;
+}
+
+.clear-filters-btn {
+  flex-shrink: 0;
+  padding: 9px 14px;
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--accent-hover);
+  font-size: 0.85rem;
+  font-weight: 500;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.15s, border-color 0.15s;
+}
+
+.clear-filters-btn:hover {
+  background: var(--bg-input);
+  border-color: var(--accent);
+}
+
+.view-style-toggle {
+  display: flex;
+  flex-shrink: 0;
+  gap: 4px;
+  background: var(--bg-card);
+  padding: 4px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+}
+
+.view-style-toggle button {
+  background: transparent;
+  border: none;
+  color: var(--text-muted);
+  width: 34px;
+  height: 30px;
+  border-radius: 7px;
+  cursor: pointer;
+  font-size: 0.95rem;
+  transition: all 0.2s ease;
+}
+
+.view-style-toggle button:hover {
+  color: var(--text-main);
+}
+
+.view-style-toggle button.active {
+  background: var(--accent);
+  color: white;
 }
 
 .drill-header {
@@ -622,6 +771,90 @@ main.with-player {
   color: var(--text-main);
 }
 
+.groups-grid.grid-view {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: 20px;
+}
+
+.groups-grid.grid-view .group-card {
+  flex-direction: column;
+  align-items: stretch;
+  padding: 0;
+  aspect-ratio: 1 / 1;
+  position: relative;
+  overflow: hidden;
+}
+
+.group-thumb,
+.group-thumb-fallback {
+  display: none;
+}
+
+.groups-grid.grid-view .group-thumb-fallback {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  background: var(--bg-input);
+  color: var(--text-muted);
+  font-weight: 700;
+  font-size: 2.6rem;
+}
+
+.groups-grid.grid-view .group-thumb {
+  display: block;
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.groups-grid.grid-view .group-card-main {
+  position: relative;
+  z-index: 1;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  text-align: center;
+  gap: 8px;
+  background: linear-gradient(to top, rgba(0, 0, 0, 0.85), rgba(0, 0, 0, 0.15) 65%, transparent);
+}
+
+.groups-grid.grid-view .group-card-main h3 {
+  white-space: normal;
+  font-size: 1.05rem;
+  overflow: visible;
+  color: #fff;
+  text-shadow: 0 1px 4px rgba(0, 0, 0, 0.6);
+}
+
+.groups-grid.grid-view .group-count {
+  color: rgba(255, 255, 255, 0.85);
+  text-shadow: 0 1px 4px rgba(0, 0, 0, 0.6);
+}
+
+.groups-grid.grid-view .group-card-actions {
+  position: absolute;
+  z-index: 2;
+  bottom: 8px;
+  right: 8px;
+  padding-right: 0;
+  background: rgba(20, 20, 24, 0.75);
+  border-radius: 8px;
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+
+.groups-grid.grid-view .group-card:hover .group-card-actions {
+  opacity: 1;
+}
+
 .play-btn {
   flex-shrink: 0;
   width: 32px;
@@ -650,6 +883,80 @@ main.with-player {
 .track-card.playing .play-btn {
   background: var(--accent);
   color: white;
+}
+
+.tracks-grid.grid-view {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: 20px;
+}
+
+.tracks-grid.grid-view .track-card {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 10px;
+  padding: 12px;
+  text-align: center;
+}
+
+.tracks-grid.grid-view .track-thumb-wrap {
+  width: 100%;
+  height: auto;
+  aspect-ratio: 1 / 1;
+  border-radius: 10px;
+}
+
+.tracks-grid.grid-view .track-thumb-fallback {
+  font-size: 2rem;
+}
+
+.tracks-grid.grid-view .track-info {
+  width: 100%;
+  min-width: 0;
+}
+
+.tracks-grid.grid-view .track-info h3,
+.tracks-grid.grid-view .track-info .artist {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.play-btn.overlay {
+  position: absolute;
+  right: 8px;
+  bottom: 8px;
+  width: 36px;
+  height: 36px;
+  font-size: 0.85rem;
+  background: rgba(20, 20, 24, 0.75);
+  color: white;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.4);
+  opacity: 0;
+  transition: opacity 0.15s, background 0.15s;
+}
+
+.tracks-grid.grid-view .track-card:hover .play-btn.overlay,
+.tracks-grid.grid-view .track-card.playing .play-btn.overlay {
+  opacity: 1;
+}
+
+.play-btn.overlay:hover {
+  background: var(--accent);
+}
+
+/* Grid view is roomier than the app's normal 900px reading-width column, so on
+   desktop let it break out of that constraint and use 2/3 of the viewport
+   width, centered - the vw-based width plus the 50%/-50% margin/transform
+   pair centers regardless of the (narrower) parent's own width. */
+@media (min-width: 901px) {
+  .tracks-grid.grid-view,
+  .groups-grid.grid-view {
+    width: 66.67vw;
+    max-width: 66.67vw;
+    margin-left: 50%;
+    transform: translateX(-50%);
+  }
 }
 
 .load-more-btn {
@@ -682,16 +989,20 @@ main.with-player {
   z-index: 10;
   display: flex;
   flex-direction: column;
+  align-items: center;
 }
 
 .player-bar {
   display: flex;
   align-items: center;
-  gap: 16px;
-  padding: 18px 24px;
+  gap: 20px;
+  width: 66.67%;
+  margin-bottom: 16px;
+  padding: 14px 24px;
   background: var(--bg-card);
-  border-top: 1px solid var(--border);
-  box-shadow: 0 -8px 24px rgba(0, 0, 0, 0.3);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.35);
 }
 
 .player-thumb-wrap {
@@ -735,12 +1046,44 @@ main.with-player {
   white-space: nowrap;
 }
 
-.player-controls {
+.player-center {
   flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.player-progress-row {
   display: flex;
   align-items: center;
   gap: 10px;
+}
+
+.player-progress-row .np-progress-track {
+  flex: 1;
   min-width: 0;
+}
+
+.player-progress-time {
+  flex-shrink: 0;
+  font-size: 0.72rem;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.player-tech {
+  text-align: center;
+  font-size: 0.72rem;
+  color: var(--text-muted);
+  opacity: 0.75;
+}
+
+.player-controls {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  gap: 10px;
 }
 
 .player-btn {
@@ -764,6 +1107,11 @@ main.with-player {
   color: white;
 }
 
+.player-btn.active {
+  background: var(--accent);
+  color: white;
+}
+
 .player-btn:disabled {
   opacity: 0.35;
   cursor: not-allowed;
@@ -774,40 +1122,8 @@ main.with-player {
   color: var(--text-main);
 }
 
-.player-audio {
-  flex: 1;
-  min-width: 0;
-  height: 32px;
-}
-
-.wiim-progress {
-  flex: 1;
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  min-width: 0;
-}
-
-.wiim-progress-time {
-  font-size: 0.75rem;
-  color: var(--text-muted);
-  white-space: nowrap;
-}
-
-.wiim-progress-track {
-  flex: 1;
-}
-
-.output-picker {
-  flex-shrink: 0;
-  background: var(--bg-input);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  color: var(--text-main);
-  font-size: 0.8rem;
-  padding: 8px 10px;
-  cursor: pointer;
-  max-width: 150px;
+.player-audio-hidden {
+  display: none;
 }
 
 .now-playing-panel {
@@ -831,6 +1147,8 @@ main.with-player {
 .now-playing-grid {
   position: relative;
   z-index: 1;
+  width: 66.67%;
+  margin: 0 auto;
   height: 100%;
   display: grid;
   grid-template-columns: 1fr minmax(220px, 300px);
@@ -1081,11 +1399,11 @@ main.with-player {
   background: var(--bg-input);
   border: none;
   color: var(--text-muted);
-  width: 42px;
-  height: 42px;
+  width: 56px;
+  height: 56px;
   border-radius: 50%;
   cursor: pointer;
-  font-size: 1rem;
+  font-size: 1.3rem;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -1251,6 +1569,7 @@ main.with-player {
   gap: 12px;
   padding: 7px 6px;
   border-radius: 8px;
+  cursor: pointer;
 }
 
 .queue-row:hover {
@@ -1486,11 +1805,21 @@ main.with-player {
 }
 
 @media (max-width: 900px) {
+  .player-bar {
+    width: 100%;
+    margin-bottom: 0;
+    border-radius: 0;
+    border-left: none;
+    border-right: none;
+    border-bottom: none;
+  }
+
   .now-playing-panel {
     overflow-y: auto;
   }
 
   .now-playing-grid {
+    width: 100%;
     height: auto;
     min-height: 100%;
     display: flex;

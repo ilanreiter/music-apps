@@ -23,6 +23,49 @@ EXTENSION_MIME_TYPES = {
 }
 PUBLIC_BASE_URL = os.environ.get('PUBLIC_BASE_URL', 'http://localhost:8001')
 
+# Derived (not stored) library attributes computed on the fly from existing
+# columns. Defined once here so the bucket boundaries can't drift between the
+# flat track filter and the group-by browsing endpoint.
+FORMAT_SQL = "UPPER(regexp_replace(file_path, '^.*\\.', ''))"
+QUALITY_TIER_SQL = f"""
+    CASE
+        WHEN {FORMAT_SQL} IN ('FLAC', 'WAV', 'ALAC', 'AIFF', 'APE') THEN 'Lossless'
+        WHEN bitrate >= 256000 THEN 'High (256kbps+)'
+        WHEN bitrate >= 128000 THEN 'Standard (128-255kbps)'
+        WHEN bitrate IS NOT NULL THEN 'Low (<128kbps)'
+        ELSE 'Unknown'
+    END
+"""
+QUALITY_TIER_RANK_SQL = f"""
+    CASE {QUALITY_TIER_SQL}
+        WHEN 'Lossless' THEN 0
+        WHEN 'High (256kbps+)' THEN 1
+        WHEN 'Standard (128-255kbps)' THEN 2
+        WHEN 'Low (<128kbps)' THEN 3
+        ELSE 4
+    END
+"""
+LENGTH_TIER_SQL = """
+    CASE
+        WHEN duration_seconds IS NULL THEN 'Unknown'
+        WHEN duration_seconds < 180 THEN 'Short (<3 min)'
+        WHEN duration_seconds < 360 THEN 'Medium (3-6 min)'
+        ELSE 'Long (6 min+)'
+    END
+"""
+LENGTH_TIER_RANK_SQL = f"""
+    CASE {LENGTH_TIER_SQL}
+        WHEN 'Short (<3 min)' THEN 0
+        WHEN 'Medium (3-6 min)' THEN 1
+        WHEN 'Long (6 min+)' THEN 2
+        ELSE 3
+    END
+"""
+FAVORITE_LABEL_SQL = "CASE WHEN is_favorite THEN 'Favorites' ELSE 'Not Favorited' END"
+# One representative track per group, for a grid-view tile's artwork - prefers
+# a track that actually has artwork, falling back to any track in the group.
+SAMPLE_TRACK_SQL = "COALESCE(MIN(CASE WHEN has_artwork THEN id END), MIN(id))"
+
 app = FastAPI()
 
 # Single shared scan state: this is a personal single-user tool, so one in-flight
@@ -107,6 +150,7 @@ class GroupEntry(BaseModel):
     key: str
     label: str
     count: int
+    sample_track_id: Optional[int] = None
 
 class ArtistInfo(BaseModel):
     found: bool
@@ -171,6 +215,10 @@ async def get_known_tracks(
     album: Optional[str] = None,
     artist: Optional[str] = None,
     has_artwork: Optional[bool] = None,
+    quality: Optional[str] = None,
+    format: Optional[str] = None,
+    favorite: Optional[bool] = None,
+    length: Optional[str] = None,
     shuffle: bool = False,
     limit: int = Query(100, ge=1, le=20000),
     offset: int = Query(0, ge=0),
@@ -198,6 +246,18 @@ async def get_known_tracks(
         if has_artwork is not None:
             where_clauses.append("has_artwork = %(has_artwork)s")
             params['has_artwork'] = has_artwork
+        if quality:
+            where_clauses.append(f"({QUALITY_TIER_SQL}) = %(quality)s")
+            params['quality'] = quality
+        if format:
+            where_clauses.append(f"({FORMAT_SQL}) = %(format)s")
+            params['format'] = format.upper()
+        if favorite is not None:
+            where_clauses.append("is_favorite = %(favorite)s")
+            params['favorite'] = favorite
+        if length:
+            where_clauses.append(f"({LENGTH_TIER_SQL}) = %(length)s")
+            params['length'] = length
 
         where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
 
@@ -226,40 +286,93 @@ async def get_known_tracks(
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
 
 @app.get("/api/library/groups", response_model=List[GroupEntry])
-async def get_library_groups(by: str, search: Optional[str] = None, db: psycopg2.extensions.connection = Depends(get_db)):
-    if by not in ("album", "genre", "decade"):
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="by must be one of: album, genre, decade")
+async def get_library_groups(
+    by: str,
+    search: Optional[str] = None,
+    genre: Optional[str] = None,
+    decade: Optional[int] = None,
+    quality: Optional[str] = None,
+    format: Optional[str] = None,
+    db: psycopg2.extensions.connection = Depends(get_db),
+):
+    valid_by = ("album", "genre", "decade", "quality", "format", "favorite", "length")
+    if by not in valid_by:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"by must be one of: {', '.join(valid_by)}")
     try:
-        search_sql = ""
+        # These are the same ambient filters the flat track list supports, so
+        # they can stay active while browsing/drilling into any grouping too.
+        extra_clauses = []
         params = {}
         if search:
-            search_sql = "AND (track_name ILIKE %(search)s OR artist_name ILIKE %(search)s OR album_name ILIKE %(search)s)"
+            extra_clauses.append("(track_name ILIKE %(search)s OR artist_name ILIKE %(search)s OR album_name ILIKE %(search)s)")
             params['search'] = f"%{search}%"
+        if genre:
+            extra_clauses.append("genre = %(genre)s")
+            params['genre'] = genre
+        if decade is not None:
+            extra_clauses.append("year >= %(decade_start)s AND year < %(decade_end)s")
+            params['decade_start'] = decade
+            params['decade_end'] = decade + 10
+        if quality:
+            extra_clauses.append(f"({QUALITY_TIER_SQL}) = %(quality)s")
+            params['quality'] = quality
+        if format:
+            extra_clauses.append(f"({FORMAT_SQL}) = %(format)s")
+            params['format'] = format.upper()
+        extra_sql = ("AND " + " AND ".join(extra_clauses)) if extra_clauses else ""
 
         cur = db.cursor()
 
         if by == "genre":
             cur.execute(f"""
-                SELECT genre, COUNT(*) FROM known_tracks
-                WHERE genre IS NOT NULL AND genre <> '' {search_sql}
+                SELECT genre, COUNT(*), {SAMPLE_TRACK_SQL} FROM known_tracks
+                WHERE genre IS NOT NULL AND genre <> '' {extra_sql}
                 GROUP BY genre ORDER BY COUNT(*) DESC
             """, params)
-            groups = [{"key": row[0], "label": row[0], "count": row[1]} for row in cur.fetchall()]
+            groups = [{"key": row[0], "label": row[0], "count": row[1], "sample_track_id": row[2]} for row in cur.fetchall()]
         elif by == "decade":
             cur.execute(f"""
-                SELECT (year / 10) * 10 AS decade, COUNT(*) FROM known_tracks
-                WHERE year IS NOT NULL {search_sql}
+                SELECT (year / 10) * 10 AS decade, COUNT(*), {SAMPLE_TRACK_SQL} FROM known_tracks
+                WHERE year IS NOT NULL {extra_sql}
                 GROUP BY decade ORDER BY decade
             """, params)
-            groups = [{"key": str(row[0]), "label": f"{row[0]}s", "count": row[1]} for row in cur.fetchall()]
+            groups = [{"key": str(row[0]), "label": f"{row[0]}s", "count": row[1], "sample_track_id": row[2]} for row in cur.fetchall()]
+        elif by == "quality":
+            cur.execute(f"""
+                SELECT {QUALITY_TIER_SQL} AS tier, COUNT(*), {SAMPLE_TRACK_SQL} FROM known_tracks
+                WHERE 1=1 {extra_sql}
+                GROUP BY tier ORDER BY MIN({QUALITY_TIER_RANK_SQL})
+            """, params)
+            groups = [{"key": row[0], "label": row[0], "count": row[1], "sample_track_id": row[2]} for row in cur.fetchall()]
+        elif by == "format":
+            cur.execute(f"""
+                SELECT {FORMAT_SQL} AS fmt, COUNT(*), {SAMPLE_TRACK_SQL} FROM known_tracks
+                WHERE file_path IS NOT NULL {extra_sql}
+                GROUP BY fmt ORDER BY COUNT(*) DESC
+            """, params)
+            groups = [{"key": row[0], "label": row[0], "count": row[1], "sample_track_id": row[2]} for row in cur.fetchall()]
+        elif by == "favorite":
+            cur.execute(f"""
+                SELECT {FAVORITE_LABEL_SQL} AS fav, COUNT(*), {SAMPLE_TRACK_SQL} FROM known_tracks
+                WHERE 1=1 {extra_sql}
+                GROUP BY fav ORDER BY fav ASC
+            """, params)
+            groups = [{"key": row[0], "label": row[0], "count": row[1], "sample_track_id": row[2]} for row in cur.fetchall()]
+        elif by == "length":
+            cur.execute(f"""
+                SELECT {LENGTH_TIER_SQL} AS tier, COUNT(*), {SAMPLE_TRACK_SQL} FROM known_tracks
+                WHERE 1=1 {extra_sql}
+                GROUP BY tier ORDER BY MIN({LENGTH_TIER_RANK_SQL})
+            """, params)
+            groups = [{"key": row[0], "label": row[0], "count": row[1], "sample_track_id": row[2]} for row in cur.fetchall()]
         else:
             cur.execute(f"""
-                SELECT album_name, artist_name, COUNT(*) FROM known_tracks
-                WHERE album_name IS NOT NULL AND album_name <> '' {search_sql}
+                SELECT album_name, artist_name, COUNT(*), {SAMPLE_TRACK_SQL} FROM known_tracks
+                WHERE album_name IS NOT NULL AND album_name <> '' {extra_sql}
                 GROUP BY album_name, artist_name ORDER BY artist_name, album_name
             """, params)
             groups = [
-                {"key": f"{row[1]}||{row[0]}", "label": f"{row[0]} — {row[1]}", "count": row[2]}
+                {"key": f"{row[1]}||{row[0]}", "label": f"{row[0]} — {row[1]}", "count": row[2], "sample_track_id": row[3]}
                 for row in cur.fetchall()
             ]
 

@@ -4,7 +4,16 @@ import './App.css';
 
 const LIBRARY_PAGE_SIZE = 100;
 const GROUP_QUEUE_LIMIT = 500;
-const VIEW_MODES = ['all', 'album', 'genre', 'decade'];
+const VIEW_MODES = ['all', 'album', 'genre', 'decade', 'quality', 'format', 'favorite', 'length'];
+const BACK_LABELS = {
+  album: 'Albums', genre: 'Genres', decade: 'Decades',
+  quality: 'Quality Tiers', format: 'Formats', favorite: 'Favorites', length: 'Lengths',
+};
+
+const SESSION_KEY = 'md_playback_session_v1';
+const POSITION_KEY = 'md_playback_position_v1';
+const QUEUE_PERSIST_CAP = 200;
+const HISTORY_PERSIST_CAP = 50;
 
 function shuffleArray(arr) {
   const copy = [...arr];
@@ -13,6 +22,68 @@ function shuffleArray(arr) {
     [copy[i], copy[j]] = [copy[j], copy[i]];
   }
   return copy;
+}
+
+// Maps a browse-by group ("genre", "quality", ...) and its key to the query
+// params /api/tracks/known expects for that group, shared between filtering
+// the flat track list and queuing a whole group's tracks for playback.
+function paramsForGroupKey(by, key) {
+  if (by === 'genre') return { genre: key };
+  if (by === 'decade') return { decade: Number(key) };
+  if (by === 'album') {
+    const [artist, album] = key.split('||');
+    return { artist, album };
+  }
+  if (by === 'quality') return { quality: key };
+  if (by === 'format') return { format: key };
+  if (by === 'length') return { length: key };
+  if (by === 'favorite') return { favorite: key === 'Favorites' };
+  return {};
+}
+
+// Parsed once per page load: avoids re-parsing a potentially large JSON blob
+// on every lazy useState initializer that needs a piece of the saved session.
+let _cachedSession;
+function loadSession() {
+  if (_cachedSession !== undefined) return _cachedSession;
+  try {
+    const raw = localStorage.getItem(SESSION_KEY);
+    _cachedSession = raw ? JSON.parse(raw) : null;
+  } catch {
+    _cachedSession = null;
+  }
+  return _cachedSession;
+}
+
+function loadPosition() {
+  try {
+    const raw = localStorage.getItem(POSITION_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch {
+    return null;
+  }
+}
+
+function saveSession(session) {
+  try {
+    localStorage.setItem(SESSION_KEY, JSON.stringify(session));
+  } catch {
+    // Quota exceeded (a long queue can add up) - fall back to just enough to
+    // resume the current track, dropping the upcoming-queue/history payload.
+    try {
+      localStorage.setItem(SESSION_KEY, JSON.stringify({ ...session, queue: [], history: [] }));
+    } catch {
+      /* localStorage unavailable - resume-on-reload just won't work this time */
+    }
+  }
+}
+
+function savePosition(position) {
+  try {
+    localStorage.setItem(POSITION_KEY, JSON.stringify(position));
+  } catch {
+    /* ignore */
+  }
 }
 
 function App() {
@@ -26,7 +97,8 @@ function App() {
 
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
-  const [activeTab, setActiveTab] = useState('discover');
+  const [activeTab, setActiveTab] = useState('library');
+  const [settingsOpen, setSettingsOpen] = useState(false);
 
   const [rootPath, setRootPath] = useState('');
   const [scanning, setScanning] = useState(false);
@@ -36,34 +108,66 @@ function App() {
   const [statsLoading, setStatsLoading] = useState(false);
   const pollRef = useRef(null);
 
-  // Library browsing: flat search/filter or grouped-by-album/genre/decade with drill-down
+  // Library browsing: flat search/filter or grouped-by-album/genre/decade/... with drill-down
   const [libraryMode, setLibraryMode] = useState('all');
   const [drill, setDrill] = useState(null); // { by, key, label } once a group is opened
   const [searchInput, setSearchInput] = useState('');
   const [search, setSearch] = useState('');
   const [filterGenre, setFilterGenre] = useState('');
   const [filterDecade, setFilterDecade] = useState('');
+  const [filterQuality, setFilterQuality] = useState('');
+  const [filterFormat, setFilterFormat] = useState('');
   const [genreOptions, setGenreOptions] = useState([]);
   const [decadeOptions, setDecadeOptions] = useState([]);
+  const [qualityOptions, setQualityOptions] = useState([]);
+  const [formatOptions, setFormatOptions] = useState([]);
   const [groups, setGroups] = useState([]);
   const [groupsLoading, setGroupsLoading] = useState(false);
   const [libraryTracks, setLibraryTracks] = useState([]);
   const [libraryTotal, setLibraryTotal] = useState(0);
   const [libraryLoading, setLibraryLoading] = useState(false);
+  const [trackViewStyle, setTrackViewStyle] = useState(() => {
+    try {
+      return localStorage.getItem('md_track_view_style') || 'list';
+    } catch {
+      return 'list';
+    }
+  });
 
-  // Playback
-  const [queue, setQueue] = useState([]);
-  const [history, setHistory] = useState([]);
-  const [nowPlaying, setNowPlaying] = useState(null);
+  // Playback - initialized from a previously saved session (if any) so a page
+  // reload or reopening the tab returns to what was playing.
+  const [queue, setQueue] = useState(() => loadSession()?.queue || []);
+  const [history, setHistory] = useState(() => loadSession()?.history || []);
+  const [nowPlaying, setNowPlaying] = useState(() => loadSession()?.nowPlaying || null);
   const [isPlaying, setIsPlaying] = useState(false);
-  const [shuffleEnabled, setShuffleEnabled] = useState(false);
+  const [shuffleEnabled, setShuffleEnabled] = useState(() => loadSession()?.shuffleEnabled || false);
+  // Gates the <audio> autoPlay attribute: a restored session shouldn't blast
+  // sound the instant the page loads, but a genuine user-initiated track
+  // change should still autoplay exactly as before.
+  const [userHasInteracted, setUserHasInteracted] = useState(false);
+  const [initialSeekMs, setInitialSeekMs] = useState(() => {
+    const session = loadSession();
+    const position = loadPosition();
+    if (session?.nowPlaying && position && position.trackId === session.nowPlaying.id && !session.outputDevice) {
+      return position.positionMs ?? null;
+    }
+    return null;
+  });
   const audioRef = useRef(null);
   const preShuffleQueueRef = useRef(null);
+  // Skips the WiiM auto-cast effect's very first run, which otherwise fires
+  // immediately on mount whenever a session with an active device is restored.
+  const skipInitialCastRef = useRef(true);
+  // True only when we restored a session that had an active WiiM device -
+  // the first Play press for that session needs to (re-)cast the track
+  // rather than just resume, since we skip the auto-cast on restore.
+  const wiimNeedsInitialCastRef = useRef(!!loadSession()?.outputDevice);
 
   // Output routing: null = play in this browser, otherwise cast to a WiiM device
   const [wiimDevices, setWiimDevices] = useState([]);
-  const [outputDevice, setOutputDevice] = useState(null);
+  const [outputDevice, setOutputDevice] = useState(() => loadSession()?.outputDevice || null);
   const [wiimStatus, setWiimStatus] = useState(null);
+  const wiimStatusRef = useRef(null);
   const prevOutputDeviceRef = useRef(null);
   const wiimAdvancingRef = useRef(false);
   const wiimHasStartedRef = useRef(false);
@@ -82,7 +186,14 @@ function App() {
   }, []);
 
   // Cast the current track to the selected WiiM device whenever it changes.
+  // The very first run is skipped: when a session with an active device is
+  // restored on load, outputDevice/nowPlaying are already set on mount, and
+  // we don't want to blast audio to the device before the user asks for it.
   useEffect(() => {
+    if (skipInitialCastRef.current) {
+      skipInitialCastRef.current = false;
+      return;
+    }
     if (!outputDevice || !nowPlaying) return;
     axios.post(`${API_BASE_URL}/wiim/devices/${outputDevice.id}/play`, { track_id: nowPlaying.id })
       .catch((err) => console.error('Error casting to WiiM:', err));
@@ -122,6 +233,7 @@ function App() {
     const interval = setInterval(async () => {
       try {
         const response = await axios.get(`${API_BASE_URL}/wiim/devices/${outputDevice.id}/status`);
+        wiimStatusRef.current = response.data;
         setWiimStatus(response.data);
         const { reachable, status: playState, duration_ms: duration, position_ms: position } = response.data;
         if (!reachable || wiimAdvancingRef.current) return;
@@ -146,6 +258,46 @@ function App() {
   }, [outputDevice, nowPlaying]);
 
   useEffect(() => {
+    try {
+      localStorage.setItem('md_track_view_style', trackViewStyle);
+    } catch {
+      /* ignore */
+    }
+  }, [trackViewStyle]);
+
+  // Persist the playback session (queue/history capped, so a mutation never
+  // costs a multi-MB localStorage write) so a reload or reopened tab returns
+  // to what was playing.
+  useEffect(() => {
+    saveSession({
+      nowPlaying,
+      queue: queue.slice(0, QUEUE_PERSIST_CAP),
+      history: history.slice(-HISTORY_PERSIST_CAP),
+      shuffleEnabled,
+      outputDevice,
+    });
+  }, [nowPlaying, queue, history, shuffleEnabled, outputDevice]);
+
+  // Separately snapshot just the playback position on a timer (cheap, small
+  // payload) so resuming lands close to where you left off.
+  useEffect(() => {
+    if (!nowPlaying) return;
+    const saveNow = () => {
+      const positionMs = outputDevice
+        ? (wiimStatusRef.current?.position_ms ?? null)
+        : (audioRef.current ? audioRef.current.currentTime * 1000 : null);
+      if (positionMs == null) return;
+      savePosition({ trackId: nowPlaying.id, positionMs });
+    };
+    const interval = setInterval(saveNow, 5000);
+    window.addEventListener('beforeunload', saveNow);
+    return () => {
+      clearInterval(interval);
+      window.removeEventListener('beforeunload', saveNow);
+    };
+  }, [nowPlaying, outputDevice]);
+
+  useEffect(() => {
     if (activeTab === 'taste' && !stats) {
       fetchStats();
     }
@@ -166,7 +318,7 @@ function App() {
       fetchGroups();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeTab, libraryMode, drill, search, filterGenre, filterDecade]);
+  }, [activeTab, libraryMode, drill, search, filterGenre, filterDecade, filterQuality, filterFormat]);
 
   useEffect(() => {
     if (activeTab !== 'library') return;
@@ -180,23 +332,47 @@ function App() {
         .then((r) => setDecadeOptions(r.data))
         .catch((err) => console.error('Error fetching decades:', err));
     }
+    if (qualityOptions.length === 0) {
+      axios.get(`${API_BASE_URL}/library/groups`, { params: { by: 'quality' } })
+        .then((r) => setQualityOptions(r.data))
+        .catch((err) => console.error('Error fetching quality tiers:', err));
+    }
+    if (formatOptions.length === 0) {
+      axios.get(`${API_BASE_URL}/library/groups`, { params: { by: 'format' } })
+        .then((r) => setFormatOptions(r.data))
+        .catch((err) => console.error('Error fetching formats:', err));
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeTab]);
+
+  // The genre/decade/quality/format filters stay active no matter which
+  // browse-by view or drill-down you're in; a drill-down's own dimension
+  // (e.g. drilling into a specific genre) takes precedence over the ambient
+  // filter for that same dimension.
+  const buildAmbientFilterParams = () => {
+    const params = {};
+    if (filterGenre) params.genre = filterGenre;
+    if (filterDecade) params.decade = Number(filterDecade);
+    if (filterQuality) params.quality = filterQuality;
+    if (filterFormat) params.format = filterFormat;
+    return params;
+  };
+
+  const hasActiveFilters = !!(filterGenre || filterDecade || filterQuality || filterFormat);
+
+  const clearFilters = () => {
+    setFilterGenre('');
+    setFilterDecade('');
+    setFilterQuality('');
+    setFilterFormat('');
+  };
 
   const buildTrackFilterParams = () => {
     const params = {};
     if (search) params.search = search;
+    Object.assign(params, buildAmbientFilterParams());
     if (drill) {
-      if (drill.by === 'genre') params.genre = drill.key;
-      else if (drill.by === 'decade') params.decade = Number(drill.key);
-      else if (drill.by === 'album') {
-        const [artist, album] = drill.key.split('||');
-        params.artist = artist;
-        params.album = album;
-      }
-    } else if (libraryMode === 'all') {
-      if (filterGenre) params.genre = filterGenre;
-      if (filterDecade) params.decade = Number(filterDecade);
+      Object.assign(params, paramsForGroupKey(drill.by, drill.key));
     }
     return params;
   };
@@ -218,7 +394,7 @@ function App() {
   const fetchGroups = async () => {
     setGroupsLoading(true);
     try {
-      const params = { by: libraryMode };
+      const params = { by: libraryMode, ...buildAmbientFilterParams() };
       if (search) params.search = search;
       const response = await axios.get(`${API_BASE_URL}/library/groups`, { params });
       setGroups(response.data);
@@ -330,6 +506,8 @@ function App() {
     setQueue(ordered.slice(1));
     setIsPlaying(true);
     setShuffleEnabled(shuffle);
+    setUserHasInteracted(true);
+    setInitialSeekMs(null);
     preShuffleQueueRef.current = null;
   };
 
@@ -356,7 +534,17 @@ function App() {
   };
 
   const togglePlay = () => {
+    setUserHasInteracted(true);
     if (outputDevice) {
+      // A restored session skips the auto-cast on mount, so the device never
+      // actually got the track loaded - the first press here needs to cast
+      // (load + play) rather than just resume a stream that was never sent.
+      if (wiimNeedsInitialCastRef.current && nowPlaying) {
+        wiimNeedsInitialCastRef.current = false;
+        axios.post(`${API_BASE_URL}/wiim/devices/${outputDevice.id}/play`, { track_id: nowPlaying.id })
+          .catch((err) => console.error('Error casting to WiiM:', err));
+        return;
+      }
       const action = wiimStatus?.status === 'play' ? 'pause' : 'resume';
       axios.post(`${API_BASE_URL}/wiim/devices/${outputDevice.id}/${action}`).catch((err) => {
         console.error('Error toggling WiiM playback:', err);
@@ -390,6 +578,52 @@ function App() {
     }
   };
 
+  // Shared between list and grid display styles - grid mode overlays the play
+  // button on the artwork instead of showing it as a separate row element.
+  const renderTrackCard = (track, list) => {
+    const isCurrent = nowPlaying && nowPlaying.id === track.id;
+    const isCardPlaying = isCurrent && effectiveIsPlaying;
+    const thumb = (
+      <div className="track-thumb-wrap">
+        <span className="track-thumb-fallback">{track.track_name.charAt(0).toUpperCase()}</span>
+        <img
+          className="track-thumb"
+          src={`${API_BASE_URL}/tracks/${track.id}/artwork`}
+          alt=""
+          loading="lazy"
+          onError={(e) => { e.target.style.display = 'none'; }}
+        />
+        {trackViewStyle === 'grid' && (
+          <button
+            className="play-btn overlay"
+            onClick={() => handleTrackPlayClick(track, list)}
+            aria-label={isCardPlaying ? 'Pause' : 'Play'}
+          >
+            {isCardPlaying ? '❚❚' : '▶'}
+          </button>
+        )}
+      </div>
+    );
+    return (
+      <div key={track.id} className={`track-card${isCurrent ? ' playing' : ''}`}>
+        {trackViewStyle !== 'grid' && (
+          <button
+            className="play-btn"
+            onClick={() => handleTrackPlayClick(track, list)}
+            aria-label={isCardPlaying ? 'Pause' : 'Play'}
+          >
+            {isCardPlaying ? '❚❚' : '▶'}
+          </button>
+        )}
+        {thumb}
+        <div className="track-info">
+          <h3>{track.track_name}</h3>
+          <p className="artist">{track.artist_name}</p>
+        </div>
+      </div>
+    );
+  };
+
   const handleNext = () => {
     setQueue((prevQueue) => {
       if (prevQueue.length === 0) {
@@ -414,6 +648,23 @@ function App() {
     });
   };
 
+  // Jumping to a specific Up Next row: everything from the current track up
+  // to (but not including) the clicked one moves into history, the clicked
+  // track becomes nowPlaying, and only what came after it remains queued.
+  const jumpToQueueItem = (index) => {
+    setQueue((prevQueue) => {
+      if (index < 0 || index >= prevQueue.length) return prevQueue;
+      const skipped = prevQueue.slice(0, index);
+      const target = prevQueue[index];
+      setHistory((h) => [...h, ...(nowPlaying ? [nowPlaying] : []), ...skipped]);
+      setNowPlaying(target);
+      setIsPlaying(true);
+      setUserHasInteracted(true);
+      setInitialSeekMs(null);
+      return prevQueue.slice(index + 1);
+    });
+  };
+
   // Shuffle needs the *entire* matching set considered, not just one page of it -
   // fetching a capped page and shuffling only that page means "shuffle all" would
   // only ever draw from whatever happened to sort first alphabetically. The count
@@ -431,14 +682,7 @@ function App() {
 
   const playGroup = async (group, { shuffle = false } = {}) => {
     try {
-      const params = {};
-      if (group.by === 'genre') params.genre = group.key;
-      else if (group.by === 'decade') params.decade = Number(group.key);
-      else if (group.by === 'album') {
-        const [artist, album] = group.key.split('||');
-        params.artist = artist;
-        params.album = album;
-      }
+      const params = { ...buildAmbientFilterParams(), ...paramsForGroupKey(group.by, group.key) };
       if (shuffle) {
         startQueue(await fetchAllMatchingShuffled(params));
       } else {
@@ -465,25 +709,37 @@ function App() {
   };
 
   const viewLabel = (mode) => (mode === 'all' ? 'All Tracks' : `By ${mode.charAt(0).toUpperCase()}${mode.slice(1)}`);
-  const backLabel = drill && (drill.by === 'album' ? 'Albums' : drill.by === 'genre' ? 'Genres' : 'Decades');
+  const backLabel = drill && BACK_LABELS[drill.by];
   const effectiveIsPlaying = outputDevice ? wiimStatus?.status === 'play' : isPlaying;
 
   return (
     <div className="app">
       <header className="app-header">
-        <h1>Music Discovery</h1>
+        <div className="app-brand">
+          <svg className="app-logo" viewBox="0 0 64 64" aria-hidden="true">
+            <defs>
+              <linearGradient id="app-logo-gradient" x1="0" y1="0" x2="1" y2="1">
+                <stop offset="0%" stopColor="#6366f1" />
+                <stop offset="100%" stopColor="#818cf8" />
+              </linearGradient>
+            </defs>
+            <rect width="64" height="64" rx="14" fill="url(#app-logo-gradient)" />
+            <path d="M23 18 L23 46 L47 32 Z" fill="#f5f5f7" />
+          </svg>
+          <h1>Music Discovery</h1>
+        </div>
         <nav className="nav-tabs">
-          <button
-            className={activeTab === 'discover' ? 'active' : ''}
-            onClick={() => setActiveTab('discover')}
-          >
-            Discover
-          </button>
           <button
             className={activeTab === 'library' ? 'active' : ''}
             onClick={() => setActiveTab('library')}
           >
             My Library
+          </button>
+          <button
+            className={activeTab === 'discover' ? 'active' : ''}
+            onClick={() => setActiveTab('discover')}
+          >
+            Discover
           </button>
           <button
             className={activeTab === 'taste' ? 'active' : ''}
@@ -498,6 +754,9 @@ function App() {
             Cleanup
           </button>
         </nav>
+        <button className="settings-btn" onClick={() => setSettingsOpen(true)} aria-label="Settings" title="Settings">
+          &#9881;
+        </button>
       </header>
 
       <main className={nowPlaying ? 'with-player' : ''}>
@@ -594,41 +853,34 @@ function App() {
           </section>
         ) : activeTab === 'library' ? (
           <section className="library-section">
-            <form onSubmit={handleScan} className="scan-form">
-              <div className="form-group full">
-                <label>Library folder</label>
-                <div className="scan-row">
-                  <input
-                    type="text"
-                    value={rootPath}
-                    onChange={(e) => setRootPath(e.target.value)}
-                    placeholder="/music"
-                    required
-                  />
-                  <button type="submit" disabled={scanning} className="scan-btn">
-                    {scanning ? 'Scanning...' : 'Scan Library'}
+            <div className="library-controls">
+              <div className="search-row">
+                <input
+                  type="text"
+                  className="search-input"
+                  placeholder="Search tracks, artists, albums…"
+                  value={searchInput}
+                  onChange={(e) => setSearchInput(e.target.value)}
+                />
+                <div className="view-style-toggle">
+                  <button
+                    className={trackViewStyle === 'list' ? 'active' : ''}
+                    onClick={() => setTrackViewStyle('list')}
+                    aria-label="List view"
+                    title="List view"
+                  >
+                    &#9776;
+                  </button>
+                  <button
+                    className={trackViewStyle === 'grid' ? 'active' : ''}
+                    onClick={() => setTrackViewStyle('grid')}
+                    aria-label="Grid view"
+                    title="Grid view"
+                  >
+                    &#9638;
                   </button>
                 </div>
-                <p className="hint">Path as seen by the backend container (bind-mounted from MUSIC_LIBRARY_PATH).</p>
               </div>
-              {scanError && <p className="error-message">{scanError}</p>}
-              {scanResult && scanResult.status !== 'idle' && (
-                <p className="scan-summary">
-                  {scanResult.status === 'running' ? 'Scanning… ' : scanResult.status === 'error' ? 'Scan failed after ' : 'Scan complete — '}
-                  {(scanResult.processed || 0).toLocaleString()} processed &middot; added {scanResult.added || 0} &middot; updated {scanResult.updated || 0}
-                  {scanResult.skipped > 0 ? ` · ${scanResult.skipped} unreadable` : ''}
-                </p>
-              )}
-            </form>
-
-            <div className="library-controls">
-              <input
-                type="text"
-                className="search-input"
-                placeholder="Search tracks, artists, albums…"
-                value={searchInput}
-                onChange={(e) => setSearchInput(e.target.value)}
-              />
               <div className="view-tabs">
                 {VIEW_MODES.map((mode) => (
                   <button
@@ -640,18 +892,27 @@ function App() {
                   </button>
                 ))}
               </div>
-              {libraryMode === 'all' && !drill && (
-                <div className="filter-row">
-                  <select value={filterGenre} onChange={(e) => setFilterGenre(e.target.value)}>
-                    <option value="">All Genres</option>
-                    {genreOptions.map((g) => <option key={g.key} value={g.key}>{g.label} ({g.count})</option>)}
-                  </select>
-                  <select value={filterDecade} onChange={(e) => setFilterDecade(e.target.value)}>
-                    <option value="">All Decades</option>
-                    {decadeOptions.map((d) => <option key={d.key} value={d.key}>{d.label} ({d.count})</option>)}
-                  </select>
-                </div>
-              )}
+              <div className="filter-row">
+                <select value={filterGenre} onChange={(e) => setFilterGenre(e.target.value)}>
+                  <option value="">All Genres</option>
+                  {genreOptions.map((g) => <option key={g.key} value={g.key}>{g.label} ({g.count})</option>)}
+                </select>
+                <select value={filterDecade} onChange={(e) => setFilterDecade(e.target.value)}>
+                  <option value="">All Decades</option>
+                  {decadeOptions.map((d) => <option key={d.key} value={d.key}>{d.label} ({d.count})</option>)}
+                </select>
+                <select value={filterQuality} onChange={(e) => setFilterQuality(e.target.value)}>
+                  <option value="">All Qualities</option>
+                  {qualityOptions.map((q) => <option key={q.key} value={q.key}>{q.label} ({q.count})</option>)}
+                </select>
+                <select value={filterFormat} onChange={(e) => setFilterFormat(e.target.value)}>
+                  <option value="">All Formats</option>
+                  {formatOptions.map((f) => <option key={f.key} value={f.key}>{f.label} ({f.count})</option>)}
+                </select>
+                {hasActiveFilters && (
+                  <button className="clear-filters-btn" onClick={clearFilters}>Clear Filters</button>
+                )}
+              </div>
             </div>
 
             {drill && (
@@ -679,38 +940,11 @@ function App() {
                 </div>
                 {libraryTracks.length === 0 ? (
                   <p className="empty-state">
-                    {libraryLoading ? 'Loading…' : 'No tracks found. Scan a folder above to get started.'}
+                    {libraryLoading ? 'Loading…' : 'No tracks found. Open Settings to scan a library folder.'}
                   </p>
                 ) : (
-                  <div className="tracks-grid">
-                    {libraryTracks.map((track) => {
-                      const isCurrent = nowPlaying && nowPlaying.id === track.id;
-                      return (
-                        <div key={track.id} className={`track-card${isCurrent ? ' playing' : ''}`}>
-                          <button
-                            className="play-btn"
-                            onClick={() => handleTrackPlayClick(track, libraryTracks)}
-                            aria-label={isCurrent && effectiveIsPlaying ? 'Pause' : 'Play'}
-                          >
-                            {isCurrent && effectiveIsPlaying ? '❚❚' : '▶'}
-                          </button>
-                          <div className="track-thumb-wrap">
-                            <span className="track-thumb-fallback">{track.track_name.charAt(0).toUpperCase()}</span>
-                            <img
-                              className="track-thumb"
-                              src={`${API_BASE_URL}/tracks/${track.id}/artwork`}
-                              alt=""
-                              loading="lazy"
-                              onError={(e) => { e.target.style.display = 'none'; }}
-                            />
-                          </div>
-                          <div className="track-info">
-                            <h3>{track.track_name}</h3>
-                            <p className="artist">{track.artist_name}</p>
-                          </div>
-                        </div>
-                      );
-                    })}
+                  <div className={`tracks-grid${trackViewStyle === 'grid' ? ' grid-view' : ''}`}>
+                    {libraryTracks.map((track) => renderTrackCard(track, libraryTracks))}
                   </div>
                 )}
                 {libraryTracks.length < libraryTotal && (
@@ -724,7 +958,7 @@ function App() {
                 )}
               </>
             ) : (
-              <div className="groups-grid">
+              <div className={`groups-grid${trackViewStyle === 'grid' ? ' grid-view' : ''}`}>
                 {groupsLoading ? (
                   <p className="empty-state">Loading…</p>
                 ) : groups.length === 0 ? (
@@ -732,6 +966,16 @@ function App() {
                 ) : (
                   groups.map((g) => (
                     <div key={g.key} className="group-card">
+                      <span className="group-thumb-fallback">{g.label.charAt(0).toUpperCase()}</span>
+                      {g.sample_track_id != null && (
+                        <img
+                          className="group-thumb"
+                          src={`${API_BASE_URL}/tracks/${g.sample_track_id}/artwork`}
+                          alt=""
+                          loading="lazy"
+                          onError={(e) => { e.target.style.display = 'none'; }}
+                        />
+                      )}
                       <div className="group-card-main" onClick={() => setDrill({ by: libraryMode, key: g.key, label: g.label })}>
                         <h3>{g.label}</h3>
                         <span className="group-count">{g.count.toLocaleString()} tracks</span>
@@ -790,6 +1034,18 @@ function App() {
         )}
       </main>
 
+      {settingsOpen && (
+        <SettingsPanel
+          onClose={() => setSettingsOpen(false)}
+          rootPath={rootPath}
+          setRootPath={setRootPath}
+          scanning={scanning}
+          scanResult={scanResult}
+          scanError={scanError}
+          onScan={handleScan}
+        />
+      )}
+
       <PlayerBar
         track={nowPlaying}
         queue={queue}
@@ -798,6 +1054,7 @@ function App() {
         hasPrev={history.length > 0}
         onNext={handleNext}
         onPrev={handlePrev}
+        onJumpToQueueItem={jumpToQueueItem}
         onTogglePlay={togglePlay}
         setIsPlaying={setIsPlaying}
         audioRef={audioRef}
@@ -809,6 +1066,9 @@ function App() {
         shuffleEnabled={shuffleEnabled}
         onToggleShuffle={toggleShuffle}
         onSeek={handleSeek}
+        userHasInteracted={userHasInteracted}
+        initialSeekMs={initialSeekMs}
+        onInitialSeekApplied={() => setInitialSeekMs(null)}
       />
     </div>
   );
@@ -834,10 +1094,50 @@ function channelLabel(channels) {
   return `${channels}ch`;
 }
 
+function SettingsPanel({ onClose, rootPath, setRootPath, scanning, scanResult, scanError, onScan }) {
+  return (
+    <div className="settings-overlay" onClick={onClose}>
+      <div className="settings-modal" onClick={(e) => e.stopPropagation()}>
+        <div className="settings-header">
+          <h2>Settings</h2>
+          <button className="settings-close" onClick={onClose} aria-label="Close">&times;</button>
+        </div>
+        <form onSubmit={onScan} className="scan-form">
+          <div className="form-group full">
+            <label>Library folder</label>
+            <div className="scan-row">
+              <input
+                type="text"
+                value={rootPath}
+                onChange={(e) => setRootPath(e.target.value)}
+                placeholder="/music"
+                required
+              />
+              <button type="submit" disabled={scanning} className="scan-btn">
+                {scanning ? 'Scanning...' : 'Scan Library'}
+              </button>
+            </div>
+            <p className="hint">Path as seen by the backend container (bind-mounted from MUSIC_LIBRARY_PATH).</p>
+          </div>
+          {scanError && <p className="error-message">{scanError}</p>}
+          {scanResult && scanResult.status !== 'idle' && (
+            <p className="scan-summary">
+              {scanResult.status === 'running' ? 'Scanning… ' : scanResult.status === 'error' ? 'Scan failed after ' : 'Scan complete — '}
+              {(scanResult.processed || 0).toLocaleString()} processed &middot; added {scanResult.added || 0} &middot; updated {scanResult.updated || 0}
+              {scanResult.skipped > 0 ? ` · ${scanResult.skipped} unreadable` : ''}
+            </p>
+          )}
+        </form>
+      </div>
+    </div>
+  );
+}
+
 function PlayerBar({
   track, queue, isPlaying, hasNext, hasPrev, onNext, onPrev, onTogglePlay, setIsPlaying, audioRef, apiBase,
   wiimDevices, outputDevice, setOutputDevice, wiimStatus,
-  shuffleEnabled, onToggleShuffle, onSeek,
+  shuffleEnabled, onToggleShuffle, onSeek, onJumpToQueueItem,
+  userHasInteracted, initialSeekMs, onInitialSeekApplied,
 }) {
   const [expanded, setExpanded] = useState(false);
   const [artistInfo, setArtistInfo] = useState(null);
@@ -952,7 +1252,14 @@ function PlayerBar({
                   </div>
                   <div className="queue-list">
                     {queue.slice(0, 200).map((t, idx) => (
-                      <div className="queue-row" key={`${t.id}-${idx}`}>
+                      <div
+                        className="queue-row"
+                        key={`${t.id}-${idx}`}
+                        onClick={() => onJumpToQueueItem(idx)}
+                        onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onJumpToQueueItem(idx); } }}
+                        role="button"
+                        tabIndex={0}
+                      >
                         <div className="queue-thumb-wrap">
                           <span className="queue-thumb-fallback">{t.track_name.charAt(0).toUpperCase()}</span>
                           <img
@@ -1055,59 +1362,85 @@ function PlayerBar({
           <span className="player-title">{track.track_name}</span>
           <span className="player-artist">{track.artist_name}</span>
         </div>
-        <div className="player-controls">
-          <button className="player-btn" onClick={onPrev} disabled={!hasPrev} aria-label="Previous">&#9198;</button>
-          {outputDevice ? (
-            <>
-              <button className="player-btn" onClick={onTogglePlay} aria-label={isPlaying ? 'Pause' : 'Play'}>
-                {isPlaying ? '❚❚' : '▶'}
-              </button>
-              <div className="wiim-progress">
-                <span className="wiim-progress-time">{formatDuration(Math.floor((wiimStatus?.position_ms || 0) / 1000))}</span>
-                <div className="bar-track wiim-progress-track">
-                  <div
-                    className="bar-fill"
-                    style={{
-                      width: wiimStatus?.duration_ms
-                        ? `${Math.min(100, (wiimStatus.position_ms / wiimStatus.duration_ms) * 100)}%`
-                        : '0%',
-                    }}
-                  />
-                </div>
-                <span className="wiim-progress-time">{formatDuration(Math.floor((wiimStatus?.duration_ms || 0) / 1000))}</span>
-              </div>
-            </>
-          ) : (
-            <audio
-              key={track.id}
-              ref={audioRef}
-              src={`${apiBase}/tracks/${track.id}/stream`}
-              autoPlay
-              controls
-              className="player-audio"
-              onPlay={() => setIsPlaying(true)}
-              onPause={() => setIsPlaying(false)}
-              onEnded={onNext}
-              onTimeUpdate={(e) => setLocalProgress({ currentTime: e.target.currentTime, duration: e.target.duration || 0 })}
-              onLoadedMetadata={(e) => setLocalProgress({ currentTime: e.target.currentTime, duration: e.target.duration || 0 })}
-            />
-          )}
-          <button className="player-btn" onClick={onNext} disabled={!hasNext} aria-label="Next">&#9197;</button>
+
+        <div className="player-center">
+          <div className="player-progress-row">
+            <span className="player-progress-time">{formatDuration(Math.floor(positionMs / 1000))}</span>
+            <div className="np-progress-track" onClick={handleProgressClick}>
+              <div className="np-progress-fill" style={{ width: `${progressRatio * 100}%` }} />
+              <div className="np-progress-handle" style={{ left: `${progressRatio * 100}%` }} />
+            </div>
+            <span className="player-progress-time">{formatDuration(Math.floor(durationMs / 1000))}</span>
+          </div>
+          {techParts.length > 0 && <p className="player-tech">{techParts.join(' · ')}</p>}
         </div>
-        <select
-          className="output-picker"
-          value={outputDevice ? outputDevice.id : ''}
-          onChange={(e) => {
-            const id = e.target.value;
-            setOutputDevice(id ? wiimDevices.find((d) => d.id === id) || null : null);
-          }}
-          aria-label="Playback output"
-        >
-          <option value="">🔊 This Browser</option>
-          {wiimDevices.map((d) => (
-            <option key={d.id} value={d.id}>📡 {d.name}</option>
-          ))}
-        </select>
+
+        <div className="player-controls">
+          <button
+            className={`player-btn${shuffleEnabled ? ' active' : ''}`}
+            onClick={onToggleShuffle}
+            aria-label="Shuffle"
+            aria-pressed={shuffleEnabled}
+            title="Shuffle"
+          >
+            &#128256;
+          </button>
+          <button className="player-btn" onClick={onPrev} disabled={!hasPrev} aria-label="Previous">&#9198;</button>
+          <button className="player-btn" onClick={onTogglePlay} aria-label={isPlaying ? 'Pause' : 'Play'}>
+            {isPlaying ? '❚❚' : '▶'}
+          </button>
+          <button className="player-btn" onClick={onNext} disabled={!hasNext} aria-label="Next">&#9197;</button>
+          <div className="np-destination">
+            <button
+              className={`player-btn${outputDevice ? ' active' : ''}`}
+              onClick={() => setDestMenuOpen((o) => !o)}
+              aria-label="Playback destination"
+              title={`Playing on ${destinationLabel}`}
+            >
+              {outputDevice ? '📡' : '🔊'}
+            </button>
+            {destMenuOpen && (
+              <div className="np-destination-menu">
+                <button
+                  className={!outputDevice ? 'active' : ''}
+                  onClick={() => { setOutputDevice(null); setDestMenuOpen(false); }}
+                >
+                  🔊 This Browser
+                </button>
+                {wiimDevices.map((d) => (
+                  <button
+                    key={d.id}
+                    className={outputDevice?.id === d.id ? 'active' : ''}
+                    onClick={() => { setOutputDevice(d); setDestMenuOpen(false); }}
+                  >
+                    📡 {d.name}
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+
+        {!outputDevice && (
+          <audio
+            key={track.id}
+            ref={audioRef}
+            src={`${apiBase}/tracks/${track.id}/stream`}
+            autoPlay={userHasInteracted}
+            className="player-audio-hidden"
+            onPlay={() => setIsPlaying(true)}
+            onPause={() => setIsPlaying(false)}
+            onEnded={onNext}
+            onTimeUpdate={(e) => setLocalProgress({ currentTime: e.target.currentTime, duration: e.target.duration || 0 })}
+            onLoadedMetadata={(e) => {
+              if (initialSeekMs != null) {
+                e.target.currentTime = initialSeekMs / 1000;
+                onInitialSeekApplied();
+              }
+              setLocalProgress({ currentTime: e.target.currentTime, duration: e.target.duration || 0 });
+            }}
+          />
+        )}
       </div>
     </div>
   );
