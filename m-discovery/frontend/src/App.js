@@ -317,6 +317,16 @@ function App() {
     }
   };
 
+  const playCurrentFilter = async ({ shuffle = false } = {}) => {
+    try {
+      const params = { ...buildTrackFilterParams(), limit: GROUP_QUEUE_LIMIT, offset: 0 };
+      const response = await axios.get(`${API_BASE_URL}/tracks/known`, { params });
+      startQueue(response.data.tracks, { shuffle });
+    } catch (err) {
+      console.error('Error queuing playback:', err);
+    }
+  };
+
   const viewLabel = (mode) => (mode === 'all' ? 'All Tracks' : `By ${mode.charAt(0).toUpperCase()}${mode.slice(1)}`);
   const backLabel = drill && (drill.by === 'album' ? 'Albums' : drill.by === 'genre' ? 'Genres' : 'Decades');
 
@@ -515,6 +525,12 @@ function App() {
               <>
                 <div className="library-header">
                   <h2>{drill ? '' : 'Your Library'}</h2>
+                  {!drill && libraryTracks.length > 0 && (
+                    <div className="group-actions">
+                      <button className="group-action-btn" onClick={() => playCurrentFilter()}>&#9654; Play All</button>
+                      <button className="group-action-btn" onClick={() => playCurrentFilter({ shuffle: true })}>&#128256; Shuffle All</button>
+                    </div>
+                  )}
                   <span className="library-count">{libraryTotal.toLocaleString()} tracks</span>
                 </div>
                 {libraryTracks.length === 0 ? (
@@ -629,6 +645,7 @@ function App() {
         hasPrev={history.length > 0}
         onNext={handleNext}
         onPrev={handlePrev}
+        onTogglePlay={togglePlay}
         setIsPlaying={setIsPlaying}
         audioRef={audioRef}
         apiBase={API_BASE_URL}
@@ -637,35 +654,136 @@ function App() {
   );
 }
 
-function PlayerBar({ track, isPlaying, hasNext, hasPrev, onNext, onPrev, setIsPlaying, audioRef, apiBase }) {
+function formatDuration(seconds) {
+  if (seconds === null || seconds === undefined) return null;
+  const m = Math.floor(seconds / 60);
+  const s = Math.floor(seconds % 60).toString().padStart(2, '0');
+  return `${m}:${s}`;
+}
+
+function formatFileSize(bytes) {
+  if (!bytes) return null;
+  const mb = bytes / (1024 * 1024);
+  return mb >= 1000 ? `${(mb / 1024).toFixed(1)} GB` : `${mb.toFixed(1)} MB`;
+}
+
+function channelLabel(channels) {
+  if (!channels) return null;
+  if (channels === 1) return 'Mono';
+  if (channels === 2) return 'Stereo';
+  return `${channels}ch`;
+}
+
+function PlayerBar({ track, isPlaying, hasNext, hasPrev, onNext, onPrev, onTogglePlay, setIsPlaying, audioRef, apiBase }) {
+  const [expanded, setExpanded] = useState(false);
+  const [artistInfo, setArtistInfo] = useState(null);
+  const [bioExpanded, setBioExpanded] = useState(false);
+  const lastArtistRef = useRef(null);
+
+  useEffect(() => {
+    if (!expanded || !track) return;
+    if (lastArtistRef.current === track.artist_name) return;
+    lastArtistRef.current = track.artist_name;
+    setArtistInfo(null);
+    setBioExpanded(false);
+    axios.get(`${apiBase}/artist-info`, { params: { name: track.artist_name } })
+      .then((r) => setArtistInfo(r.data))
+      .catch(() => setArtistInfo({ found: false }));
+  }, [expanded, track, apiBase]);
+
   if (!track) return null;
+
+  const metaParts = [track.genre, track.year, formatDuration(track.duration_seconds)].filter(Boolean);
+  const techParts = [
+    track.file_format,
+    track.bitrate ? `${Math.round(track.bitrate / 1000)}kbps` : null,
+    track.sample_rate ? `${(track.sample_rate / 1000).toFixed(1)}kHz` : null,
+    channelLabel(track.channels),
+    formatFileSize(track.file_size_bytes),
+  ].filter(Boolean);
+
   return (
-    <div className="player-bar">
-      <div className="player-thumb-wrap">
-        <img
-          src={`${apiBase}/tracks/${track.id}/artwork`}
-          alt=""
-          onError={(e) => { e.target.style.display = 'none'; }}
-        />
-      </div>
-      <div className="player-info">
-        <span className="player-title">{track.track_name}</span>
-        <span className="player-artist">{track.artist_name}</span>
-      </div>
-      <div className="player-controls">
-        <button className="player-btn" onClick={onPrev} disabled={!hasPrev} aria-label="Previous">&#9198;</button>
-        <audio
-          key={track.id}
-          ref={audioRef}
-          src={`${apiBase}/tracks/${track.id}/stream`}
-          autoPlay
-          controls
-          className="player-audio"
-          onPlay={() => setIsPlaying(true)}
-          onPause={() => setIsPlaying(false)}
-          onEnded={onNext}
-        />
-        <button className="player-btn" onClick={onNext} disabled={!hasNext} aria-label="Next">&#9197;</button>
+    <div className="player-root">
+      {expanded && (
+        <div className="now-playing-panel">
+          <div
+            className="now-playing-backdrop"
+            style={{ backgroundImage: `url(${apiBase}/tracks/${track.id}/artwork)` }}
+          />
+          <button className="now-playing-collapse" onClick={() => setExpanded(false)} aria-label="Collapse">&#9660;</button>
+          <div className="now-playing-content">
+          <div className="now-playing-body">
+            <div className="now-playing-art">
+              <img
+                src={`${apiBase}/tracks/${track.id}/artwork`}
+                alt=""
+                onError={(e) => { e.target.style.display = 'none'; }}
+              />
+            </div>
+            <div className="now-playing-details">
+              <h2 className="now-playing-title">{track.track_name}</h2>
+              <div className="now-playing-artist-row">
+                {artistInfo?.found && (
+                  <img
+                    className="now-playing-artist-photo"
+                    src={`${apiBase}/artist-info/photo?name=${encodeURIComponent(track.artist_name)}`}
+                    alt=""
+                    onError={(e) => { e.target.style.display = 'none'; }}
+                  />
+                )}
+                <p className="now-playing-artist">{track.artist_name}</p>
+              </div>
+              {track.album_name && <p className="now-playing-album">{track.album_name}</p>}
+              {metaParts.length > 0 && <p className="now-playing-meta">{metaParts.join(' · ')}</p>}
+              {techParts.length > 0 && <p className="now-playing-tech">{techParts.join(' · ')}</p>}
+              <div className="now-playing-controls">
+                <button className="player-btn large" onClick={onPrev} disabled={!hasPrev} aria-label="Previous">&#9198;</button>
+                <button className="player-btn xlarge" onClick={onTogglePlay} aria-label={isPlaying ? 'Pause' : 'Play'}>
+                  {isPlaying ? '❚❚' : '▶'}
+                </button>
+                <button className="player-btn large" onClick={onNext} disabled={!hasNext} aria-label="Next">&#9197;</button>
+              </div>
+            </div>
+          </div>
+          {artistInfo?.found && artistInfo.biography && (
+            <div className="now-playing-bio">
+              <h3>About {track.artist_name}</h3>
+              <p className={bioExpanded ? '' : 'clamped'}>{artistInfo.biography}</p>
+              <button className="bio-toggle" onClick={() => setBioExpanded(!bioExpanded)}>
+                {bioExpanded ? 'Show less' : 'Read more'}
+              </button>
+            </div>
+          )}
+          </div>
+        </div>
+      )}
+      <div className="player-bar">
+        <div className="player-thumb-wrap" onClick={() => setExpanded(true)}>
+          <img
+            src={`${apiBase}/tracks/${track.id}/artwork`}
+            alt=""
+            onError={(e) => { e.target.style.display = 'none'; }}
+          />
+        </div>
+        <div className="player-info" onClick={() => setExpanded(true)}>
+          <span className="player-title">{track.track_name}</span>
+          <span className="player-artist">{track.artist_name}</span>
+        </div>
+        <div className="player-controls">
+          <button className="player-btn" onClick={onPrev} disabled={!hasPrev} aria-label="Previous">&#9198;</button>
+          <audio
+            key={track.id}
+            ref={audioRef}
+            src={`${apiBase}/tracks/${track.id}/stream`}
+            autoPlay
+            controls
+            className="player-audio"
+            onPlay={() => setIsPlaying(true)}
+            onPause={() => setIsPlaying(false)}
+            onEnded={onNext}
+          />
+          <button className="player-btn" onClick={onNext} disabled={!hasNext} aria-label="Next">&#9197;</button>
+        </div>
       </div>
     </div>
   );

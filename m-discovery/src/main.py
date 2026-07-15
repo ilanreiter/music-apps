@@ -7,6 +7,7 @@ from psycopg2.extras import RealDictCursor
 from .database import get_db_connection, create_tables
 from .library_scanner import run_scan
 from .artwork import get_or_create_thumbnail
+from .artist_info import get_artist_info, get_artist_photo_path
 import google.generativeai as genai
 import os
 import json
@@ -36,6 +37,14 @@ class Track(BaseModel):
     track_name: str
     artist_name: str
     album_name: Optional[str] = None
+    genre: Optional[str] = None
+    year: Optional[int] = None
+    duration_seconds: Optional[int] = None
+    bitrate: Optional[int] = None
+    sample_rate: Optional[int] = None
+    channels: Optional[int] = None
+    file_size_bytes: Optional[int] = None
+    file_format: Optional[str] = None
     is_favorite: Optional[bool] = False
     last_played: Optional[str] = None # Will be datetime string
 
@@ -84,6 +93,17 @@ class GroupEntry(BaseModel):
     key: str
     label: str
     count: int
+
+class ArtistInfo(BaseModel):
+    found: bool
+    source: Optional[str] = None  # 'audiodb' or 'wikipedia'
+    name: Optional[str] = None
+    biography: Optional[str] = None
+    genre: Optional[str] = None
+    style: Optional[str] = None
+    country: Optional[str] = None
+    formed_year: Optional[str] = None
+    website: Optional[str] = None
 
 # Dependency to get a database connection
 def get_db():
@@ -143,13 +163,17 @@ async def get_known_tracks(
         total = cur.fetchone()['count']
 
         cur.execute(f"""
-            SELECT id, track_name, artist_name, album_name, is_favorite, last_played
+            SELECT id, track_name, artist_name, album_name, genre, year, duration_seconds,
+                   bitrate, sample_rate, channels, file_size_bytes, file_path, is_favorite, last_played
             FROM known_tracks {where_sql}
             ORDER BY artist_name, album_name, track_name
             LIMIT %(limit)s OFFSET %(offset)s
         """, {**params, 'limit': limit, 'offset': offset})
         tracks = cur.fetchall()
         cur.close()
+        for track in tracks:
+            file_path = track.pop('file_path', None)
+            track['file_format'] = os.path.splitext(file_path)[1].lstrip('.').upper() if file_path else None
         return {"total": total, "tracks": tracks}
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
@@ -232,6 +256,23 @@ async def get_track_artwork(track_id: int, db: psycopg2.extensions.connection = 
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No artwork available")
 
     return FileResponse(cache_path, media_type="image/jpeg")
+
+# Defined as regular (non-async) functions so FastAPI runs them in its threadpool -
+# they make a blocking network call to TheAudioDB, which would otherwise stall the
+# single asyncio event loop for every other in-flight request.
+@app.get("/api/artist-info", response_model=ArtistInfo)
+def get_artist_info_endpoint(name: str):
+    info = get_artist_info(name)
+    if info is None:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Could not reach artist info service")
+    return info
+
+@app.get("/api/artist-info/photo")
+def get_artist_photo_endpoint(name: str):
+    photo_path = get_artist_photo_path(name)
+    if not photo_path:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No artist photo available")
+    return FileResponse(photo_path, media_type="image/jpeg")
 
 @app.post("/api/library/scan", response_model=ScanStatus, status_code=status.HTTP_202_ACCEPTED)
 async def scan_library(params: LibraryScanRequest):

@@ -7,6 +7,7 @@ services:
     volumes:
       - ${MUSIC_LIBRARY_PATH:-./music}:/music:ro
       - artwork_cache:/app/artwork_cache
+      - artist_cache:/app/artist_cache
     ports:
       - "8001:8000"
 
@@ -21,3 +22,4 @@ services:
 
 volumes:
   artwork_cache:
+  artist_cache:

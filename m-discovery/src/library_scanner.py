@@ -72,6 +72,14 @@ def read_tags(file_path):
 
     info = getattr(audio, 'info', None)
     duration_seconds = int(info.length) if info and getattr(info, 'length', None) else None
+    bitrate = getattr(info, 'bitrate', None) if info else None
+    sample_rate = getattr(info, 'sample_rate', None) if info else None
+    channels = getattr(info, 'channels', None) if info else None
+
+    try:
+        file_size_bytes = os.path.getsize(file_path)
+    except OSError:
+        file_size_bytes = None
 
     return {
         'file_path': file_path,
@@ -81,6 +89,10 @@ def read_tags(file_path):
         'genre': genre,
         'year': year,
         'duration_seconds': duration_seconds,
+        'bitrate': bitrate,
+        'sample_rate': sample_rate,
+        'channels': channels,
+        'file_size_bytes': file_size_bytes,
     }
 
 
@@ -94,15 +106,25 @@ def find_audio_files(root_path):
 def _upsert_track(cur, metadata):
     # xmax = 0 on the returned row means it was newly inserted rather than updated by the conflict.
     cur.execute("""
-        INSERT INTO known_tracks (track_name, artist_name, album_name, genre, year, duration_seconds, file_path)
-        VALUES (%(track_name)s, %(artist_name)s, %(album_name)s, %(genre)s, %(year)s, %(duration_seconds)s, %(file_path)s)
+        INSERT INTO known_tracks (
+            track_name, artist_name, album_name, genre, year, duration_seconds,
+            bitrate, sample_rate, channels, file_size_bytes, file_path
+        )
+        VALUES (
+            %(track_name)s, %(artist_name)s, %(album_name)s, %(genre)s, %(year)s, %(duration_seconds)s,
+            %(bitrate)s, %(sample_rate)s, %(channels)s, %(file_size_bytes)s, %(file_path)s
+        )
         ON CONFLICT (file_path) WHERE file_path IS NOT NULL DO UPDATE SET
             track_name = EXCLUDED.track_name,
             artist_name = EXCLUDED.artist_name,
             album_name = EXCLUDED.album_name,
             genre = EXCLUDED.genre,
             year = EXCLUDED.year,
-            duration_seconds = EXCLUDED.duration_seconds
+            duration_seconds = EXCLUDED.duration_seconds,
+            bitrate = EXCLUDED.bitrate,
+            sample_rate = EXCLUDED.sample_rate,
+            channels = EXCLUDED.channels,
+            file_size_bytes = EXCLUDED.file_size_bytes
         RETURNING (xmax = 0) AS inserted
     """, metadata)
     row = cur.fetchone()
