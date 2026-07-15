@@ -312,14 +312,16 @@ def wiim_play(device_id: str, params: WiimPlayRequest, db: psycopg2.extensions.c
     device = _get_wiim_device_or_404(device_id)
 
     cur = db.cursor()
-    cur.execute("SELECT id FROM known_tracks WHERE id = %s", (params.track_id,))
-    found = cur.fetchone()
+    cur.execute("SELECT track_name, artist_name, album_name FROM known_tracks WHERE id = %s", (params.track_id,))
+    track = cur.fetchone()
     cur.close()
-    if not found:
+    if not track:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Track not found")
+    track_name, artist_name, album_name = track
 
     stream_url = f"{PUBLIC_BASE_URL}/api/tracks/{params.track_id}/stream"
-    if not wiim.play_url(device['ip'], stream_url):
+    art_url = f"{PUBLIC_BASE_URL}/api/tracks/{params.track_id}/artwork"
+    if not wiim.play_url(device['ip'], params.track_id, stream_url, art_url, title=track_name, artist=artist_name, album=album_name):
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Could not reach WiiM device")
     return {"status": "playing"}
 
