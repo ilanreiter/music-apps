@@ -130,6 +130,9 @@ class WiimPlayRequest(BaseModel):
 class WiimVolumeRequest(BaseModel):
     level: int
 
+class WiimSeekRequest(BaseModel):
+    position_ms: int
+
 class WiimStatus(BaseModel):
     reachable: bool
     status: Optional[str] = None
@@ -366,6 +369,13 @@ def wiim_stop(device_id: str):
     if not wiim.stop(device['ip']):
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Could not reach WiiM device")
     return {"status": "stopped"}
+
+@app.post("/api/wiim/devices/{device_id}/seek")
+def wiim_seek(device_id: str, params: WiimSeekRequest):
+    device = _get_wiim_device_or_404(device_id)
+    if not wiim.seek(device['ip'], params.position_ms):
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Could not reach WiiM device")
+    return {"status": "ok"}
 
 @app.post("/api/wiim/devices/{device_id}/volume")
 def wiim_set_volume(device_id: str, params: WiimVolumeRequest):

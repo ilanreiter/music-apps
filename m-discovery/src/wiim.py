@@ -151,6 +151,22 @@ def stop(ip):
     return _soap_request(ip, services['avtransport'], AVTRANSPORT_SERVICE, 'Stop', {'InstanceID': 0}) is not None
 
 
+def _ms_to_time_str(position_ms):
+    total_seconds = max(0, int(position_ms) // 1000)
+    h, rem = divmod(total_seconds, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+def seek(ip, position_ms):
+    services = _discover_services(ip)
+    if not services or not services.get('avtransport'):
+        return False
+    return _soap_request(ip, services['avtransport'], AVTRANSPORT_SERVICE, 'Seek', {
+        'InstanceID': 0, 'Unit': 'REL_TIME', 'Target': _ms_to_time_str(position_ms),
+    }) is not None
+
+
 def set_volume(ip, level):
     services = _discover_services(ip)
     if not services or not services.get('renderingcontrol'):

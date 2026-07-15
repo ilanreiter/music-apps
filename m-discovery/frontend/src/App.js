@@ -56,7 +56,9 @@ function App() {
   const [history, setHistory] = useState([]);
   const [nowPlaying, setNowPlaying] = useState(null);
   const [isPlaying, setIsPlaying] = useState(false);
+  const [shuffleEnabled, setShuffleEnabled] = useState(false);
   const audioRef = useRef(null);
+  const preShuffleQueueRef = useRef(null);
 
   // Output routing: null = play in this browser, otherwise cast to a WiiM device
   const [wiimDevices, setWiimDevices] = useState([]);
@@ -327,11 +329,30 @@ function App() {
     setNowPlaying(ordered[0]);
     setQueue(ordered.slice(1));
     setIsPlaying(true);
+    setShuffleEnabled(shuffle);
+    preShuffleQueueRef.current = null;
   };
 
   const playTrackFromList = (track, list) => {
     const index = list.findIndex((t) => t.id === track.id);
     startQueue(index >= 0 ? list.slice(index) : [track]);
+  };
+
+  // Toggle shuffling of the *remaining* queue, keeping the currently-playing
+  // track fixed. Remembers the pre-shuffle order so toggling back off restores
+  // the original upcoming sequence rather than re-shuffling again.
+  const toggleShuffle = () => {
+    setShuffleEnabled((prevEnabled) => {
+      const next = !prevEnabled;
+      if (next) {
+        preShuffleQueueRef.current = queue;
+        setQueue(shuffleArray(queue));
+      } else if (preShuffleQueueRef.current) {
+        setQueue(preShuffleQueueRef.current);
+        preShuffleQueueRef.current = null;
+      }
+      return next;
+    });
   };
 
   const togglePlay = () => {
@@ -347,6 +368,17 @@ function App() {
       audioRef.current.play();
     } else {
       audioRef.current.pause();
+    }
+  };
+
+  const handleSeek = (positionMs) => {
+    if (outputDevice) {
+      axios.post(`${API_BASE_URL}/wiim/devices/${outputDevice.id}/seek`, { position_ms: Math.round(positionMs) })
+        .catch((err) => console.error('Error seeking WiiM playback:', err));
+      return;
+    }
+    if (audioRef.current) {
+      audioRef.current.currentTime = positionMs / 1000;
     }
   };
 
@@ -774,6 +806,9 @@ function App() {
         outputDevice={outputDevice}
         setOutputDevice={setOutputDevice}
         wiimStatus={wiimStatus}
+        shuffleEnabled={shuffleEnabled}
+        onToggleShuffle={toggleShuffle}
+        onSeek={handleSeek}
       />
     </div>
   );
@@ -802,10 +837,13 @@ function channelLabel(channels) {
 function PlayerBar({
   track, queue, isPlaying, hasNext, hasPrev, onNext, onPrev, onTogglePlay, setIsPlaying, audioRef, apiBase,
   wiimDevices, outputDevice, setOutputDevice, wiimStatus,
+  shuffleEnabled, onToggleShuffle, onSeek,
 }) {
   const [expanded, setExpanded] = useState(false);
   const [artistInfo, setArtistInfo] = useState(null);
   const [bioExpanded, setBioExpanded] = useState(false);
+  const [destMenuOpen, setDestMenuOpen] = useState(false);
+  const [localProgress, setLocalProgress] = useState({ currentTime: 0, duration: 0 });
   const lastArtistRef = useRef(null);
 
   useEffect(() => {
@@ -819,6 +857,10 @@ function PlayerBar({
       .catch(() => setArtistInfo({ found: false }));
   }, [expanded, track, apiBase]);
 
+  useEffect(() => {
+    setLocalProgress({ currentTime: 0, duration: 0 });
+  }, [track?.id]);
+
   if (!track) return null;
 
   const metaParts = [track.genre, track.year, formatDuration(track.duration_seconds)].filter(Boolean);
@@ -830,6 +872,19 @@ function PlayerBar({
     formatFileSize(track.file_size_bytes),
   ].filter(Boolean);
 
+  const positionMs = outputDevice ? (wiimStatus?.position_ms || 0) : localProgress.currentTime * 1000;
+  const durationMs = outputDevice ? (wiimStatus?.duration_ms || 0) : localProgress.duration * 1000;
+  const progressRatio = durationMs > 0 ? Math.min(1, positionMs / durationMs) : 0;
+
+  const handleProgressClick = (e) => {
+    if (!durationMs) return;
+    const rect = e.currentTarget.getBoundingClientRect();
+    const ratio = Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width));
+    onSeek(ratio * durationMs);
+  };
+
+  const destinationLabel = outputDevice ? outputDevice.name : 'This Browser';
+
   return (
     <div className="player-root">
       {expanded && (
@@ -839,75 +894,153 @@ function PlayerBar({
             style={{ backgroundImage: `url(${apiBase}/tracks/${track.id}/artwork)` }}
           />
           <button className="now-playing-collapse" onClick={() => setExpanded(false)} aria-label="Collapse">&#9660;</button>
-          <div className="now-playing-content">
-          <div className="now-playing-body">
-            <div className="now-playing-art">
-              <img
-                src={`${apiBase}/tracks/${track.id}/artwork`}
-                alt=""
-                onError={(e) => { e.target.style.display = 'none'; }}
-              />
-            </div>
-            <div className="now-playing-details">
-              <h2 className="now-playing-title">{track.track_name}</h2>
-              <div className="now-playing-artist-row">
-                {artistInfo?.found && (
-                  <img
-                    className="now-playing-artist-photo"
-                    src={`${apiBase}/artist-info/photo?name=${encodeURIComponent(track.artist_name)}`}
-                    alt=""
-                    onError={(e) => { e.target.style.display = 'none'; }}
-                  />
-                )}
-                <p className="now-playing-artist">{track.artist_name}</p>
-              </div>
-              {track.album_name && <p className="now-playing-album">{track.album_name}</p>}
-              {metaParts.length > 0 && <p className="now-playing-meta">{metaParts.join(' · ')}</p>}
-              {techParts.length > 0 && <p className="now-playing-tech">{techParts.join(' · ')}</p>}
-              <div className="now-playing-controls">
-                <button className="player-btn large" onClick={onPrev} disabled={!hasPrev} aria-label="Previous">&#9198;</button>
-                <button className="player-btn xlarge" onClick={onTogglePlay} aria-label={isPlaying ? 'Pause' : 'Play'}>
-                  {isPlaying ? '❚❚' : '▶'}
-                </button>
-                <button className="player-btn large" onClick={onNext} disabled={!hasNext} aria-label="Next">&#9197;</button>
-              </div>
-            </div>
-          </div>
-          {artistInfo?.found && artistInfo.biography && (
-            <div className="now-playing-bio">
-              <h3>About {track.artist_name}</h3>
-              <p className={bioExpanded ? '' : 'clamped'}>{artistInfo.biography}</p>
-              <button className="bio-toggle" onClick={() => setBioExpanded(!bioExpanded)}>
-                {bioExpanded ? 'Show less' : 'Read more'}
-              </button>
-            </div>
-          )}
-          </div>
-          {queue && queue.length > 0 && (
-            <div className="now-playing-queue">
-              <div className="now-playing-queue-header">
-                <h3>Up Next</h3>
-                <span className="queue-count">
-                  {queue.length.toLocaleString()} track{queue.length === 1 ? '' : 's'} queued
-                  {queue.length > 200 ? ' — showing first 200' : ''}
-                </span>
-              </div>
-              <div className="queue-list">
-                {queue.slice(0, 200).map((t, idx) => (
-                  <div className="queue-row" key={`${t.id}-${idx}`}>
-                    <span className="queue-position">{idx + 1}</span>
-                    <span className="queue-track-title">{t.track_name}</span>
-                    <span className="queue-track-artist">{t.artist_name}</span>
+
+          <div className="now-playing-grid">
+            <div className="np-main-col">
+              <div className="np-hero-row">
+                <section className="np-section np-art-section">
+                  <div className="now-playing-art">
+                    <img
+                      src={`${apiBase}/tracks/${track.id}/artwork`}
+                      alt=""
+                      onError={(e) => { e.target.style.display = 'none'; }}
+                    />
                   </div>
-                ))}
+                </section>
+
+                <section className="np-section np-info-section">
+                  <h2 className="now-playing-title">{track.track_name}</h2>
+                  <div className="now-playing-artist-row">
+                    {artistInfo?.found && (
+                      <img
+                        className="now-playing-artist-photo"
+                        src={`${apiBase}/artist-info/photo?name=${encodeURIComponent(track.artist_name)}`}
+                        alt=""
+                        onError={(e) => { e.target.style.display = 'none'; }}
+                      />
+                    )}
+                    <p className="now-playing-artist">{track.artist_name}</p>
+                  </div>
+                  {track.album_name && <p className="now-playing-album">{track.album_name}</p>}
+                  {metaParts.length > 0 && <p className="now-playing-meta">{metaParts.join(' · ')}</p>}
+                  {techParts.length > 0 && <p className="now-playing-tech">{techParts.join(' · ')}</p>}
+                </section>
               </div>
-              {queue.length > 200 && (
-                <p className="queue-more-note">
-                  + {(queue.length - 200).toLocaleString()} more tracks queued (all {queue.length.toLocaleString()} will still play — this list just isn't showing all of them)
-                </p>
+
+              {artistInfo?.found && artistInfo.biography && (
+                <section className={`np-section np-bio-section${bioExpanded ? ' expanded' : ''}`}>
+                  <h3>About {track.artist_name}</h3>
+                  <div className="np-bio-scroll">
+                    <p className={bioExpanded ? '' : 'clamped'}>{artistInfo.biography}</p>
+                  </div>
+                  <button className="bio-toggle" onClick={() => setBioExpanded(!bioExpanded)}>
+                    {bioExpanded ? 'Show less' : 'Read more'}
+                  </button>
+                </section>
               )}
             </div>
-          )}
+
+            <div className="np-queue-col">
+              {queue && queue.length > 0 && (
+                <section className="np-section np-queue-section">
+                  <div className="now-playing-queue-header">
+                    <h3>Up Next</h3>
+                    <span className="queue-count">
+                      {queue.length.toLocaleString()} track{queue.length === 1 ? '' : 's'} queued
+                      {queue.length > 200 ? ' — showing first 200' : ''}
+                    </span>
+                  </div>
+                  <div className="queue-list">
+                    {queue.slice(0, 200).map((t, idx) => (
+                      <div className="queue-row" key={`${t.id}-${idx}`}>
+                        <div className="queue-thumb-wrap">
+                          <span className="queue-thumb-fallback">{t.track_name.charAt(0).toUpperCase()}</span>
+                          <img
+                            className="queue-thumb"
+                            src={`${apiBase}/tracks/${t.id}/artwork`}
+                            alt=""
+                            loading="lazy"
+                            onError={(e) => { e.target.style.display = 'none'; }}
+                          />
+                        </div>
+                        <div className="queue-track-info">
+                          <span className="queue-track-title">{t.track_name}</span>
+                          <span className="queue-track-artist">{t.artist_name}</span>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                  {queue.length > 200 && (
+                    <p className="queue-more-note">
+                      + {(queue.length - 200).toLocaleString()} more tracks queued (all {queue.length.toLocaleString()} will still play — this list just isn't showing all of them)
+                    </p>
+                  )}
+                </section>
+              )}
+            </div>
+
+            <div className="np-bottom-bar">
+              <section className="np-section np-progress-section">
+                <div className="np-progress-track" onClick={handleProgressClick}>
+                  <div className="np-progress-fill" style={{ width: `${progressRatio * 100}%` }} />
+                  <div className="np-progress-handle" style={{ left: `${progressRatio * 100}%` }} />
+                </div>
+                <div className="np-progress-times">
+                  <span>{formatDuration(Math.floor(positionMs / 1000))}</span>
+                  <span>{formatDuration(Math.floor(durationMs / 1000))}</span>
+                </div>
+              </section>
+
+              <section className="np-section np-controls-section">
+                <button
+                  className={`np-side-btn${shuffleEnabled ? ' active' : ''}`}
+                  onClick={onToggleShuffle}
+                  aria-label="Shuffle"
+                  aria-pressed={shuffleEnabled}
+                  title="Shuffle"
+                >
+                  &#128256;
+                </button>
+                <div className="np-transport">
+                  <button className="player-btn large" onClick={onPrev} disabled={!hasPrev} aria-label="Previous">&#9198;</button>
+                  <button className="player-btn xlarge" onClick={onTogglePlay} aria-label={isPlaying ? 'Pause' : 'Play'}>
+                    {isPlaying ? '❚❚' : '▶'}
+                  </button>
+                  <button className="player-btn large" onClick={onNext} disabled={!hasNext} aria-label="Next">&#9197;</button>
+                </div>
+                <div className="np-destination">
+                  <button
+                    className={`np-side-btn${outputDevice ? ' active' : ''}`}
+                    onClick={() => setDestMenuOpen((o) => !o)}
+                    aria-label="Playback destination"
+                    title={`Playing on ${destinationLabel}`}
+                  >
+                    {outputDevice ? '📡' : '🔊'}
+                  </button>
+                  {destMenuOpen && (
+                    <div className="np-destination-menu">
+                      <button
+                        className={!outputDevice ? 'active' : ''}
+                        onClick={() => { setOutputDevice(null); setDestMenuOpen(false); }}
+                      >
+                        🔊 This Browser
+                      </button>
+                      {wiimDevices.map((d) => (
+                        <button
+                          key={d.id}
+                          className={outputDevice?.id === d.id ? 'active' : ''}
+                          onClick={() => { setOutputDevice(d); setDestMenuOpen(false); }}
+                        >
+                          📡 {d.name}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </section>
+              <p className="np-destination-label">Playing on {destinationLabel}</p>
+            </div>
+          </div>
         </div>
       )}
       <div className="player-bar">
@@ -955,6 +1088,8 @@ function PlayerBar({
               onPlay={() => setIsPlaying(true)}
               onPause={() => setIsPlaying(false)}
               onEnded={onNext}
+              onTimeUpdate={(e) => setLocalProgress({ currentTime: e.target.currentTime, duration: e.target.duration || 0 })}
+              onLoadedMetadata={(e) => setLocalProgress({ currentTime: e.target.currentTime, duration: e.target.duration || 0 })}
             />
           )}
           <button className="player-btn" onClick={onNext} disabled={!hasNext} aria-label="Next">&#9197;</button>
