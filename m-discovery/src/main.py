@@ -52,6 +52,16 @@ QUALITY_TIER_RANK_SQL = f"""
         ELSE 4
     END
 """
+
+# "Best Quality" dedup: same song (title+artist, loosely normalized) kept only
+# once, picking the highest quality-tier/bitrate copy when more than one rip
+# exists. Deliberately simpler than library_cleanup.find_duplicates' noise
+# stripping (no Live/Remastered/etc. removal) - this runs on every default
+# library-tab load, so it favors a cheap, conservative match (won't merge a
+# live recording into a studio one) over the fuzzier one-off cleanup report.
+DEDUP_NORM_TITLE_SQL = "btrim(regexp_replace(lower(track_name), '[^a-z0-9]+', ' ', 'g'))"
+DEDUP_NORM_ARTIST_SQL = "btrim(regexp_replace(lower(artist_name), '[^a-z0-9]+', ' ', 'g'))"
+
 LENGTH_TIER_SQL = """
     CASE
         WHEN duration_seconds IS NULL THEN 'Unknown'
@@ -279,7 +289,8 @@ async def get_known_tracks(
         if has_artwork is not None:
             where_clauses.append("has_artwork = %(has_artwork)s")
             params['has_artwork'] = has_artwork
-        if quality:
+        best_quality_only = (quality == 'best')
+        if quality and not best_quality_only:
             where_clauses.append(f"({QUALITY_TIER_SQL}) = %(quality)s")
             params['quality'] = quality
         if format:
@@ -294,8 +305,24 @@ async def get_known_tracks(
 
         where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
 
+        # "Best Quality" mode: collapse same-song duplicates down to their
+        # single best-quality copy *before* any other filter/pagination logic
+        # runs, by treating the deduped result as if it were known_tracks itself.
+        if best_quality_only:
+            from_sql = f"""
+                (SELECT DISTINCT ON ({DEDUP_NORM_TITLE_SQL}, {DEDUP_NORM_ARTIST_SQL})
+                        id, track_name, artist_name, album_name, genre, year, duration_seconds,
+                        bitrate, sample_rate, channels, file_size_bytes, file_path, is_favorite, last_played
+                 FROM known_tracks {where_sql}
+                 ORDER BY {DEDUP_NORM_TITLE_SQL}, {DEDUP_NORM_ARTIST_SQL},
+                          {QUALITY_TIER_RANK_SQL} ASC, bitrate DESC NULLS LAST, id ASC
+                ) AS best_tracks
+            """
+        else:
+            from_sql = f"known_tracks {where_sql}"
+
         cur = db.cursor(cursor_factory=RealDictCursor)
-        cur.execute(f"SELECT COUNT(*) AS count FROM known_tracks {where_sql}", params)
+        cur.execute(f"SELECT COUNT(*) AS count FROM {from_sql}", params)
         total = cur.fetchone()['count']
 
         # RANDOM() genuinely reshuffles the matching rows before truncating, so a
@@ -305,7 +332,7 @@ async def get_known_tracks(
         cur.execute(f"""
             SELECT id, track_name, artist_name, album_name, genre, year, duration_seconds,
                    bitrate, sample_rate, channels, file_size_bytes, file_path, is_favorite, last_played
-            FROM known_tracks {where_sql}
+            FROM {from_sql}
             {order_sql}
             LIMIT %(limit)s OFFSET %(offset)s
         """, {**params, 'limit': limit, 'offset': offset})
@@ -346,7 +373,7 @@ async def get_library_groups(
             extra_clauses.append("year >= %(decade_start)s AND year < %(decade_end)s")
             params['decade_start'] = decade
             params['decade_end'] = decade + 10
-        if quality:
+        if quality and quality != 'best':
             extra_clauses.append(f"({QUALITY_TIER_SQL}) = %(quality)s")
             params['quality'] = quality
         if format:

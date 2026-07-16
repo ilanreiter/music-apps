@@ -118,7 +118,10 @@ function App() {
   const [search, setSearch] = useState('');
   const [filterGenre, setFilterGenre] = useState('');
   const [filterDecade, setFilterDecade] = useState('');
-  const [filterQuality, setFilterQuality] = useState('');
+  // Defaults to deduping same-song duplicate rips down to the best copy - see
+  // the "Best Quality Only" <option> below and the `quality=best` handling in
+  // /api/tracks/known.
+  const [filterQuality, setFilterQuality] = useState('best');
   const [filterFormat, setFilterFormat] = useState('');
   const [genreOptions, setGenreOptions] = useState([]);
   const [decadeOptions, setDecadeOptions] = useState([]);
@@ -447,12 +450,14 @@ function App() {
     return params;
   };
 
-  const hasActiveFilters = !!(filterGenre || filterDecade || filterQuality || filterFormat);
+  // 'best' is the default quality filter (dedup to the best copy of each
+  // track), not a user-applied filter, so it doesn't count as "active".
+  const hasActiveFilters = !!(filterGenre || filterDecade || (filterQuality && filterQuality !== 'best') || filterFormat);
 
   const clearFilters = () => {
     setFilterGenre('');
     setFilterDecade('');
-    setFilterQuality('');
+    setFilterQuality('best');
     setFilterFormat('');
   };
 
@@ -1012,7 +1017,8 @@ function App() {
                   {decadeOptions.map((d) => <option key={d.key} value={d.key}>{d.label} ({d.count})</option>)}
                 </select>
                 <select value={filterQuality} onChange={(e) => setFilterQuality(e.target.value)}>
-                  <option value="">All Qualities</option>
+                  <option value="best">Best Quality Only</option>
+                  <option value="">All Qualities (Show Duplicates)</option>
                   {qualityOptions.map((q) => <option key={q.key} value={q.key}>{q.label} ({q.count})</option>)}
                 </select>
                 <select value={filterFormat} onChange={(e) => setFilterFormat(e.target.value)}>
