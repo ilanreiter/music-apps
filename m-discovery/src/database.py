@@ -56,7 +56,12 @@ def create_tables():
                     ADD COLUMN IF NOT EXISTS track_number INTEGER,
                     ADD COLUMN IF NOT EXISTS track_total INTEGER,
                     ADD COLUMN IF NOT EXISTS has_artwork BOOLEAN,
-                    ADD COLUMN IF NOT EXISTS date_added TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
+                    ADD COLUMN IF NOT EXISTS date_added TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    ADD COLUMN IF NOT EXISTS spotify_track_id TEXT,
+                    ADD COLUMN IF NOT EXISTS spotify_url TEXT,
+                    ADD COLUMN IF NOT EXISTS spotify_popularity INTEGER,
+                    ADD COLUMN IF NOT EXISTS spotify_album_art_url TEXT,
+                    ADD COLUMN IF NOT EXISTS spotify_checked BOOLEAN DEFAULT FALSE;
             """)
             cur.execute("""
                 ALTER TABLE known_tracks

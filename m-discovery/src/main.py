@@ -15,6 +15,7 @@ from .library_cleanup import (
 )
 from . import wiim
 from . import chromecast
+from . import spotify
 import google.generativeai as genai
 import logging
 import os
@@ -102,6 +103,9 @@ scan_progress = {"status": "idle"}
 artwork_check_lock = threading.Lock()
 artwork_check_progress = {"status": "idle"}
 
+spotify_enrich_lock = threading.Lock()
+spotify_enrich_progress = {"status": "idle"}
+
 # Configure Gemini API
 genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
 model = genai.GenerativeModel('gemini-1.5-pro')
@@ -156,6 +160,14 @@ class ArtworkCheckStatus(BaseModel):
     total: Optional[int] = None
     found: Optional[int] = None
     missing: Optional[int] = None
+    error: Optional[str] = None
+
+class SpotifyEnrichStatus(BaseModel):
+    status: str  # idle | running | done | error
+    processed: Optional[int] = None
+    total: Optional[int] = None
+    matched: Optional[int] = None
+    unmatched: Optional[int] = None
     error: Optional[str] = None
 
 class CountEntry(BaseModel):
@@ -960,6 +972,35 @@ async def start_artwork_check():
 @app.get("/api/library/check-artwork/status", response_model=ArtworkCheckStatus)
 async def get_artwork_check_status():
     return artwork_check_progress
+
+@app.post("/api/library/spotify-enrich", response_model=SpotifyEnrichStatus, status_code=status.HTTP_202_ACCEPTED)
+async def start_spotify_enrich():
+    if not spotify.is_configured():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="SPOTIFY_CLIENT_ID/SPOTIFY_CLIENT_SECRET not set in .env",
+        )
+    if not spotify_enrich_lock.acquire(blocking=False):
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="A Spotify enrich is already running.")
+    try:
+        spotify_enrich_progress.clear()
+        spotify_enrich_progress.update(status="running")
+
+        def _run():
+            try:
+                spotify.enrich_library_from_spotify(get_db_connection, spotify_enrich_progress)
+            finally:
+                spotify_enrich_lock.release()
+
+        threading.Thread(target=_run, daemon=True).start()
+    except Exception:
+        spotify_enrich_lock.release()
+        raise
+    return spotify_enrich_progress
+
+@app.get("/api/library/spotify-enrich/status", response_model=SpotifyEnrichStatus)
+async def get_spotify_enrich_status():
+    return spotify_enrich_progress
 
 @app.get("/api/history", response_model=List[DiscoveryHistoryEntry])
 async def get_discovery_history(db: psycopg2.extensions.connection = Depends(get_db)):

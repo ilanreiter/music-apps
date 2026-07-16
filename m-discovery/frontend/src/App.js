@@ -1690,6 +1690,9 @@ function CleanupTab({ apiBase, activeTab, nowPlaying, isPlaying, onTrackPlayClic
   const [missingArtworkTotal, setMissingArtworkTotal] = useState(0);
   const artworkPollRef = useRef(null);
 
+  const [spotifyEnrichStatus, setSpotifyEnrichStatus] = useState(null);
+  const spotifyEnrichPollRef = useRef(null);
+
   const fetchDuplicates = async () => {
     setDuplicatesLoading(true);
     try {
@@ -1753,6 +1756,35 @@ function CleanupTab({ apiBase, activeTab, nowPlaying, isPlaying, onTrackPlayClic
     }
   };
 
+  const pollSpotifyEnrich = () => {
+    if (spotifyEnrichPollRef.current) clearInterval(spotifyEnrichPollRef.current);
+    spotifyEnrichPollRef.current = setInterval(async () => {
+      try {
+        const response = await axios.get(`${apiBase}/library/spotify-enrich/status`);
+        setSpotifyEnrichStatus(response.data);
+        if (response.data.status === 'done' || response.data.status === 'error') {
+          clearInterval(spotifyEnrichPollRef.current);
+          spotifyEnrichPollRef.current = null;
+        }
+      } catch (err) {
+        clearInterval(spotifyEnrichPollRef.current);
+        spotifyEnrichPollRef.current = null;
+        console.error('Error polling Spotify enrich status:', err);
+      }
+    }, 1500);
+  };
+
+  const startSpotifyEnrich = async () => {
+    try {
+      const response = await axios.post(`${apiBase}/library/spotify-enrich`);
+      setSpotifyEnrichStatus(response.data);
+      pollSpotifyEnrich();
+    } catch (err) {
+      setSpotifyEnrichStatus({ status: 'error', error: err.response?.data?.detail || 'Failed to start' });
+      console.error('Error starting Spotify enrich:', err);
+    }
+  };
+
   useEffect(() => {
     if (activeTab !== 'cleanup') return;
     if (subTab === 'duplicates' && duplicateGroups === null) fetchDuplicates();
@@ -1769,11 +1801,18 @@ function CleanupTab({ apiBase, activeTab, nowPlaying, isPlaying, onTrackPlayClic
         }
       }).catch((err) => console.error('Error checking artwork-check status:', err));
     }
+    if (subTab === 'spotify-enrich' && spotifyEnrichStatus === null) {
+      axios.get(`${apiBase}/library/spotify-enrich/status`).then((response) => {
+        setSpotifyEnrichStatus(response.data);
+        if (response.data.status === 'running') pollSpotifyEnrich();
+      }).catch((err) => console.error('Error checking Spotify enrich status:', err));
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeTab, subTab]);
 
   useEffect(() => () => {
     if (artworkPollRef.current) clearInterval(artworkPollRef.current);
+    if (spotifyEnrichPollRef.current) clearInterval(spotifyEnrichPollRef.current);
   }, []);
 
   const bestTrack = (tracks) => tracks.reduce((best, t) => ((t.bitrate || 0) > (best.bitrate || 0) ? t : best), tracks[0]);
@@ -1784,6 +1823,7 @@ function CleanupTab({ apiBase, activeTab, nowPlaying, isPlaying, onTrackPlayClic
         <button className={subTab === 'duplicates' ? 'active' : ''} onClick={() => setSubTab('duplicates')}>Duplicates</button>
         <button className={subTab === 'missing-tracks' ? 'active' : ''} onClick={() => setSubTab('missing-tracks')}>Missing Tracks</button>
         <button className={subTab === 'missing-artwork' ? 'active' : ''} onClick={() => setSubTab('missing-artwork')}>Missing Artwork</button>
+        <button className={subTab === 'spotify-enrich' ? 'active' : ''} onClick={() => setSubTab('spotify-enrich')}>Spotify Enrich</button>
       </div>
 
       {subTab === 'duplicates' && (
@@ -1943,6 +1983,32 @@ function CleanupTab({ apiBase, activeTab, nowPlaying, isPlaying, onTrackPlayClic
                 </button>
               )}
             </>
+          )}
+        </div>
+      )}
+
+      {subTab === 'spotify-enrich' && (
+        <div className="cleanup-panel">
+          <p className="cleanup-summary">
+            Backfills missing release year from Spotify's catalog (embedded tags always win - Spotify only fills in
+            what's blank) and adds a Spotify link/artwork URL for each matched track. Tracks with no close-enough
+            match (bootlegs, rare live rips, etc.) are left as-is and won't be re-searched next time.
+          </p>
+          <button
+            className="scan-btn"
+            onClick={startSpotifyEnrich}
+            disabled={spotifyEnrichStatus?.status === 'running'}
+          >
+            {spotifyEnrichStatus?.status === 'running' ? 'Enriching…' : 'Enrich from Spotify'}
+          </button>
+          {spotifyEnrichStatus && spotifyEnrichStatus.status !== 'idle' && (
+            <p className="scan-summary">
+              {spotifyEnrichStatus.status === 'running'
+                ? `Enriching… ${(spotifyEnrichStatus.processed || 0).toLocaleString()} of ${(spotifyEnrichStatus.total || 0).toLocaleString()}`
+                : spotifyEnrichStatus.status === 'done'
+                  ? `Done — ${(spotifyEnrichStatus.matched || 0).toLocaleString()} matched, ${(spotifyEnrichStatus.unmatched || 0).toLocaleString()} no match`
+                  : spotifyEnrichStatus.status === 'error' ? `Error: ${spotifyEnrichStatus.error}` : ''}
+            </p>
           )}
         </div>
       )}
