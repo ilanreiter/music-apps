@@ -1691,6 +1691,8 @@ function CleanupTab({ apiBase, activeTab, nowPlaying, isPlaying, onTrackPlayClic
   const artworkPollRef = useRef(null);
 
   const [spotifyEnrichStatus, setSpotifyEnrichStatus] = useState(null);
+  const [spotifyEnrichedTracks, setSpotifyEnrichedTracks] = useState([]);
+  const [spotifyEnrichedTotal, setSpotifyEnrichedTotal] = useState(0);
   const spotifyEnrichPollRef = useRef(null);
 
   const fetchDuplicates = async () => {
@@ -1756,12 +1758,29 @@ function CleanupTab({ apiBase, activeTab, nowPlaying, isPlaying, onTrackPlayClic
     }
   };
 
+  const fetchSpotifyEnriched = async (offset) => {
+    try {
+      const response = await axios.get(`${apiBase}/tracks/known`, { params: { spotify_matched: true, limit: 100, offset } });
+      setSpotifyEnrichedTotal(response.data.total);
+      setSpotifyEnrichedTracks((prev) => (offset === 0 ? response.data.tracks : [...prev, ...response.data.tracks]));
+    } catch (err) {
+      console.error('Error fetching Spotify-enriched tracks:', err);
+    }
+  };
+
   const pollSpotifyEnrich = () => {
     if (spotifyEnrichPollRef.current) clearInterval(spotifyEnrichPollRef.current);
     spotifyEnrichPollRef.current = setInterval(async () => {
       try {
         const response = await axios.get(`${apiBase}/library/spotify-enrich/status`);
         setSpotifyEnrichStatus(response.data);
+        // Keeps polling through 'waiting' (a long Spotify rate-limit pause,
+        // possibly hours) - only a real end state stops it. The list is
+        // refreshed on every tick while actual work is happening so newly
+        // matched tracks show up live, not just once the whole run finishes.
+        if (response.data.status === 'running' || response.data.status === 'done') {
+          fetchSpotifyEnriched(0);
+        }
         if (response.data.status === 'done' || response.data.status === 'error') {
           clearInterval(spotifyEnrichPollRef.current);
           spotifyEnrichPollRef.current = null;
@@ -1804,7 +1823,8 @@ function CleanupTab({ apiBase, activeTab, nowPlaying, isPlaying, onTrackPlayClic
     if (subTab === 'spotify-enrich' && spotifyEnrichStatus === null) {
       axios.get(`${apiBase}/library/spotify-enrich/status`).then((response) => {
         setSpotifyEnrichStatus(response.data);
-        if (response.data.status === 'running') pollSpotifyEnrich();
+        if (response.data.status === 'running' || response.data.status === 'waiting') pollSpotifyEnrich();
+        fetchSpotifyEnriched(0);
       }).catch((err) => console.error('Error checking Spotify enrich status:', err));
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1997,18 +2017,64 @@ function CleanupTab({ apiBase, activeTab, nowPlaying, isPlaying, onTrackPlayClic
           <button
             className="scan-btn"
             onClick={startSpotifyEnrich}
-            disabled={spotifyEnrichStatus?.status === 'running'}
+            disabled={spotifyEnrichStatus?.status === 'running' || spotifyEnrichStatus?.status === 'waiting'}
           >
-            {spotifyEnrichStatus?.status === 'running' ? 'Enriching…' : 'Enrich from Spotify'}
+            {spotifyEnrichStatus?.status === 'running'
+              ? 'Enriching…'
+              : spotifyEnrichStatus?.status === 'waiting' ? 'Waiting on Spotify…' : 'Enrich from Spotify'}
           </button>
           {spotifyEnrichStatus && spotifyEnrichStatus.status !== 'idle' && (
             <p className="scan-summary">
               {spotifyEnrichStatus.status === 'running'
                 ? `Enriching… ${(spotifyEnrichStatus.processed || 0).toLocaleString()} of ${(spotifyEnrichStatus.total || 0).toLocaleString()}`
-                : spotifyEnrichStatus.status === 'done'
-                  ? `Done — ${(spotifyEnrichStatus.matched || 0).toLocaleString()} matched, ${(spotifyEnrichStatus.unmatched || 0).toLocaleString()} no match`
-                  : spotifyEnrichStatus.status === 'error' ? `Error: ${spotifyEnrichStatus.error}` : ''}
+                : spotifyEnrichStatus.status === 'waiting'
+                  ? `Paused by Spotify's rate limit (${(spotifyEnrichStatus.processed || 0).toLocaleString()} of ${(spotifyEnrichStatus.total || 0).toLocaleString()} done so far) - resuming automatically around ${spotifyEnrichStatus.resume_at ? new Date(spotifyEnrichStatus.resume_at * 1000).toLocaleString() : 'later'}`
+                  : spotifyEnrichStatus.status === 'done'
+                    ? `Done — ${(spotifyEnrichStatus.matched || 0).toLocaleString()} matched, ${(spotifyEnrichStatus.unmatched || 0).toLocaleString()} no match`
+                    : spotifyEnrichStatus.status === 'error' ? `Error: ${spotifyEnrichStatus.error}` : ''}
             </p>
+          )}
+          {spotifyEnrichedTracks.length > 0 && (
+            <>
+              <div className="library-header">
+                <h2>Enriched Tracks</h2>
+                <span className="library-count">{spotifyEnrichedTotal.toLocaleString()} tracks</span>
+              </div>
+              <div className="tracks-grid">
+                {spotifyEnrichedTracks.map((track) => {
+                  const isCurrent = nowPlaying && nowPlaying.id === track.id;
+                  return (
+                    <div key={track.id} className={`track-card${isCurrent ? ' playing' : ''}`}>
+                      <button
+                        className="play-btn"
+                        onClick={() => onTrackPlayClick(track, spotifyEnrichedTracks)}
+                        aria-label={isCurrent && isPlaying ? 'Pause' : 'Play'}
+                      >
+                        {isCurrent && isPlaying ? '❚❚' : '▶'}
+                      </button>
+                      <div className="track-thumb-wrap">
+                        <span className="track-thumb-fallback">{track.track_name.charAt(0).toUpperCase()}</span>
+                        <img className="track-thumb" src={`${apiBase}/tracks/${track.id}/artwork`} alt="" loading="lazy" onError={(e) => { e.target.style.display = 'none'; }} />
+                      </div>
+                      <div className="track-info">
+                        <h3>{track.track_name}</h3>
+                        <p className="artist">{track.artist_name}</p>
+                      </div>
+                      {track.spotify_url && (
+                        <a className="spotify-link" href={track.spotify_url} target="_blank" rel="noreferrer" onClick={(e) => e.stopPropagation()}>
+                          Spotify
+                        </a>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+              {spotifyEnrichedTracks.length < spotifyEnrichedTotal && (
+                <button className="load-more-btn" onClick={() => fetchSpotifyEnriched(spotifyEnrichedTracks.length)}>
+                  Load more ({spotifyEnrichedTracks.length.toLocaleString()} of {spotifyEnrichedTotal.toLocaleString()})
+                </button>
+              )}
+            </>
           )}
         </div>
       )}

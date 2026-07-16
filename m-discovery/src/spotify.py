@@ -150,7 +150,6 @@ def search_track(track_name, artist_name):
     return min(candidates, key=_release_date_key)
 
 
-ENRICH_COMMIT_EVERY = 50
 SEARCH_PACING_SECONDS = 0.2
 
 
@@ -170,8 +169,18 @@ def enrich_library_from_spotify(get_connection, progress):
     app doesn't have - so genre/artist lookups would just be wasted network
     calls with no data to show for it. spotify_popularity stays NULL for
     now; the column exists in case that access is ever granted later.
+
+    Processes one track at a time (rather than fetching the whole remaining
+    set upfront) so that hitting a real rate limit can pause and resume
+    mid-run: on RateLimited, the run sleeps until Spotify's own Retry-After
+    deadline and then continues from wherever it left off, entirely within
+    this same background thread - no manual re-click needed. A newly
+    registered app was observed getting handed a ~24h Retry-After, so this
+    can mean a very long sleep; that's fine for a daemon background thread,
+    it just means `status` will read 'waiting' with a resume_at timestamp
+    for most of that time.
     """
-    progress.update(status='running', processed=0, total=0, matched=0, unmatched=0, error=None)
+    progress.update(status='running', processed=0, total=0, matched=0, unmatched=0, error=None, resume_at=None)
 
     if not is_configured():
         progress.update(status='error', error='SPOTIFY_CLIENT_ID/SPOTIFY_CLIENT_SECRET not set in .env')
@@ -184,17 +193,33 @@ def enrich_library_from_spotify(get_connection, progress):
 
     try:
         cur = conn.cursor()
-        cur.execute("""
-            SELECT id, track_name, artist_name, year FROM known_tracks
-            WHERE spotify_checked IS NOT TRUE
-        """)
-        rows = cur.fetchall()
+        cur.execute("SELECT COUNT(*) FROM known_tracks WHERE spotify_checked IS NOT TRUE")
+        progress['total'] = cur.fetchone()[0]
         cur.close()
-        progress['total'] = len(rows)
 
-        cur = conn.cursor()
-        for track_id, track_name, artist_name, existing_year in rows:
-            match = search_track(track_name, artist_name)
+        while True:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT id, track_name, artist_name, year FROM known_tracks
+                WHERE spotify_checked IS NOT TRUE
+                LIMIT 1
+            """)
+            row = cur.fetchone()
+            cur.close()
+            if row is None:
+                break
+
+            track_id, track_name, artist_name, existing_year = row
+            try:
+                match = search_track(track_name, artist_name)
+            except RateLimited as e:
+                resume_at = time.time() + e.retry_after_seconds
+                progress.update(status='waiting', resume_at=resume_at)
+                time.sleep(e.retry_after_seconds + 5)
+                progress.update(status='running', resume_at=None)
+                continue  # re-try the same still-unchecked track
+
+            cur = conn.cursor()
             if match:
                 album = match.get('album') or {}
                 images = album.get('images') or []
@@ -218,26 +243,17 @@ def enrich_library_from_spotify(get_connection, progress):
             else:
                 cur.execute("UPDATE known_tracks SET spotify_checked = TRUE WHERE id = %s", (track_id,))
                 progress['unmatched'] += 1
+            conn.commit()
+            cur.close()
 
             progress['processed'] += 1
-            if progress['processed'] % ENRICH_COMMIT_EVERY == 0:
-                conn.commit()
             # A newly-registered app has a much tighter rate-limit ceiling
             # than an established one (observed firsthand: a ~24h block after
             # a few minutes of back-to-back requests) - pace requests instead
             # of firing them as fast as the network allows.
             time.sleep(SEARCH_PACING_SECONDS)
 
-        conn.commit()
-        cur.close()
         progress['status'] = 'done'
-    except RateLimited as e:
-        conn.commit()  # keep whatever was already processed this run
-        hours = round(e.retry_after_seconds / 3600, 1)
-        progress.update(
-            status='error',
-            error=f"Spotify rate-limited us (retry in ~{hours}h) - stopped after {progress['processed']} of {progress['total']}. Already-processed tracks are saved; re-running later will pick up where this left off.",
-        )
     except Exception as e:
         conn.rollback()
         progress.update(status='error', error=str(e))

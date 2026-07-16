@@ -124,6 +124,7 @@ class Track(BaseModel):
     channels: Optional[int] = None
     file_size_bytes: Optional[int] = None
     file_format: Optional[str] = None
+    spotify_url: Optional[str] = None
     is_favorite: Optional[bool] = False
     last_played: Optional[str] = None # Will be datetime string
 
@@ -163,11 +164,12 @@ class ArtworkCheckStatus(BaseModel):
     error: Optional[str] = None
 
 class SpotifyEnrichStatus(BaseModel):
-    status: str  # idle | running | done | error
+    status: str  # idle | running | waiting | done | error
     processed: Optional[int] = None
     total: Optional[int] = None
     matched: Optional[int] = None
     unmatched: Optional[int] = None
+    resume_at: Optional[float] = None  # unix timestamp; set only while status == 'waiting'
     error: Optional[str] = None
 
 class CountEntry(BaseModel):
@@ -288,6 +290,7 @@ async def get_known_tracks(
     format: Optional[str] = None,
     favorite: Optional[bool] = None,
     length: Optional[str] = None,
+    spotify_matched: Optional[bool] = None,
     shuffle: bool = False,
     limit: int = Query(100, ge=1, le=20000),
     offset: int = Query(0, ge=0),
@@ -328,6 +331,9 @@ async def get_known_tracks(
         if length:
             where_clauses.append(f"({LENGTH_TIER_SQL}) = %(length)s")
             params['length'] = length
+        if spotify_matched is not None:
+            where_clauses.append("(spotify_track_id IS NOT NULL) = %(spotify_matched)s")
+            params['spotify_matched'] = spotify_matched
 
         where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
 
@@ -339,7 +345,7 @@ async def get_known_tracks(
             from_sql = f"""
                 (SELECT DISTINCT ON ({DEDUP_NORM_TITLE_SQL}, {DEDUP_NORM_ARTIST_SQL}, {DEDUP_NORM_ALBUM_SQL})
                         id, track_name, artist_name, album_name, genre, year, duration_seconds,
-                        bitrate, sample_rate, channels, file_size_bytes, file_path, is_favorite, last_played
+                        bitrate, sample_rate, channels, file_size_bytes, file_path, spotify_url, is_favorite, last_played
                  FROM known_tracks {where_sql}
                  ORDER BY {DEDUP_NORM_TITLE_SQL}, {DEDUP_NORM_ARTIST_SQL}, {DEDUP_NORM_ALBUM_SQL},
                           {QUALITY_TIER_RANK_SQL} ASC, bitrate DESC NULLS LAST, id ASC
@@ -358,7 +364,7 @@ async def get_known_tracks(
         order_sql = "ORDER BY RANDOM()" if shuffle else "ORDER BY artist_name, album_name, track_name"
         cur.execute(f"""
             SELECT id, track_name, artist_name, album_name, genre, year, duration_seconds,
-                   bitrate, sample_rate, channels, file_size_bytes, file_path, is_favorite, last_played
+                   bitrate, sample_rate, channels, file_size_bytes, file_path, spotify_url, is_favorite, last_played
             FROM {from_sql}
             {order_sql}
             LIMIT %(limit)s OFFSET %(offset)s
@@ -497,7 +503,7 @@ async def get_track(track_id: int, db: psycopg2.extensions.connection = Depends(
         cur = db.cursor(cursor_factory=RealDictCursor)
         cur.execute("""
             SELECT id, track_name, artist_name, album_name, genre, year, duration_seconds,
-                   bitrate, sample_rate, channels, file_size_bytes, file_path, is_favorite, last_played
+                   bitrate, sample_rate, channels, file_size_bytes, file_path, spotify_url, is_favorite, last_played
             FROM known_tracks WHERE id = %s
         """, (track_id,))
         track = cur.fetchone()
