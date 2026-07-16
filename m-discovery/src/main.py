@@ -53,14 +53,19 @@ QUALITY_TIER_RANK_SQL = f"""
     END
 """
 
-# "Best Quality" dedup: same song (title+artist, loosely normalized) kept only
-# once, picking the highest quality-tier/bitrate copy when more than one rip
-# exists. Deliberately simpler than library_cleanup.find_duplicates' noise
-# stripping (no Live/Remastered/etc. removal) - this runs on every default
-# library-tab load, so it favors a cheap, conservative match (won't merge a
-# live recording into a studio one) over the fuzzier one-off cleanup report.
+# "Best Quality" dedup: same song on the same album (title+artist+album,
+# loosely normalized) kept only once, picking the highest quality-tier/bitrate
+# copy when more than one rip exists. Album is part of the key so a song that
+# legitimately appears on two different albums (e.g. a studio LP and a
+# compilation) still shows once per album, instead of one appearance winning
+# and hiding the other. Deliberately simpler than library_cleanup.
+# find_duplicates' noise stripping (no Live/Remastered/etc. removal) - this
+# runs on every default library-tab load, so it favors a cheap, conservative
+# match (won't merge a live recording into a studio one) over the fuzzier
+# one-off cleanup report.
 DEDUP_NORM_TITLE_SQL = "btrim(regexp_replace(lower(track_name), '[^a-z0-9]+', ' ', 'g'))"
 DEDUP_NORM_ARTIST_SQL = "btrim(regexp_replace(lower(artist_name), '[^a-z0-9]+', ' ', 'g'))"
+DEDUP_NORM_ALBUM_SQL = normalized_album_sql('album_name')
 
 LENGTH_TIER_SQL = """
     CASE
@@ -305,16 +310,17 @@ async def get_known_tracks(
 
         where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
 
-        # "Best Quality" mode: collapse same-song duplicates down to their
-        # single best-quality copy *before* any other filter/pagination logic
-        # runs, by treating the deduped result as if it were known_tracks itself.
+        # "Best Quality" mode: collapse same-song-on-the-same-album duplicates
+        # down to their single best-quality copy *before* any other
+        # filter/pagination logic runs, by treating the deduped result as if
+        # it were known_tracks itself.
         if best_quality_only:
             from_sql = f"""
-                (SELECT DISTINCT ON ({DEDUP_NORM_TITLE_SQL}, {DEDUP_NORM_ARTIST_SQL})
+                (SELECT DISTINCT ON ({DEDUP_NORM_TITLE_SQL}, {DEDUP_NORM_ARTIST_SQL}, {DEDUP_NORM_ALBUM_SQL})
                         id, track_name, artist_name, album_name, genre, year, duration_seconds,
                         bitrate, sample_rate, channels, file_size_bytes, file_path, is_favorite, last_played
                  FROM known_tracks {where_sql}
-                 ORDER BY {DEDUP_NORM_TITLE_SQL}, {DEDUP_NORM_ARTIST_SQL},
+                 ORDER BY {DEDUP_NORM_TITLE_SQL}, {DEDUP_NORM_ARTIST_SQL}, {DEDUP_NORM_ALBUM_SQL},
                           {QUALITY_TIER_RANK_SQL} ASC, bitrate DESC NULLS LAST, id ASC
                 ) AS best_tracks
             """
