@@ -1731,6 +1731,16 @@ function CleanupTab({ apiBase, activeTab, nowPlaying, isPlaying, onTrackPlayClic
                     </div>
                     {group.tracks.map((t) => (
                       <div key={t.id} className={`dup-track${t.id === keeper.id ? ' suggested-keep' : ''}`}>
+                        <div className="track-thumb-wrap">
+                          <span className="track-thumb-fallback">{t.track_name.charAt(0).toUpperCase()}</span>
+                          <img
+                            className="track-thumb"
+                            src={`${apiBase}/tracks/${t.id}/artwork`}
+                            alt=""
+                            loading="lazy"
+                            onError={(e) => { e.target.style.display = 'none'; }}
+                          />
+                        </div>
                         <div className="dup-track-info">
                           <span className="dup-track-title">{t.track_name}</span>
                           <span className="dup-track-artist">{t.artist_name}{t.album_name ? ` · ${t.album_name}` : ''}</span>

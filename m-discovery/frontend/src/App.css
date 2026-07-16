@@ -1769,8 +1769,7 @@ main.with-player {
 
 .dup-track {
   display: flex;
-  align-items: baseline;
-  justify-content: space-between;
+  align-items: center;
   gap: 12px;
   padding: 7px 0;
   border-top: 1px solid var(--border);
@@ -1785,6 +1784,7 @@ main.with-player {
 }
 
 .dup-track-info {
+  flex: 1;
   display: flex;
   flex-direction: column;
   gap: 2px;
@@ -1811,6 +1811,7 @@ main.with-player {
   display: flex;
   align-items: center;
   gap: 8px;
+  margin-left: auto;
   font-size: 0.75rem;
   color: var(--text-muted);
   white-space: nowrap;

@@ -6,7 +6,7 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 from .database import get_db_connection, create_tables
 from .library_scanner import run_scan
-from .artwork import get_or_create_thumbnail, check_artwork_presence
+from .artwork import get_or_create_thumbnail, check_artwork_presence, cache_key_for, normalize_album_name, normalized_album_sql
 from .artist_info import get_artist_info, get_artist_photo_path
 from .library_cleanup import find_duplicates, find_missing_tracks
 from . import wiim
@@ -455,16 +455,47 @@ async def stream_track(track_id: int, db: psycopg2.extensions.connection = Depen
 async def get_track_artwork(track_id: int, db: psycopg2.extensions.connection = Depends(get_db)):
     try:
         cur = db.cursor()
-        cur.execute("SELECT file_path FROM known_tracks WHERE id = %s", (track_id,))
+        cur.execute("SELECT file_path, artist_name, album_name FROM known_tracks WHERE id = %s", (track_id,))
         row = cur.fetchone()
+        if not row or not row[0]:
+            cur.close()
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No artwork available")
+        file_path, artist_name, album_name = row
+
+        # Tracks sharing an artist+album share one cache entry and fall back
+        # to a sibling's embedded art if this file itself has none, so an
+        # album shows one consistent thumbnail instead of it varying per file.
+        # Albums are matched loosely (normalized_album_sql), not by exact
+        # string, so e.g. "Album Songtrack" and "Album [Songtrack]" share art.
+        candidate_paths = [file_path]
+        if album_name:
+            # has_artwork is already known (from the background check-artwork
+            # scan) for most tracks, so order by it: a sibling already
+            # flagged as having art gets opened first, instead of opening
+            # every sibling file blindly hoping to find one. Still falls
+            # back through the rest (NULLS LAST puts never-checked tracks
+            # before confirmed-empty ones) for tracks the scan hasn't
+            # reached yet.
+            cur.execute(f"""
+                SELECT file_path FROM known_tracks
+                WHERE artist_name = %(artist)s
+                  AND {normalized_album_sql()} = %(normalized_album)s
+                  AND file_path IS NOT NULL AND id != %(track_id)s
+                ORDER BY has_artwork DESC NULLS LAST
+            """, {
+                'artist': artist_name,
+                'normalized_album': normalize_album_name(album_name),
+                'track_id': track_id,
+            })
+            candidate_paths += [r[0] for r in cur.fetchall()]
         cur.close()
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
 
-    if not row or not row[0]:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No artwork available")
-
-    cache_path = get_or_create_thumbnail(track_id, row[0])
+    cache_key = cache_key_for(track_id, artist_name, album_name)
+    cache_path = get_or_create_thumbnail(cache_key, candidate_paths)
     if not cache_path:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No artwork available")
 
@@ -677,6 +708,12 @@ async def scan_library(params: LibraryScanRequest):
         def _run():
             try:
                 run_scan(params.root_path, get_db_connection, scan_progress)
+                # Newly-scanned tracks start with has_artwork unset, so a scan
+                # is exactly the event that makes that flag stale - follow it
+                # with a check automatically instead of relying on the user
+                # to remember to click "Check Artwork" themselves.
+                if scan_progress.get('status') == 'done':
+                    _start_artwork_check_background()
             finally:
                 scan_lock.release()
 
@@ -757,10 +794,13 @@ async def get_missing_tracks(db: psycopg2.extensions.connection = Depends(get_db
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
     return find_missing_tracks(rows)
 
-@app.post("/api/library/check-artwork", response_model=ArtworkCheckStatus, status_code=status.HTTP_202_ACCEPTED)
-async def start_artwork_check():
+def _start_artwork_check_background():
+    """Kicks off a background artwork-presence check if one isn't already
+    running. Returns False (no-op, no error) if one is already in flight -
+    used both by the explicit endpoint below and the auto-trigger after a
+    library scan finishes."""
     if not artwork_check_lock.acquire(blocking=False):
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="An artwork check is already running.")
+        return False
     try:
         artwork_check_progress.clear()
         artwork_check_progress.update(status="running")
@@ -772,10 +812,16 @@ async def start_artwork_check():
                 artwork_check_lock.release()
 
         threading.Thread(target=_run, daemon=True).start()
-        return artwork_check_progress
+        return True
     except Exception:
         artwork_check_lock.release()
         raise
+
+@app.post("/api/library/check-artwork", response_model=ArtworkCheckStatus, status_code=status.HTTP_202_ACCEPTED)
+async def start_artwork_check():
+    if not _start_artwork_check_background():
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="An artwork check is already running.")
+    return artwork_check_progress
 
 @app.get("/api/library/check-artwork/status", response_model=ArtworkCheckStatus)
 async def get_artwork_check_status():
