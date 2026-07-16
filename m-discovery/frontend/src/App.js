@@ -132,6 +132,10 @@ function App() {
   const [libraryTracks, setLibraryTracks] = useState([]);
   const [libraryTotal, setLibraryTotal] = useState(0);
   const [libraryLoading, setLibraryLoading] = useState(false);
+  // "Shuffle All" toggle: while on, the flat library list itself is fetched
+  // and displayed in the same shuffled order that got queued for playback,
+  // instead of the default alphabetical browse order.
+  const [libraryShuffleOn, setLibraryShuffleOn] = useState(false);
   const [trackViewStyle, setTrackViewStyle] = useState(() => {
     try {
       return localStorage.getItem('md_track_view_style') || 'list';
@@ -405,7 +409,11 @@ function App() {
   useEffect(() => {
     if (activeTab !== 'library') return;
     if (drill || libraryMode === 'all') {
-      fetchLibraryTracks(0);
+      // If Shuffle All is already on, a filter change re-shuffles the new
+      // matching set rather than silently reverting to alphabetical order.
+      // The Shuffle All toggle itself is handled directly in its own click
+      // handler (not here), so it isn't a dependency of this effect.
+      if (libraryShuffleOn) fetchLibraryTracksShuffled(); else fetchLibraryTracks(0);
     } else {
       fetchGroups();
     }
@@ -480,6 +488,25 @@ function App() {
       setLibraryTracks((prev) => (offset === 0 ? response.data.tracks : [...prev, ...response.data.tracks]));
     } catch (err) {
       console.error('Error fetching tracks:', err);
+    } finally {
+      setLibraryLoading(false);
+    }
+  };
+
+  // Fetches the *entire* matching set in one truly-shuffled order (same
+  // approach as fetchAllMatchingShuffled below) and shows all of it - there's
+  // no "Load more" page-by-page equivalent for a random order, since each
+  // separate LIMIT/OFFSET request would re-randomize independently.
+  const fetchLibraryTracksShuffled = async () => {
+    setLibraryLoading(true);
+    try {
+      const tracks = await fetchAllMatchingShuffled(buildTrackFilterParams());
+      setLibraryTotal(tracks.length);
+      setLibraryTracks(tracks);
+      return tracks;
+    } catch (err) {
+      console.error('Error fetching shuffled tracks:', err);
+      return [];
     } finally {
       setLibraryLoading(false);
     }
@@ -823,6 +850,21 @@ function App() {
     }
   };
 
+  // Shuffle All toggle for the flat library list: turning it on both re-shows
+  // the list in the same shuffled order that gets queued and starts playing
+  // it; turning it off just reverts the list to its default alphabetical
+  // order (doesn't touch whatever's already playing).
+  const toggleLibraryShuffle = async () => {
+    if (libraryShuffleOn) {
+      setLibraryShuffleOn(false);
+      fetchLibraryTracks(0);
+      return;
+    }
+    setLibraryShuffleOn(true);
+    const tracks = await fetchLibraryTracksShuffled();
+    if (tracks.length > 0) startQueue(tracks);
+  };
+
   const viewLabel = (mode) => (mode === 'all' ? 'All Tracks' : `By ${mode.charAt(0).toUpperCase()}${mode.slice(1)}`);
   const backLabel = drill && BACK_LABELS[drill.by];
   const effectiveIsPlaying = outputDevice ? destStatus?.status === 'play' : isPlaying;
@@ -1049,7 +1091,12 @@ function App() {
                   {!drill && libraryTracks.length > 0 && (
                     <div className="group-actions">
                       <button className="group-action-btn" onClick={() => playCurrentFilter()}>&#9654; Play All</button>
-                      <button className="group-action-btn" onClick={() => playCurrentFilter({ shuffle: true })}>&#128256; Shuffle All</button>
+                      <button
+                        className={`group-action-btn${libraryShuffleOn ? ' active' : ''}`}
+                        onClick={toggleLibraryShuffle}
+                      >
+                        &#128256; Shuffle All
+                      </button>
                     </div>
                   )}
                   <span className="library-count">{libraryTotal.toLocaleString()} tracks</span>
