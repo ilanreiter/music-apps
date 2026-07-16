@@ -33,7 +33,9 @@ function paramsForGroupKey(by, key) {
   if (by === 'decade') return { decade: Number(key) };
   if (by === 'album') {
     const [artist, album] = key.split('||');
-    return { artist, album };
+    // Empty artist means the album grouping treated this as a compilation
+    // (many distinct per-track artists) - filter by album alone in that case.
+    return artist ? { artist, album } : { album };
   }
   if (by === 'quality') return { quality: key };
   if (by === 'format') return { format: key };
@@ -1074,16 +1076,18 @@ function App() {
                 ) : (
                   groups.map((g) => (
                     <div key={g.key} className="group-card">
-                      <span className="group-thumb-fallback">{g.label.charAt(0).toUpperCase()}</span>
-                      {g.sample_track_id != null && (
-                        <img
-                          className="group-thumb"
-                          src={`${API_BASE_URL}/tracks/${g.sample_track_id}/artwork`}
-                          alt=""
-                          loading="lazy"
-                          onError={(e) => { e.target.style.display = 'none'; }}
-                        />
-                      )}
+                      <div className="group-thumb-wrap">
+                        <span className="group-thumb-fallback">{g.label.charAt(0).toUpperCase()}</span>
+                        {g.sample_track_id != null && (
+                          <img
+                            className="group-thumb"
+                            src={`${API_BASE_URL}/tracks/${g.sample_track_id}/artwork`}
+                            alt=""
+                            loading="lazy"
+                            onError={(e) => { e.target.style.display = 'none'; }}
+                          />
+                        )}
+                      </div>
                       <div className="group-card-main" onClick={() => setDrill({ by: libraryMode, key: g.key, label: g.label })}>
                         <h3>{g.label}</h3>
                         <span className="group-count">{g.count.toLocaleString()} tracks</span>
@@ -1774,12 +1778,12 @@ function CleanupTab({ apiBase, activeTab, nowPlaying, isPlaying, onTrackPlayClic
             <p className="empty-state">Checking track numbers…</p>
           ) : !missingTracksAlbums || missingTracksAlbums.length === 0 ? (
             <p className="empty-state">
-              {missingTracksAlbums ? 'No gaps found in albums with track numbers.' : 'Loading…'}
+              {missingTracksAlbums ? 'No gaps or duplicate track numbers found.' : 'Loading…'}
             </p>
           ) : (
             <>
               <p className="cleanup-summary">
-                {missingTracksAlbums.length.toLocaleString()} album{missingTracksAlbums.length === 1 ? '' : 's'} with missing tracks
+                {missingTracksAlbums.length.toLocaleString()} album{missingTracksAlbums.length === 1 ? '' : 's'} with missing or duplicate tracks
               </p>
               {missingTracksAlbums.map((album, idx) => (
                 <div key={idx} className="missing-album-row">
@@ -1800,7 +1804,9 @@ function CleanupTab({ apiBase, activeTab, nowPlaying, isPlaying, onTrackPlayClic
                     <span className="missing-album-artist">{album.artist_name}</span>
                   </div>
                   <div className="missing-album-gap">
-                    {album.have_count} available &middot; {album.missing_track_numbers.length} missing
+                    {album.have_count} available
+                    {album.missing_track_numbers.length > 0 && ` · ${album.missing_track_numbers.length} missing`}
+                    {album.duplicate_track_numbers.length > 0 && ` · duplicate #${album.duplicate_track_numbers.join(', #')}`}
                   </div>
                 </div>
               ))}

@@ -1,4 +1,5 @@
 import re
+from collections import Counter
 from difflib import SequenceMatcher
 
 # Strips common "same song, different edition" noise so e.g. "Yesterday" and
@@ -131,46 +132,101 @@ MAX_PLAUSIBLE_ALBUM_SIZE = 50  # guards against corrupt track_total tags (real d
                                 # style folders where many unrelated artists share one
                                 # album name with a track_total meant for the whole
                                 # compilation, not any single artist's contribution to it
+MIN_GUESS_COMPLETENESS_RATIO = 0.5  # when there's no explicit track_total tag, the album
+                                     # size is only a guess (the highest track_number seen) -
+                                     # only trust that guess if we actually have a good
+                                     # fraction of that many tracks. Real data had an album
+                                     # with 7 tracks (each a duplicate scan, so 14 rows) where
+                                     # one stray track was numbered 44 - trusting that as "the
+                                     # album has 44 tracks" reported 37 fake gaps instead of
+                                     # recognizing the 44 as an outlier, not the true length
+
+
+COMPILATION_MIN_ARTISTS = 4  # matches the "by album" grouping in main.py - keep in sync
+COMPILATION_MIN_TRACKS = 6
 
 
 def find_missing_tracks(rows):
     """rows: iterable of (id, artist_name, album_name, track_number, track_total).
-    Returns albums with a gap in the track-number sequence, largest gap first.
-    track_total (from an "N/M" tag) is used as the expected count when present,
-    since it's authoritative; otherwise the highest track_number seen is only a
-    heuristic guess at the album length. sample_track_id (any track we do have
-    from that album) is included so the caller can show representative artwork -
-    there's no track row at all for the missing numbers themselves, so this is
-    the only artwork available for that album.
+    Returns albums with a gap in the track-number sequence and/or more than one
+    track sharing the same number, largest issue first. track_total (from an
+    "N/M" tag) is used as the expected count when present, since it's
+    authoritative; otherwise the highest track_number seen is only a heuristic
+    guess at the album length. sample_track_id (any track we do have from that
+    album) is included so the caller can show representative artwork - there's
+    no track row at all for the missing numbers themselves, so this is the
+    only artwork available for that album.
+
+    Grouping key is normally (artist_name, album_name) - but a "Various Artists"
+    compilation has a different per-track artist on every track, so grouping
+    that way would split it into dozens of near-empty single-artist "albums",
+    each compared against the *whole compilation's* track-total tag and so
+    each looking wildly incomplete (e.g. "2 of 36" for an artist who
+    contributed 2 of the compilation's 36 tracks). Detected compilations
+    (many distinct artists across a real number of tracks) are reunified by
+    album name alone first, matching the same heuristic used for "by album"
+    browsing.
     """
+    rows = list(rows)
+    artists_per_album = {}
+    for _track_id, artist_name, album_name, track_number, _track_total in rows:
+        if not album_name or track_number is None:
+            continue
+        info = artists_per_album.setdefault(album_name, {'artists': set(), 'count': 0})
+        info['artists'].add(artist_name)
+        info['count'] += 1
+
+    def is_compilation(album_name):
+        info = artists_per_album.get(album_name)
+        return bool(info) and len(info['artists']) > COMPILATION_MIN_ARTISTS and info['count'] >= COMPILATION_MIN_TRACKS
+
     albums = {}
     for track_id, artist_name, album_name, track_number, track_total in rows:
         if not album_name or track_number is None:
             continue
-        key = (artist_name, album_name)
-        entry = albums.setdefault(key, {'numbers': set(), 'total_hint': None, 'sample_track_id': track_id})
-        entry['numbers'].add(track_number)
+        compilation = is_compilation(album_name)
+        key = album_name if compilation else (artist_name, album_name)
+        entry = albums.setdefault(key, {
+            'artist_name': 'Various Artists' if compilation else artist_name,
+            'album_name': album_name,
+            # Counts (not just a set) so a track number used by more than one
+            # file - either a genuine duplicate rip or two different songs
+            # mistagged with the same number - can be told apart from a
+            # normal, singly-used one.
+            'number_counts': Counter(),
+            'total_hint': None,
+            'sample_track_id': track_id,
+        })
+        entry['number_counts'][track_number] += 1
         if track_total:
             entry['total_hint'] = max(entry['total_hint'] or 0, track_total)
 
     results = []
-    for (artist_name, album_name), entry in albums.items():
-        numbers = entry['numbers']
+    for entry in albums.values():
+        counts = entry['number_counts']
+        numbers = set(counts)
         if len(numbers) < MIN_HAVE_COUNT:
             continue
+
+        duplicate_track_numbers = sorted(n for n, c in counts.items() if c > 1)
+
+        has_explicit_total = entry['total_hint'] is not None
         expected_total = entry['total_hint'] or max(numbers)
-        if expected_total > MAX_PLAUSIBLE_ALBUM_SIZE:
-            continue
-        missing = sorted(set(range(1, expected_total + 1)) - numbers)
-        if missing:
+        trust_guess = has_explicit_total or len(numbers) / expected_total >= MIN_GUESS_COMPLETENESS_RATIO
+        missing = []
+        if expected_total <= MAX_PLAUSIBLE_ALBUM_SIZE and trust_guess:
+            missing = sorted(set(range(1, expected_total + 1)) - numbers)
+
+        if missing or duplicate_track_numbers:
             results.append({
-                'artist_name': artist_name,
-                'album_name': album_name,
+                'artist_name': entry['artist_name'],
+                'album_name': entry['album_name'],
                 'have_count': len(numbers),
                 'expected_total': expected_total,
                 'missing_track_numbers': missing,
+                'duplicate_track_numbers': duplicate_track_numbers,
                 'sample_track_id': entry['sample_track_id'],
             })
 
-    results.sort(key=lambda r: len(r['missing_track_numbers']), reverse=True)
+    results.sort(key=lambda r: len(r['missing_track_numbers']) + len(r['duplicate_track_numbers']), reverse=True)
     return results

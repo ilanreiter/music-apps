@@ -399,13 +399,36 @@ async def get_library_groups(
             """, params)
             groups = [{"key": row[0], "label": row[0], "count": row[1], "sample_track_id": row[2]} for row in cur.fetchall()]
         else:
+            # Grouping by (album_name, artist_name) fragments any album where
+            # tracks carry different per-track artist tags - which is exactly
+            # every "Various Artists" compilation, since we don't scan a
+            # separate album-artist tag. Detect that case (many distinct
+            # artists across a real number of tracks, not just 2-3 tracks
+            # that happen to share a generic title) and group by album_name
+            # alone for those; ordinary albums keep the artist-scoped
+            # grouping, so two unrelated artists' same-titled albums don't
+            # get merged into one.
             cur.execute(f"""
-                SELECT album_name, artist_name, COUNT(*), {SAMPLE_TRACK_SQL} FROM known_tracks
-                WHERE album_name IS NOT NULL AND album_name <> '' {extra_sql}
-                GROUP BY album_name, artist_name ORDER BY artist_name, album_name
+                WITH album_meta AS (
+                    SELECT album_name AS cte_album_name,
+                           (COUNT(DISTINCT artist_name) > 4 AND COUNT(*) >= 6) AS is_compilation
+                    FROM known_tracks
+                    WHERE album_name IS NOT NULL AND album_name <> '' {extra_sql}
+                    GROUP BY album_name
+                )
+                SELECT
+                    kt.album_name,
+                    CASE WHEN am.is_compilation THEN '' ELSE kt.artist_name END AS grouping_artist,
+                    CASE WHEN am.is_compilation THEN 'Various Artists' ELSE kt.artist_name END AS display_artist,
+                    COUNT(*), {SAMPLE_TRACK_SQL}
+                FROM known_tracks kt
+                JOIN album_meta am ON am.cte_album_name = kt.album_name
+                WHERE kt.album_name IS NOT NULL AND kt.album_name <> '' {extra_sql}
+                GROUP BY kt.album_name, grouping_artist, display_artist
+                ORDER BY kt.album_name, display_artist
             """, params)
             groups = [
-                {"key": f"{row[1]}||{row[0]}", "label": f"{row[0]} — {row[1]}", "count": row[2], "sample_track_id": row[3]}
+                {"key": f"{row[1]}||{row[0]}", "label": f"{row[0]} — {row[2]}", "count": row[3], "sample_track_id": row[4]}
                 for row in cur.fetchall()
             ]
 
