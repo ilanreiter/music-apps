@@ -1832,7 +1832,7 @@ function CleanupTab({ apiBase, activeTab, nowPlaying, isPlaying, onTrackPlayClic
                   <div className="missing-album-gap">
                     {album.have_count} available
                     {album.missing_track_numbers.length > 0 && ` · ${album.missing_track_numbers.length} missing`}
-                    {album.duplicate_track_numbers.length > 0 && ` · duplicate #${album.duplicate_track_numbers.join(', #')}`}
+                    {album.duplicate_track_numbers.length > 0 && ` · ${album.duplicate_track_numbers.length} duplicate${album.duplicate_track_numbers.length > 1 ? 's' : ''}`}
                   </div>
                 </div>
               ))}
