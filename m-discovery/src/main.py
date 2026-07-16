@@ -274,6 +274,27 @@ async def startup_event():
     create_tables()
     print("Tables checked/created.")
 
+    # A Spotify enrich run (mid-processing, or mid-wait for a rate limit) has
+    # no way to survive a container rebuild on its own - the in-memory
+    # progress/lock are gone the moment the process exits. Auto-resume here
+    # rather than requiring a manual re-click, since unchecked rows are
+    # exactly the same "still work to do" signal a genuine interruption would
+    # leave behind (also covers new tracks added by a scan since the last
+    # complete run).
+    if spotify.is_configured():
+        conn = get_db_connection()
+        if conn:
+            try:
+                cur = conn.cursor()
+                cur.execute("SELECT COUNT(*) FROM known_tracks WHERE spotify_checked IS NOT TRUE")
+                remaining = cur.fetchone()[0]
+                cur.close()
+            finally:
+                conn.close()
+            if remaining > 0:
+                print(f"Resuming Spotify enrich in the background ({remaining} tracks not yet checked).")
+                _start_spotify_enrich_background()
+
 @app.get("/")
 async def read_root():
     return {"message": "Gemini Music Discovery API is running!"}
@@ -979,15 +1000,15 @@ async def start_artwork_check():
 async def get_artwork_check_status():
     return artwork_check_progress
 
-@app.post("/api/library/spotify-enrich", response_model=SpotifyEnrichStatus, status_code=status.HTTP_202_ACCEPTED)
-async def start_spotify_enrich():
-    if not spotify.is_configured():
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="SPOTIFY_CLIENT_ID/SPOTIFY_CLIENT_SECRET not set in .env",
-        )
+def _start_spotify_enrich_background():
+    """Kicks off a background Spotify enrich if one isn't already running.
+    Returns False (no-op, no error) if one is already in flight - used both
+    by the explicit endpoint below and the auto-resume-on-startup check
+    (a run interrupted by a container rebuild - mid-run or mid-wait for a
+    rate limit - otherwise wouldn't restart itself, since the in-memory
+    progress/lock don't survive the process exiting)."""
     if not spotify_enrich_lock.acquire(blocking=False):
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="A Spotify enrich is already running.")
+        return False
     try:
         spotify_enrich_progress.clear()
         spotify_enrich_progress.update(status="running")
@@ -999,9 +1020,20 @@ async def start_spotify_enrich():
                 spotify_enrich_lock.release()
 
         threading.Thread(target=_run, daemon=True).start()
+        return True
     except Exception:
         spotify_enrich_lock.release()
         raise
+
+@app.post("/api/library/spotify-enrich", response_model=SpotifyEnrichStatus, status_code=status.HTTP_202_ACCEPTED)
+async def start_spotify_enrich():
+    if not spotify.is_configured():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="SPOTIFY_CLIENT_ID/SPOTIFY_CLIENT_SECRET not set in .env",
+        )
+    if not _start_spotify_enrich_background():
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="A Spotify enrich is already running.")
     return spotify_enrich_progress
 
 @app.get("/api/library/spotify-enrich/status", response_model=SpotifyEnrichStatus)
