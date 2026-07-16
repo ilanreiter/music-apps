@@ -1715,7 +1715,9 @@ function CleanupTab({ apiBase, activeTab, nowPlaying, isPlaying, onTrackPlayClic
         setArtworkCheckStatus(response.data);
         if (response.data.status === 'running') {
           pollArtworkCheck();
-        } else if (response.data.status === 'done') {
+        } else {
+          // 'idle' just means no check job is running right now, not that
+          // has_artwork has no data - show the current state either way.
           fetchMissingArtwork(0);
         }
       }).catch((err) => console.error('Error checking artwork-check status:', err));
