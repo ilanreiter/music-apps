@@ -497,16 +497,19 @@ async def get_track(track_id: int, db: psycopg2.extensions.connection = Depends(
 
 @app.get("/api/tracks/{track_id}/album-position", response_model=TrackAlbumPosition)
 async def get_track_album_position(track_id: int, db: psycopg2.extensions.connection = Depends(get_db)):
-    """How this track's own track_number/track_total tags relate to how many of
-    that album's tracks are actually present in the library - e.g. "Track #3,
-    of 12 (10 in Lib)" in the Now Playing panel. Grouping is compilation-aware
-    (same heuristic as find_missing_tracks/"by album" browsing): a "Various
-    Artists" style album is matched by album name alone, since every track
-    there has a different artist tag."""
+    """How this track's own track_number tag relates to how many of that
+    album's tracks are actually present in the library - e.g. "Track #3, of
+    12 (10 in Lib)" in the Now Playing panel. track_total is the highest
+    total-tracks tag seen across the whole album, not just this file's own
+    tag, since not every rip necessarily has that tag filled in (same
+    approach as find_missing_tracks' total_hint). Grouping is
+    compilation-aware (same heuristic as find_missing_tracks/"by album"
+    browsing): a "Various Artists" style album is matched by album name
+    alone, since every track there has a different artist tag."""
     try:
         cur = db.cursor(cursor_factory=RealDictCursor)
         cur.execute(
-            "SELECT artist_name, album_name, track_number, track_total FROM known_tracks WHERE id = %s",
+            "SELECT artist_name, album_name, track_number FROM known_tracks WHERE id = %s",
             (track_id,),
         )
         track = cur.fetchone()
@@ -516,7 +519,7 @@ async def get_track_album_position(track_id: int, db: psycopg2.extensions.connec
 
         if not track['album_name']:
             cur.close()
-            return {'track_number': track['track_number'], 'track_total': track['track_total'], 'library_track_count': None}
+            return {'track_number': track['track_number'], 'track_total': None, 'library_track_count': None}
 
         cur.execute(
             "SELECT COUNT(DISTINCT artist_name) AS artists, COUNT(*) AS cnt FROM known_tracks WHERE album_name = %(album)s",
@@ -527,20 +530,22 @@ async def get_track_album_position(track_id: int, db: psycopg2.extensions.connec
 
         if is_compilation:
             cur.execute(
-                "SELECT COUNT(DISTINCT track_number) AS cnt FROM known_tracks WHERE album_name = %(album)s AND track_number IS NOT NULL",
+                """SELECT MAX(track_total) AS total_hint, COUNT(DISTINCT track_number) AS cnt
+                   FROM known_tracks WHERE album_name = %(album)s AND track_number IS NOT NULL""",
                 {'album': track['album_name']},
             )
         else:
             cur.execute(
-                "SELECT COUNT(DISTINCT track_number) AS cnt FROM known_tracks WHERE album_name = %(album)s AND artist_name = %(artist)s AND track_number IS NOT NULL",
+                """SELECT MAX(track_total) AS total_hint, COUNT(DISTINCT track_number) AS cnt
+                   FROM known_tracks WHERE album_name = %(album)s AND artist_name = %(artist)s AND track_number IS NOT NULL""",
                 {'album': track['album_name'], 'artist': track['artist_name']},
             )
-        library_track_count = cur.fetchone()['cnt']
+        album_stats = cur.fetchone()
         cur.close()
         return {
             'track_number': track['track_number'],
-            'track_total': track['track_total'],
-            'library_track_count': library_track_count,
+            'track_total': album_stats['total_hint'],
+            'library_track_count': album_stats['cnt'],
         }
     except HTTPException:
         raise
