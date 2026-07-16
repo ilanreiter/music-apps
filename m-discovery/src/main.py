@@ -8,7 +8,11 @@ from .database import get_db_connection, create_tables
 from .library_scanner import run_scan
 from .artwork import get_or_create_thumbnail, check_artwork_presence, cache_key_for, normalize_album_name, normalized_album_sql
 from .artist_info import get_artist_info, get_artist_photo_path
-from .library_cleanup import find_duplicates, find_missing_tracks, COMPILATION_MIN_ARTISTS, COMPILATION_MIN_TRACKS
+from .library_cleanup import (
+    find_duplicates, find_missing_tracks,
+    COMPILATION_MIN_ARTISTS, COMPILATION_MIN_TRACKS,
+    MIN_GUESS_COMPLETENESS_RATIO, MAX_PLAUSIBLE_ALBUM_SIZE,
+)
 from . import wiim
 from . import chromecast
 import google.generativeai as genai
@@ -499,10 +503,12 @@ async def get_track(track_id: int, db: psycopg2.extensions.connection = Depends(
 async def get_track_album_position(track_id: int, db: psycopg2.extensions.connection = Depends(get_db)):
     """How this track's own track_number tag relates to how many of that
     album's tracks are actually present in the library - e.g. "Track #3, of
-    12 (10 in Lib)" in the Now Playing panel. track_total is the highest
-    total-tracks tag seen across the whole album, not just this file's own
-    tag, since not every rip necessarily has that tag filled in (same
-    approach as find_missing_tracks' total_hint). Grouping is
+    12 (10 in Lib)" in the Now Playing panel. track_total is the original
+    album's real track count: the highest total-tracks tag seen anywhere in
+    the album (not just this file's own tag, since not every rip necessarily
+    has it filled in), falling back to a guessed total (the highest
+    track_number seen) when no rip has an explicit tag at all - same
+    total_hint/trust_guess approach as find_missing_tracks. Grouping is
     compilation-aware (same heuristic as find_missing_tracks/"by album"
     browsing): a "Various Artists" style album is matched by album name
     alone, since every track there has a different artist tag."""
@@ -530,21 +536,31 @@ async def get_track_album_position(track_id: int, db: psycopg2.extensions.connec
 
         if is_compilation:
             cur.execute(
-                """SELECT MAX(track_total) AS total_hint, COUNT(DISTINCT track_number) AS cnt
+                """SELECT MAX(track_total) AS total_hint, MAX(track_number) AS max_number,
+                          COUNT(DISTINCT track_number) AS cnt
                    FROM known_tracks WHERE album_name = %(album)s AND track_number IS NOT NULL""",
                 {'album': track['album_name']},
             )
         else:
             cur.execute(
-                """SELECT MAX(track_total) AS total_hint, COUNT(DISTINCT track_number) AS cnt
+                """SELECT MAX(track_total) AS total_hint, MAX(track_number) AS max_number,
+                          COUNT(DISTINCT track_number) AS cnt
                    FROM known_tracks WHERE album_name = %(album)s AND artist_name = %(artist)s AND track_number IS NOT NULL""",
                 {'album': track['album_name'], 'artist': track['artist_name']},
             )
         album_stats = cur.fetchone()
         cur.close()
+
+        has_explicit_total = album_stats['total_hint'] is not None
+        expected_total = album_stats['total_hint'] or album_stats['max_number']
+        trust_guess = expected_total and (
+            has_explicit_total or album_stats['cnt'] / expected_total >= MIN_GUESS_COMPLETENESS_RATIO
+        )
+        track_total = expected_total if (trust_guess and expected_total <= MAX_PLAUSIBLE_ALBUM_SIZE) else None
+
         return {
             'track_number': track['track_number'],
-            'track_total': album_stats['total_hint'],
+            'track_total': track_total,
             'library_track_count': album_stats['cnt'],
         }
     except HTTPException:
