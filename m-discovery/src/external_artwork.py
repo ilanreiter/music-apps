@@ -4,6 +4,7 @@ from difflib import SequenceMatcher
 
 import requests
 
+from .artist_info import AUDIODB_BASE_URL
 from .artwork import cache_key_for, normalize_album_name, normalized_album_sql, save_thumbnail
 
 REQUEST_TIMEOUT = 10
@@ -22,7 +23,16 @@ COVER_ART_ARCHIVE_URL = 'https://coverartarchive.org/release'
 ITUNES_SEARCH_URL = 'https://itunes.apple.com/search'
 MATCH_THRESHOLD = 0.72
 
+DEEZER_SEARCH_URL = 'https://api.deezer.com/search/album'
+
+# TheAudioDB's free-tier key ("123" unless a real one is set) is shared by
+# everyone using it and capped around 30 req/min - a dedicated throttle here
+# keeps this job from being what finally pushes it over that shared limit
+# (the artist-info bio/photo lookups also use this same key).
+AUDIODB_MIN_INTERVAL_SECONDS = 2.1
+
 _last_musicbrainz_call = 0.0
+_last_audiodb_call = 0.0
 
 
 class RateLimited(Exception):
@@ -130,6 +140,74 @@ def search_itunes_artwork_url(artist_name, album_name):
     return art_url.replace('100x100bb', '600x600bb') if art_url else None
 
 
+def search_deezer_album_artwork(artist_name, album_name):
+    """Best-matching Deezer album artwork URL (largest size available), or
+    None. Deezer signals its rate limit with an HTTP 200 whose JSON body is
+    an error object (code 4, "Quota limit exceeded"), not an HTTP error
+    status - has to be checked for explicitly."""
+    try:
+        response = requests.get(
+            DEEZER_SEARCH_URL,
+            params={'q': f'artist:"{artist_name}" album:"{album_name}"', 'limit': 3},
+            timeout=REQUEST_TIMEOUT,
+        )
+    except Exception:
+        return None
+    if response.status_code != 200:
+        return None
+    data = response.json()
+    if isinstance(data, dict) and data.get('error'):
+        raise RateLimited(5)
+
+    best, best_score = None, 0.0
+    for result in data.get('data') or []:
+        score = (_similar(album_name, result.get('title', '')) + _similar(artist_name, (result.get('artist') or {}).get('name', ''))) / 2
+        if score > best_score:
+            best, best_score = result, score
+    if best is None or best_score < MATCH_THRESHOLD:
+        return None
+    return best.get('cover_xl') or best.get('cover_big')
+
+
+def _throttle_audiodb():
+    global _last_audiodb_call
+    elapsed = time.time() - _last_audiodb_call
+    if elapsed < AUDIODB_MIN_INTERVAL_SECONDS:
+        time.sleep(AUDIODB_MIN_INTERVAL_SECONDS - elapsed)
+    _last_audiodb_call = time.time()
+
+
+def search_audiodb_album_artwork(artist_name, album_name):
+    """Best-matching TheAudioDB album artwork URL, or None. Tried last in the
+    fallback chain since it shares artist_info.py's community rate-limited
+    key (30 req/min on the default free-tier key)."""
+    _throttle_audiodb()
+    try:
+        response = requests.get(
+            f"{AUDIODB_BASE_URL}/searchalbum.php",
+            params={'s': artist_name, 'a': album_name},
+            timeout=REQUEST_TIMEOUT,
+        )
+    except Exception:
+        return None
+    if response.status_code == 429:
+        raise RateLimited(60)
+    if response.status_code != 200:
+        return None
+    albums = response.json().get('album') or []
+    if not albums:
+        return None
+
+    best, best_score = None, 0.0
+    for album in albums:
+        score = (_similar(album_name, album.get('strAlbum', '')) + _similar(artist_name, album.get('strArtist', ''))) / 2
+        if score > best_score:
+            best, best_score = album, score
+    if best is None or best_score < MATCH_THRESHOLD:
+        return None
+    return best.get('strAlbumThumb')
+
+
 SEARCH_PACING_SECONDS = 0.5
 
 
@@ -138,10 +216,12 @@ def backfill_external_artwork(get_connection, progress):
     the Check Artwork job), tries free external sources in order: this
     track's own already-stored Spotify album art URL (from Spotify Enrich,
     if that ran - free, no extra lookup needed), then MusicBrainz + Cover Art
-    Archive, then the iTunes Search API. A hit is downloaded and cached under
-    the same album-shared cache_key used everywhere else, so every track
-    sharing that album picks it up too - not just the one row processed
-    here (mirrors check_artwork_presence's own sibling backfill).
+    Archive, then Deezer, then the iTunes Search API, then TheAudioDB's album
+    endpoint (last, since it shares artist_info.py's community-rate-limited
+    key). A hit is downloaded and cached under the same album-shared
+    cache_key used everywhere else, so every track sharing that album picks
+    it up too - not just the one row processed here (mirrors
+    check_artwork_presence's own sibling backfill).
 
     Processes one row at a time so a real rate limit (raised as RateLimited)
     can pause the whole run and resume automatically once it clears, same
@@ -183,9 +263,12 @@ def backfill_external_artwork(get_connection, progress):
                     mbid = search_musicbrainz_release_mbid(artist_name, album_name)
                     if mbid:
                         raw = fetch_cover_art_archive_image(mbid)
+                if not raw and album_name:
+                    raw = download_bytes(search_deezer_album_artwork(artist_name, album_name))
                 if not raw:
-                    art_url = search_itunes_artwork_url(artist_name, album_name or '')
-                    raw = download_bytes(art_url)
+                    raw = download_bytes(search_itunes_artwork_url(artist_name, album_name or ''))
+                if not raw and album_name:
+                    raw = download_bytes(search_audiodb_album_artwork(artist_name, album_name))
             except RateLimited as e:
                 resume_at = time.time() + e.retry_after_seconds
                 progress.update(status='waiting', resume_at=resume_at)
