@@ -62,7 +62,8 @@ def create_tables():
                     ADD COLUMN IF NOT EXISTS spotify_popularity INTEGER,
                     ADD COLUMN IF NOT EXISTS spotify_album_art_url TEXT,
                     ADD COLUMN IF NOT EXISTS spotify_checked BOOLEAN DEFAULT FALSE,
-                    ADD COLUMN IF NOT EXISTS external_artwork_checked BOOLEAN DEFAULT FALSE;
+                    ADD COLUMN IF NOT EXISTS external_artwork_checked BOOLEAN DEFAULT FALSE,
+                    ADD COLUMN IF NOT EXISTS artwork_source_url TEXT;
             """)
             cur.execute("""
                 ALTER TABLE known_tracks

@@ -339,21 +339,22 @@ main.with-player {
   transition: background 0.15s, border-color 0.15s, transform 0.15s;
 }
 
-.spotify-link {
+.source-link {
   margin-left: auto;
   flex-shrink: 0;
   padding: 4px 10px;
   border-radius: 999px;
-  background: #1db95422;
-  color: #1db954;
+  background: var(--accent-soft);
+  color: var(--accent);
   font-size: 0.75rem;
   font-weight: 600;
   text-decoration: none;
   white-space: nowrap;
 }
 
-.spotify-link:hover {
-  background: #1db95440;
+.source-link:hover {
+  background: var(--accent-hover);
+  color: white;
 }
 
 .track-card:hover {

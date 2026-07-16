@@ -34,6 +34,7 @@ ITUNES_SEARCH_URL = 'https://itunes.apple.com/search'
 MATCH_THRESHOLD = 0.72
 
 DEEZER_SEARCH_URL = 'https://api.deezer.com/search/album'
+DEEZER_ALBUM_URL = 'https://api.deezer.com/album'
 
 # TheAudioDB's free-tier key ("123" unless a real one is set) is shared by
 # everyone using it and capped around 30 req/min - a dedicated throttle here
@@ -69,6 +70,15 @@ def _similar(a, b):
     return SequenceMatcher(None, a, b).ratio()
 
 
+def _year_from(value):
+    """Pulls a plausible 4-digit year out of a date-ish value (int, "1969",
+    "1969-09-26", "1969-09-26T07:00:00Z", ...), or None."""
+    if not value:
+        return None
+    digits = str(value)[:4]
+    return int(digits) if digits.isdigit() else None
+
+
 def download_bytes(url):
     if not url:
         return None
@@ -95,17 +105,19 @@ def _escape_lucene(text):
     return text.replace('"', '')
 
 
-def search_musicbrainz_release_mbid(artist_name, album_name):
-    """Best-matching MusicBrainz release id for (artist_name, album_name),
-    or None. Relies on MusicBrainz's own search relevance score rather than
-    a separate similarity check, since that's exactly what it's designed to
-    rank on for this query shape."""
+def find_via_musicbrainz(artist_name, album_name):
+    """{'raw', 'year', 'source_url'} for the best-matching MusicBrainz
+    release + Cover Art Archive image, or None. Among releases meeting
+    MusicBrainz's own relevance score, prefers the earliest dated one as
+    the best proxy for the true original release, same reasoning as the
+    Spotify/Discogs candidate selection below - a reissue can score just as
+    well as the original pressing."""
     _throttle_musicbrainz()
     query = f'release:"{_escape_lucene(album_name)}" AND artist:"{_escape_lucene(artist_name)}"'
     try:
         response = requests.get(
             MUSICBRAINZ_SEARCH_URL,
-            params={'query': query, 'fmt': 'json', 'limit': 3},
+            params={'query': query, 'fmt': 'json', 'limit': 5},
             headers={'User-Agent': MUSICBRAINZ_USER_AGENT},
             timeout=REQUEST_TIMEOUT,
         )
@@ -115,17 +127,17 @@ def search_musicbrainz_release_mbid(artist_name, album_name):
         raise RateLimited(10)
     if response.status_code != 200:
         return None
-    releases = response.json().get('releases') or []
-    if not releases:
-        return None
-    best = releases[0]
-    if (best.get('score') or 0) < MUSICBRAINZ_SCORE_THRESHOLD:
-        return None
-    return best.get('id')
 
-
-def fetch_cover_art_archive_image(mbid):
-    return download_bytes(f"{COVER_ART_ARCHIVE_URL}/{mbid}/front-500")
+    candidates = [r for r in (response.json().get('releases') or []) if (r.get('score') or 0) >= MUSICBRAINZ_SCORE_THRESHOLD]
+    candidates.sort(key=lambda r: _year_from(r.get('date')) or 9999)
+    for release in candidates:
+        mbid = release.get('id')
+        if not mbid:
+            continue
+        raw = download_bytes(f"{COVER_ART_ARCHIVE_URL}/{mbid}/front-500")
+        if raw:
+            return {'raw': raw, 'year': _year_from(release.get('date')), 'source_url': f'https://musicbrainz.org/release/{mbid}'}
+    return None
 
 
 def _throttle_discogs():
@@ -136,8 +148,8 @@ def _throttle_discogs():
     _last_discogs_call = time.time()
 
 
-def search_discogs_release_artwork(artist_name, album_name):
-    """Best-matching Discogs release artwork URL, or None. Particularly
+def find_via_discogs(artist_name, album_name):
+    """{'raw', 'year', 'source_url'} via Discogs, or None. Particularly
     strong for vinyl/regional releases (e.g. Israeli/Hebrew pressings) that
     the more mainstream-Western-catalog sources tend to miss - tried early
     in the fallback chain for that reason.
@@ -146,7 +158,9 @@ def search_discogs_release_artwork(artist_name, album_name):
     artist=/release_title= fields - those need a near-exact match against
     how Discogs indexes the artist name and returned nothing for the large
     majority of a real test batch (including well-documented artists), while
-    free text against the same catalog reliably found them."""
+    free text against the same catalog reliably found them. Among title
+    matches, prefers the earliest-dated pressing - Discogs' top hit for
+    "Abbey Road" was a 2016 reissue, not the 1969 original."""
     if not DISCOGS_TOKEN:
         return None
     _throttle_discogs()
@@ -155,7 +169,7 @@ def search_discogs_release_artwork(artist_name, album_name):
             DISCOGS_SEARCH_URL,
             params={
                 'q': f'{artist_name} {album_name}', 'type': 'release',
-                'token': DISCOGS_TOKEN, 'per_page': 5,
+                'token': DISCOGS_TOKEN, 'per_page': 10,
             },
             headers={'User-Agent': MUSICBRAINZ_USER_AGENT},
             timeout=REQUEST_TIMEOUT,
@@ -168,20 +182,29 @@ def search_discogs_release_artwork(artist_name, album_name):
         return None
 
     normalized_album = _normalize(album_name)
-    for result in response.json().get('results') or []:
-        title = result.get('title', '')
-        if normalized_album and normalized_album in _normalize(title):
-            return result.get('cover_image') or result.get('thumb')
+    candidates = [
+        r for r in (response.json().get('results') or [])
+        if normalized_album and normalized_album in _normalize(r.get('title', ''))
+    ]
+    candidates.sort(key=lambda r: _year_from(r.get('year')) or 9999)
+    for result in candidates:
+        raw = download_bytes(result.get('cover_image') or result.get('thumb'))
+        if raw:
+            uri = result.get('uri')
+            return {
+                'raw': raw,
+                'year': _year_from(result.get('year')),
+                'source_url': f'https://www.discogs.com{uri}' if uri else None,
+            }
     return None
 
 
-def search_itunes_artwork_url(artist_name, album_name):
-    """Best-matching iTunes album artwork URL for (artist_name, album_name),
-    upscaled from the default 100x100 thumbnail, or None."""
+def find_via_itunes(artist_name, album_name):
+    """{'raw', 'year', 'source_url'} via the iTunes Search API, or None."""
     try:
         response = requests.get(
             ITUNES_SEARCH_URL,
-            params={'term': f'{artist_name} {album_name}', 'media': 'music', 'entity': 'album', 'limit': 3},
+            params={'term': f'{artist_name} {album_name}', 'media': 'music', 'entity': 'album', 'limit': 5},
             timeout=REQUEST_TIMEOUT,
         )
     except Exception:
@@ -191,22 +214,32 @@ def search_itunes_artwork_url(artist_name, album_name):
     if response.status_code != 200:
         return None
 
-    best, best_score = None, 0.0
+    candidates = []
     for result in response.json().get('results') or []:
         score = (_similar(album_name, result.get('collectionName', '')) + _similar(artist_name, result.get('artistName', ''))) / 2
-        if score > best_score:
-            best, best_score = result, score
-    if best is None or best_score < MATCH_THRESHOLD:
-        return None
-    art_url = best.get('artworkUrl100')
-    return art_url.replace('100x100bb', '600x600bb') if art_url else None
+        if score >= MATCH_THRESHOLD:
+            candidates.append(result)
+    candidates.sort(key=lambda r: _year_from(r.get('releaseDate')) or 9999)
+
+    for result in candidates:
+        art_url = result.get('artworkUrl100')
+        raw = download_bytes(art_url.replace('100x100bb', '600x600bb') if art_url else None)
+        if raw:
+            return {
+                'raw': raw,
+                'year': _year_from(result.get('releaseDate')),
+                'source_url': result.get('collectionViewUrl'),
+            }
+    return None
 
 
-def search_deezer_album_artwork(artist_name, album_name):
-    """Best-matching Deezer album artwork URL (largest size available), or
-    None. Deezer signals its rate limit with an HTTP 200 whose JSON body is
-    an error object (code 4, "Quota limit exceeded"), not an HTTP error
-    status - has to be checked for explicitly."""
+def find_via_deezer(artist_name, album_name):
+    """{'raw', 'year', 'source_url'} via Deezer, or None. Deezer signals its
+    rate limit with an HTTP 200 whose JSON body is an error object (code 4,
+    "Quota limit exceeded"), not an HTTP error status - checked explicitly.
+    release_date isn't in the search response, only the full album lookup -
+    fetched only for the single best-scored match, not every candidate, to
+    avoid an extra API call per candidate."""
     try:
         response = requests.get(
             DEEZER_SEARCH_URL,
@@ -228,7 +261,18 @@ def search_deezer_album_artwork(artist_name, album_name):
             best, best_score = result, score
     if best is None or best_score < MATCH_THRESHOLD:
         return None
-    return best.get('cover_xl') or best.get('cover_big')
+
+    raw = download_bytes(best.get('cover_xl') or best.get('cover_big'))
+    if not raw:
+        return None
+
+    year = None
+    try:
+        detail = requests.get(f"{DEEZER_ALBUM_URL}/{best['id']}", timeout=REQUEST_TIMEOUT).json()
+        year = _year_from(detail.get('release_date'))
+    except Exception:
+        pass
+    return {'raw': raw, 'year': year, 'source_url': best.get('link')}
 
 
 def _throttle_audiodb():
@@ -239,10 +283,12 @@ def _throttle_audiodb():
     _last_audiodb_call = time.time()
 
 
-def search_audiodb_album_artwork(artist_name, album_name):
-    """Best-matching TheAudioDB album artwork URL, or None. Tried last in the
-    fallback chain since it shares artist_info.py's community rate-limited
-    key (30 req/min on the default free-tier key)."""
+def find_via_audiodb(artist_name, album_name):
+    """{'raw', 'year', 'source_url'} via TheAudioDB's album endpoint, or
+    None. Tried last in the fallback chain since it shares artist_info.py's
+    community rate-limited key (30 req/min on the default free-tier key).
+    No public browsable album page is readily available, so source_url is
+    always None here."""
     _throttle_audiodb()
     try:
         response = requests.get(
@@ -256,18 +302,19 @@ def search_audiodb_album_artwork(artist_name, album_name):
         raise RateLimited(60)
     if response.status_code != 200:
         return None
-    albums = response.json().get('album') or []
-    if not albums:
-        return None
 
-    best, best_score = None, 0.0
-    for album in albums:
+    candidates = []
+    for album in response.json().get('album') or []:
         score = (_similar(album_name, album.get('strAlbum', '')) + _similar(artist_name, album.get('strArtist', ''))) / 2
-        if score > best_score:
-            best, best_score = album, score
-    if best is None or best_score < MATCH_THRESHOLD:
-        return None
-    return best.get('strAlbumThumb')
+        if score >= MATCH_THRESHOLD:
+            candidates.append(album)
+    candidates.sort(key=lambda a: _year_from(a.get('intYearReleased')) or 9999)
+
+    for album in candidates:
+        raw = download_bytes(album.get('strAlbumThumb'))
+        if raw:
+            return {'raw': raw, 'year': _year_from(album.get('intYearReleased')), 'source_url': None}
+    return None
 
 
 SEARCH_PACING_SECONDS = 0.5
@@ -275,21 +322,23 @@ SEARCH_PACING_SECONDS = 0.5
 
 def backfill_external_artwork(get_connection, progress):
     """For tracks with no artwork found locally (has_artwork = FALSE, set by
-    the Check Artwork job), tries free external sources in order: this
-    track's own already-stored Spotify album art URL (from Spotify Enrich,
-    if that ran - free, no extra lookup needed), then MusicBrainz + Cover Art
-    Archive, then Discogs (particularly strong for regional/vinyl releases),
-    then Deezer, then the iTunes Search API, then TheAudioDB's album
-    endpoint (last, since it shares artist_info.py's community-rate-limited
-    key). A hit is downloaded and cached under the same album-shared
-    cache_key used everywhere else, so every track sharing that album picks
-    it up too - not just the one row processed here (mirrors
+    the Check Artwork job), tries free external sources in order: MusicBrainz
+    + Cover Art Archive, then Discogs (particularly strong for regional/vinyl
+    releases), then Deezer, then the iTunes Search API, then TheAudioDB's
+    album endpoint (last, since it shares artist_info.py's community
+    rate-limited key). Alongside artwork, also backfills release year
+    (only where the local tag left it blank) and a link to whichever source
+    matched, from the same lookup - no extra API calls needed for that.
+
+    A hit is downloaded and cached under the same album-shared cache_key
+    used everywhere else, so every track sharing that album picks it up
+    too - not just the one row processed here (mirrors
     check_artwork_presence's own sibling backfill).
 
     Processes one row at a time so a real rate limit (raised as RateLimited)
-    can pause the whole run and resume automatically once it clears, same
-    approach as the Spotify enrich job - MusicBrainz in particular really
-    will reject requests outright if its 1/sec limit is violated.
+    can pause the whole run and resume automatically once it clears -
+    MusicBrainz in particular really will reject requests outright if its
+    1/sec limit is violated.
     """
     progress.update(status='running', processed=0, total=0, found=0, still_missing=0, error=None, resume_at=None)
 
@@ -310,7 +359,7 @@ def backfill_external_artwork(get_connection, progress):
         while True:
             cur = conn.cursor()
             cur.execute("""
-                SELECT id, artist_name, album_name, spotify_album_art_url FROM known_tracks
+                SELECT id, artist_name, album_name, year FROM known_tracks
                 WHERE has_artwork = FALSE AND external_artwork_checked IS NOT TRUE
                 LIMIT 1
             """)
@@ -319,21 +368,19 @@ def backfill_external_artwork(get_connection, progress):
             if row is None:
                 break
 
-            track_id, artist_name, album_name, spotify_art_url = row
+            track_id, artist_name, album_name, existing_year = row
             try:
-                raw = download_bytes(spotify_art_url)
-                if not raw and album_name:
-                    mbid = search_musicbrainz_release_mbid(artist_name, album_name)
-                    if mbid:
-                        raw = fetch_cover_art_archive_image(mbid)
-                if not raw and album_name:
-                    raw = download_bytes(search_discogs_release_artwork(artist_name, album_name))
-                if not raw and album_name:
-                    raw = download_bytes(search_deezer_album_artwork(artist_name, album_name))
-                if not raw:
-                    raw = download_bytes(search_itunes_artwork_url(artist_name, album_name or ''))
-                if not raw and album_name:
-                    raw = download_bytes(search_audiodb_album_artwork(artist_name, album_name))
+                result = None
+                if album_name:
+                    result = find_via_musicbrainz(artist_name, album_name)
+                if not result and album_name:
+                    result = find_via_discogs(artist_name, album_name)
+                if not result and album_name:
+                    result = find_via_deezer(artist_name, album_name)
+                if not result:
+                    result = find_via_itunes(artist_name, album_name or '')
+                if not result and album_name:
+                    result = find_via_audiodb(artist_name, album_name)
             except RateLimited as e:
                 resume_at = time.time() + e.retry_after_seconds
                 progress.update(status='waiting', resume_at=resume_at)
@@ -341,25 +388,33 @@ def backfill_external_artwork(get_connection, progress):
                 progress.update(status='running', resume_at=None)
                 continue
 
-            found = bool(raw and save_thumbnail(cache_key_for(track_id, artist_name, album_name), raw))
+            found = bool(result and save_thumbnail(cache_key_for(track_id, artist_name, album_name), result['raw']))
+            new_year = (result.get('year') if result else None) if not existing_year else None
+            source_url = result.get('source_url') if result else None
 
             # WHERE ... has_artwork = FALSE restricts this to rows that were
             # actually part of the "still missing" set this job targets -
             # every matched row is a definite FALSE already, so setting it to
             # `found` directly is unambiguous (no NULL/never-checked rows
-            # get touched or reinterpreted here).
+            # get touched or reinterpreted here). year only ever fills a
+            # blank (COALESCE keeps any locally-tagged year untouched).
             cur = conn.cursor()
             if album_name:
                 cur.execute(f"""
-                    UPDATE known_tracks SET external_artwork_checked = TRUE, has_artwork = %(found)s
+                    UPDATE known_tracks SET external_artwork_checked = TRUE, has_artwork = %(found)s,
+                        year = COALESCE(year, %(new_year)s), artwork_source_url = COALESCE(artwork_source_url, %(source_url)s)
                     WHERE artist_name = %(artist)s AND {normalized_album_sql()} = %(normalized_album)s
                       AND has_artwork = FALSE
-                """, {'found': found, 'artist': artist_name, 'normalized_album': normalize_album_name(album_name)})
+                """, {
+                    'found': found, 'new_year': new_year, 'source_url': source_url,
+                    'artist': artist_name, 'normalized_album': normalize_album_name(album_name),
+                })
             else:
                 cur.execute(
-                    "UPDATE known_tracks SET external_artwork_checked = TRUE, has_artwork = %s "
+                    "UPDATE known_tracks SET external_artwork_checked = TRUE, has_artwork = %s, "
+                    "year = COALESCE(year, %s), artwork_source_url = COALESCE(artwork_source_url, %s) "
                     "WHERE id = %s AND has_artwork = FALSE",
-                    (found, track_id),
+                    (found, new_year, source_url, track_id),
                 )
             conn.commit()
             cur.close()

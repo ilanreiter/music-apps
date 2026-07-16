@@ -15,7 +15,6 @@ from .library_cleanup import (
 )
 from . import wiim
 from . import chromecast
-from . import spotify
 from . import external_artwork
 import google.generativeai as genai
 import logging
@@ -104,9 +103,6 @@ scan_progress = {"status": "idle"}
 artwork_check_lock = threading.Lock()
 artwork_check_progress = {"status": "idle"}
 
-spotify_enrich_lock = threading.Lock()
-spotify_enrich_progress = {"status": "idle"}
-
 external_artwork_lock = threading.Lock()
 external_artwork_progress = {"status": "idle"}
 
@@ -128,7 +124,7 @@ class Track(BaseModel):
     channels: Optional[int] = None
     file_size_bytes: Optional[int] = None
     file_format: Optional[str] = None
-    spotify_url: Optional[str] = None
+    artwork_source_url: Optional[str] = None
     is_favorite: Optional[bool] = False
     last_played: Optional[str] = None # Will be datetime string
 
@@ -165,15 +161,6 @@ class ArtworkCheckStatus(BaseModel):
     total: Optional[int] = None
     found: Optional[int] = None
     missing: Optional[int] = None
-    error: Optional[str] = None
-
-class SpotifyEnrichStatus(BaseModel):
-    status: str  # idle | running | waiting | done | error
-    processed: Optional[int] = None
-    total: Optional[int] = None
-    matched: Optional[int] = None
-    unmatched: Optional[int] = None
-    resume_at: Optional[float] = None  # unix timestamp; set only while status == 'waiting'
     error: Optional[str] = None
 
 class ExternalArtworkStatus(BaseModel):
@@ -287,28 +274,13 @@ async def startup_event():
     create_tables()
     print("Tables checked/created.")
 
-    # A Spotify enrich run (mid-processing, or mid-wait for a rate limit) has
-    # no way to survive a container rebuild on its own - the in-memory
+    # An external-artwork run (mid-processing, or mid-wait for a rate limit)
+    # has no way to survive a container rebuild on its own - the in-memory
     # progress/lock are gone the moment the process exits. Auto-resume here
     # rather than requiring a manual re-click, since unchecked rows are
     # exactly the same "still work to do" signal a genuine interruption would
     # leave behind (also covers new tracks added by a scan since the last
     # complete run).
-    if spotify.is_configured():
-        conn = get_db_connection()
-        if conn:
-            try:
-                cur = conn.cursor()
-                cur.execute("SELECT COUNT(*) FROM known_tracks WHERE spotify_checked IS NOT TRUE")
-                remaining = cur.fetchone()[0]
-                cur.close()
-            finally:
-                conn.close()
-            if remaining > 0:
-                print(f"Resuming Spotify enrich in the background ({remaining} tracks not yet checked).")
-                _start_spotify_enrich_background()
-
-    # Same reasoning as the Spotify enrich resume above.
     conn = get_db_connection()
     if conn:
         try:
@@ -338,7 +310,6 @@ async def get_known_tracks(
     format: Optional[str] = None,
     favorite: Optional[bool] = None,
     length: Optional[str] = None,
-    spotify_matched: Optional[bool] = None,
     external_artwork_found: Optional[bool] = None,
     shuffle: bool = False,
     limit: int = Query(100, ge=1, le=20000),
@@ -380,9 +351,6 @@ async def get_known_tracks(
         if length:
             where_clauses.append(f"({LENGTH_TIER_SQL}) = %(length)s")
             params['length'] = length
-        if spotify_matched is not None:
-            where_clauses.append("(spotify_track_id IS NOT NULL) = %(spotify_matched)s")
-            params['spotify_matched'] = spotify_matched
         if external_artwork_found is not None:
             # external_artwork_checked is only ever set on rows the external-artwork
             # job actually processed (has_artwork was FALSE going in), so this
@@ -400,7 +368,7 @@ async def get_known_tracks(
             from_sql = f"""
                 (SELECT DISTINCT ON ({DEDUP_NORM_TITLE_SQL}, {DEDUP_NORM_ARTIST_SQL}, {DEDUP_NORM_ALBUM_SQL})
                         id, track_name, artist_name, album_name, genre, year, duration_seconds,
-                        bitrate, sample_rate, channels, file_size_bytes, file_path, spotify_url, is_favorite, last_played
+                        bitrate, sample_rate, channels, file_size_bytes, file_path, artwork_source_url, is_favorite, last_played
                  FROM known_tracks {where_sql}
                  ORDER BY {DEDUP_NORM_TITLE_SQL}, {DEDUP_NORM_ARTIST_SQL}, {DEDUP_NORM_ALBUM_SQL},
                           {QUALITY_TIER_RANK_SQL} ASC, bitrate DESC NULLS LAST, id ASC
@@ -419,7 +387,7 @@ async def get_known_tracks(
         order_sql = "ORDER BY RANDOM()" if shuffle else "ORDER BY artist_name, album_name, track_name"
         cur.execute(f"""
             SELECT id, track_name, artist_name, album_name, genre, year, duration_seconds,
-                   bitrate, sample_rate, channels, file_size_bytes, file_path, spotify_url, is_favorite, last_played
+                   bitrate, sample_rate, channels, file_size_bytes, file_path, artwork_source_url, is_favorite, last_played
             FROM {from_sql}
             {order_sql}
             LIMIT %(limit)s OFFSET %(offset)s
@@ -558,7 +526,7 @@ async def get_track(track_id: int, db: psycopg2.extensions.connection = Depends(
         cur = db.cursor(cursor_factory=RealDictCursor)
         cur.execute("""
             SELECT id, track_name, artist_name, album_name, genre, year, duration_seconds,
-                   bitrate, sample_rate, channels, file_size_bytes, file_path, spotify_url, is_favorite, last_played
+                   bitrate, sample_rate, channels, file_size_bytes, file_path, artwork_source_url, is_favorite, last_played
             FROM known_tracks WHERE id = %s
         """, (track_id,))
         track = cur.fetchone()
@@ -1034,50 +1002,13 @@ async def start_artwork_check():
 async def get_artwork_check_status():
     return artwork_check_progress
 
-def _start_spotify_enrich_background():
-    """Kicks off a background Spotify enrich if one isn't already running.
-    Returns False (no-op, no error) if one is already in flight - used both
-    by the explicit endpoint below and the auto-resume-on-startup check
-    (a run interrupted by a container rebuild - mid-run or mid-wait for a
-    rate limit - otherwise wouldn't restart itself, since the in-memory
-    progress/lock don't survive the process exiting)."""
-    if not spotify_enrich_lock.acquire(blocking=False):
-        return False
-    try:
-        spotify_enrich_progress.clear()
-        spotify_enrich_progress.update(status="running")
-
-        def _run():
-            try:
-                spotify.enrich_library_from_spotify(get_db_connection, spotify_enrich_progress)
-            finally:
-                spotify_enrich_lock.release()
-
-        threading.Thread(target=_run, daemon=True).start()
-        return True
-    except Exception:
-        spotify_enrich_lock.release()
-        raise
-
-@app.post("/api/library/spotify-enrich", response_model=SpotifyEnrichStatus, status_code=status.HTTP_202_ACCEPTED)
-async def start_spotify_enrich():
-    if not spotify.is_configured():
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="SPOTIFY_CLIENT_ID/SPOTIFY_CLIENT_SECRET not set in .env",
-        )
-    if not _start_spotify_enrich_background():
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="A Spotify enrich is already running.")
-    return spotify_enrich_progress
-
-@app.get("/api/library/spotify-enrich/status", response_model=SpotifyEnrichStatus)
-async def get_spotify_enrich_status():
-    return spotify_enrich_progress
-
 def _start_external_artwork_background():
-    """Same reasoning as _start_spotify_enrich_background: kicks off a
-    background external-artwork backfill if one isn't already running, and
-    is reused for the auto-resume-on-startup check below."""
+    """Kicks off a background external-artwork backfill if one isn't already
+    running. Returns False (no-op, no error) if one is already in flight -
+    used both by the explicit endpoint below and the auto-resume-on-startup
+    check (a run interrupted by a container rebuild - mid-run or mid-wait
+    for a rate limit - otherwise wouldn't restart itself, since the
+    in-memory progress/lock don't survive the process exiting)."""
     if not external_artwork_lock.acquire(blocking=False):
         return False
     try:
