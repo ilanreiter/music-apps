@@ -1,3 +1,4 @@
+import os
 import re
 import time
 from difflib import SequenceMatcher
@@ -20,6 +21,15 @@ MUSICBRAINZ_SCORE_THRESHOLD = 90  # MB's own 0-100 search relevance score
 
 COVER_ART_ARCHIVE_URL = 'https://coverartarchive.org/release'
 
+# Discogs' structured search (separate artist/release_title params, rather
+# than free text) already does relevant-result filtering server-side, so
+# unlike the other sources a full similarity-ratio check isn't needed - just
+# a substring sanity check on the combined "Artist - Title" result string.
+# 60 req/min for authenticated (token) requests per their docs.
+DISCOGS_SEARCH_URL = 'https://api.discogs.com/database/search'
+DISCOGS_TOKEN = os.environ.get('DISCOGS_TOKEN')
+DISCOGS_MIN_INTERVAL_SECONDS = 1.05
+
 ITUNES_SEARCH_URL = 'https://itunes.apple.com/search'
 MATCH_THRESHOLD = 0.72
 
@@ -33,6 +43,11 @@ AUDIODB_MIN_INTERVAL_SECONDS = 2.1
 
 _last_musicbrainz_call = 0.0
 _last_audiodb_call = 0.0
+_last_discogs_call = 0.0
+
+
+def is_discogs_configured():
+    return bool(DISCOGS_TOKEN)
 
 
 class RateLimited(Exception):
@@ -111,6 +126,53 @@ def search_musicbrainz_release_mbid(artist_name, album_name):
 
 def fetch_cover_art_archive_image(mbid):
     return download_bytes(f"{COVER_ART_ARCHIVE_URL}/{mbid}/front-500")
+
+
+def _throttle_discogs():
+    global _last_discogs_call
+    elapsed = time.time() - _last_discogs_call
+    if elapsed < DISCOGS_MIN_INTERVAL_SECONDS:
+        time.sleep(DISCOGS_MIN_INTERVAL_SECONDS - elapsed)
+    _last_discogs_call = time.time()
+
+
+def search_discogs_release_artwork(artist_name, album_name):
+    """Best-matching Discogs release artwork URL, or None. Particularly
+    strong for vinyl/regional releases (e.g. Israeli/Hebrew pressings) that
+    the more mainstream-Western-catalog sources tend to miss - tried early
+    in the fallback chain for that reason.
+
+    Uses a combined free-text query rather than Discogs' structured
+    artist=/release_title= fields - those need a near-exact match against
+    how Discogs indexes the artist name and returned nothing for the large
+    majority of a real test batch (including well-documented artists), while
+    free text against the same catalog reliably found them."""
+    if not DISCOGS_TOKEN:
+        return None
+    _throttle_discogs()
+    try:
+        response = requests.get(
+            DISCOGS_SEARCH_URL,
+            params={
+                'q': f'{artist_name} {album_name}', 'type': 'release',
+                'token': DISCOGS_TOKEN, 'per_page': 5,
+            },
+            headers={'User-Agent': MUSICBRAINZ_USER_AGENT},
+            timeout=REQUEST_TIMEOUT,
+        )
+    except Exception:
+        return None
+    if response.status_code == 429:
+        raise RateLimited(60)
+    if response.status_code != 200:
+        return None
+
+    normalized_album = _normalize(album_name)
+    for result in response.json().get('results') or []:
+        title = result.get('title', '')
+        if normalized_album and normalized_album in _normalize(title):
+            return result.get('cover_image') or result.get('thumb')
+    return None
 
 
 def search_itunes_artwork_url(artist_name, album_name):
@@ -216,7 +278,8 @@ def backfill_external_artwork(get_connection, progress):
     the Check Artwork job), tries free external sources in order: this
     track's own already-stored Spotify album art URL (from Spotify Enrich,
     if that ran - free, no extra lookup needed), then MusicBrainz + Cover Art
-    Archive, then Deezer, then the iTunes Search API, then TheAudioDB's album
+    Archive, then Discogs (particularly strong for regional/vinyl releases),
+    then Deezer, then the iTunes Search API, then TheAudioDB's album
     endpoint (last, since it shares artist_info.py's community-rate-limited
     key). A hit is downloaded and cached under the same album-shared
     cache_key used everywhere else, so every track sharing that album picks
@@ -263,6 +326,8 @@ def backfill_external_artwork(get_connection, progress):
                     mbid = search_musicbrainz_release_mbid(artist_name, album_name)
                     if mbid:
                         raw = fetch_cover_art_archive_image(mbid)
+                if not raw and album_name:
+                    raw = download_bytes(search_discogs_release_artwork(artist_name, album_name))
                 if not raw and album_name:
                     raw = download_bytes(search_deezer_album_artwork(artist_name, album_name))
                 if not raw:
