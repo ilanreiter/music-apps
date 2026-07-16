@@ -16,6 +16,7 @@ from .library_cleanup import (
 from . import wiim
 from . import chromecast
 from . import spotify
+from . import external_artwork
 import google.generativeai as genai
 import logging
 import os
@@ -106,6 +107,9 @@ artwork_check_progress = {"status": "idle"}
 spotify_enrich_lock = threading.Lock()
 spotify_enrich_progress = {"status": "idle"}
 
+external_artwork_lock = threading.Lock()
+external_artwork_progress = {"status": "idle"}
+
 # Configure Gemini API
 genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
 model = genai.GenerativeModel('gemini-1.5-pro')
@@ -169,6 +173,15 @@ class SpotifyEnrichStatus(BaseModel):
     total: Optional[int] = None
     matched: Optional[int] = None
     unmatched: Optional[int] = None
+    resume_at: Optional[float] = None  # unix timestamp; set only while status == 'waiting'
+    error: Optional[str] = None
+
+class ExternalArtworkStatus(BaseModel):
+    status: str  # idle | running | waiting | done | error
+    processed: Optional[int] = None
+    total: Optional[int] = None
+    found: Optional[int] = None
+    still_missing: Optional[int] = None
     resume_at: Optional[float] = None  # unix timestamp; set only while status == 'waiting'
     error: Optional[str] = None
 
@@ -294,6 +307,20 @@ async def startup_event():
             if remaining > 0:
                 print(f"Resuming Spotify enrich in the background ({remaining} tracks not yet checked).")
                 _start_spotify_enrich_background()
+
+    # Same reasoning as the Spotify enrich resume above.
+    conn = get_db_connection()
+    if conn:
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT COUNT(*) FROM known_tracks WHERE has_artwork = FALSE AND external_artwork_checked IS NOT TRUE")
+            remaining = cur.fetchone()[0]
+            cur.close()
+        finally:
+            conn.close()
+        if remaining > 0:
+            print(f"Resuming external artwork backfill in the background ({remaining} tracks not yet checked).")
+            _start_external_artwork_background()
 
 @app.get("/")
 async def read_root():
@@ -1039,6 +1066,38 @@ async def start_spotify_enrich():
 @app.get("/api/library/spotify-enrich/status", response_model=SpotifyEnrichStatus)
 async def get_spotify_enrich_status():
     return spotify_enrich_progress
+
+def _start_external_artwork_background():
+    """Same reasoning as _start_spotify_enrich_background: kicks off a
+    background external-artwork backfill if one isn't already running, and
+    is reused for the auto-resume-on-startup check below."""
+    if not external_artwork_lock.acquire(blocking=False):
+        return False
+    try:
+        external_artwork_progress.clear()
+        external_artwork_progress.update(status="running")
+
+        def _run():
+            try:
+                external_artwork.backfill_external_artwork(get_db_connection, external_artwork_progress)
+            finally:
+                external_artwork_lock.release()
+
+        threading.Thread(target=_run, daemon=True).start()
+        return True
+    except Exception:
+        external_artwork_lock.release()
+        raise
+
+@app.post("/api/library/external-artwork", response_model=ExternalArtworkStatus, status_code=status.HTTP_202_ACCEPTED)
+async def start_external_artwork():
+    if not _start_external_artwork_background():
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="An external artwork backfill is already running.")
+    return external_artwork_progress
+
+@app.get("/api/library/external-artwork/status", response_model=ExternalArtworkStatus)
+async def get_external_artwork_status():
+    return external_artwork_progress
 
 @app.get("/api/history", response_model=List[DiscoveryHistoryEntry])
 async def get_discovery_history(db: psycopg2.extensions.connection = Depends(get_db)):

@@ -147,14 +147,35 @@ def check_artwork_presence(get_connection, progress):
         conn.close()
 
 
+def cache_path_for(cache_key):
+    return os.path.join(ARTWORK_CACHE_DIR, f"{cache_key}.jpg")
+
+
+def save_thumbnail(cache_key, raw_bytes):
+    """Downscale and cache raw image bytes (from any source - an embedded
+    tag, or a downloaded external image) under cache_key. Returns the cache
+    path on success, None if the bytes weren't a decodable image."""
+    os.makedirs(ARTWORK_CACHE_DIR, exist_ok=True)
+    cache_path = cache_path_for(cache_key)
+    try:
+        image = Image.open(io.BytesIO(raw_bytes)).convert('RGB')
+        image.thumbnail(THUMBNAIL_SIZE)
+        image.save(cache_path, format='JPEG', quality=85)
+    except Exception:
+        return None
+    return cache_path
+
+
 def get_or_create_thumbnail(cache_key, candidate_paths):
     """Return the on-disk cache path for a thumbnail, extracting and downscaling
     embedded cover art from the first candidate file that has any, on first
     request. `candidate_paths` should be the track's own file first, followed
     by any album-mates' files to fall back to when this file itself embeds no
-    art. Returns None if none of the candidates have artwork."""
+    art. Returns None if none of the candidates have artwork (the external
+    artwork job may fill the same cache_key later - this function will then
+    pick that up automatically via the cache_path check above)."""
     os.makedirs(ARTWORK_CACHE_DIR, exist_ok=True)
-    cache_path = os.path.join(ARTWORK_CACHE_DIR, f"{cache_key}.jpg")
+    cache_path = cache_path_for(cache_key)
     if os.path.exists(cache_path):
         return cache_path
 
@@ -178,11 +199,4 @@ def get_or_create_thumbnail(cache_key, candidate_paths):
             pass
         return None
 
-    try:
-        image = Image.open(io.BytesIO(raw)).convert('RGB')
-        image.thumbnail(THUMBNAIL_SIZE)
-        image.save(cache_path, format='JPEG', quality=85)
-    except Exception:
-        return None
-
-    return cache_path
+    return save_thumbnail(cache_key, raw)

@@ -1690,6 +1690,9 @@ function CleanupTab({ apiBase, activeTab, nowPlaying, isPlaying, onTrackPlayClic
   const [missingArtworkTotal, setMissingArtworkTotal] = useState(0);
   const artworkPollRef = useRef(null);
 
+  const [externalArtworkStatus, setExternalArtworkStatus] = useState(null);
+  const externalArtworkPollRef = useRef(null);
+
   const [spotifyEnrichStatus, setSpotifyEnrichStatus] = useState(null);
   const [spotifyEnrichedTracks, setSpotifyEnrichedTracks] = useState([]);
   const [spotifyEnrichedTotal, setSpotifyEnrichedTotal] = useState(0);
@@ -1758,6 +1761,42 @@ function CleanupTab({ apiBase, activeTab, nowPlaying, isPlaying, onTrackPlayClic
     }
   };
 
+  const pollExternalArtwork = () => {
+    if (externalArtworkPollRef.current) clearInterval(externalArtworkPollRef.current);
+    externalArtworkPollRef.current = setInterval(async () => {
+      try {
+        const response = await axios.get(`${apiBase}/library/external-artwork/status`);
+        setExternalArtworkStatus(response.data);
+        // Keeps polling through 'waiting' (MusicBrainz/iTunes rate limits) -
+        // only a real end state stops it. Re-fetching the missing-artwork
+        // list while work is happening shows it visibly shrinking as
+        // external matches come in, not just once the whole run finishes.
+        if (response.data.status === 'running' || response.data.status === 'done') {
+          fetchMissingArtwork(0);
+        }
+        if (response.data.status === 'done' || response.data.status === 'error') {
+          clearInterval(externalArtworkPollRef.current);
+          externalArtworkPollRef.current = null;
+        }
+      } catch (err) {
+        clearInterval(externalArtworkPollRef.current);
+        externalArtworkPollRef.current = null;
+        console.error('Error polling external artwork status:', err);
+      }
+    }, 1500);
+  };
+
+  const startExternalArtwork = async () => {
+    try {
+      const response = await axios.post(`${apiBase}/library/external-artwork`);
+      setExternalArtworkStatus(response.data);
+      pollExternalArtwork();
+    } catch (err) {
+      setExternalArtworkStatus({ status: 'error', error: err.response?.data?.detail || 'Failed to start' });
+      console.error('Error starting external artwork backfill:', err);
+    }
+  };
+
   const fetchSpotifyEnriched = async (offset) => {
     try {
       const response = await axios.get(`${apiBase}/tracks/known`, { params: { spotify_matched: true, limit: 100, offset } });
@@ -1820,6 +1859,12 @@ function CleanupTab({ apiBase, activeTab, nowPlaying, isPlaying, onTrackPlayClic
         }
       }).catch((err) => console.error('Error checking artwork-check status:', err));
     }
+    if (subTab === 'missing-artwork' && externalArtworkStatus === null) {
+      axios.get(`${apiBase}/library/external-artwork/status`).then((response) => {
+        setExternalArtworkStatus(response.data);
+        if (response.data.status === 'running' || response.data.status === 'waiting') pollExternalArtwork();
+      }).catch((err) => console.error('Error checking external artwork status:', err));
+    }
     if (subTab === 'spotify-enrich' && spotifyEnrichStatus === null) {
       axios.get(`${apiBase}/library/spotify-enrich/status`).then((response) => {
         setSpotifyEnrichStatus(response.data);
@@ -1832,6 +1877,7 @@ function CleanupTab({ apiBase, activeTab, nowPlaying, isPlaying, onTrackPlayClic
 
   useEffect(() => () => {
     if (artworkPollRef.current) clearInterval(artworkPollRef.current);
+    if (externalArtworkPollRef.current) clearInterval(externalArtworkPollRef.current);
     if (spotifyEnrichPollRef.current) clearInterval(spotifyEnrichPollRef.current);
   }, []);
 
@@ -1966,6 +2012,26 @@ function CleanupTab({ apiBase, activeTab, nowPlaying, isPlaying, onTrackPlayClic
                 : artworkCheckStatus.status === 'done'
                   ? `Done — ${(artworkCheckStatus.found || 0).toLocaleString()} have artwork, ${(artworkCheckStatus.missing || 0).toLocaleString()} missing`
                   : artworkCheckStatus.status === 'error' ? `Error: ${artworkCheckStatus.error}` : ''}
+            </p>
+          )}
+          <button
+            className="scan-btn"
+            onClick={startExternalArtwork}
+            disabled={externalArtworkStatus?.status === 'running' || externalArtworkStatus?.status === 'waiting'}
+          >
+            {externalArtworkStatus?.status === 'running'
+              ? 'Fetching…'
+              : externalArtworkStatus?.status === 'waiting' ? 'Waiting on source…' : 'Fetch External Artwork'}
+          </button>
+          {externalArtworkStatus && externalArtworkStatus.status !== 'idle' && (
+            <p className="scan-summary">
+              {externalArtworkStatus.status === 'running'
+                ? `Fetching (MusicBrainz/Cover Art Archive/iTunes)… ${(externalArtworkStatus.processed || 0).toLocaleString()} of ${(externalArtworkStatus.total || 0).toLocaleString()}`
+                : externalArtworkStatus.status === 'waiting'
+                  ? `Paused by a source's rate limit (${(externalArtworkStatus.processed || 0).toLocaleString()} of ${(externalArtworkStatus.total || 0).toLocaleString()} done so far) - resuming automatically around ${externalArtworkStatus.resume_at ? new Date(externalArtworkStatus.resume_at * 1000).toLocaleString() : 'later'}`
+                  : externalArtworkStatus.status === 'done'
+                    ? `Done — ${(externalArtworkStatus.found || 0).toLocaleString()} found, ${(externalArtworkStatus.still_missing || 0).toLocaleString()} still missing`
+                    : externalArtworkStatus.status === 'error' ? `Error: ${externalArtworkStatus.error}` : ''}
             </p>
           )}
           {missingArtworkTracks.length > 0 && (
