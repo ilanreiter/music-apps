@@ -1783,12 +1783,24 @@ function CleanupTab({ apiBase, activeTab, nowPlaying, isPlaying, onTrackPlayClic
               </p>
               {missingTracksAlbums.map((album, idx) => (
                 <div key={idx} className="missing-album-row">
+                  {album.sample_track_id != null && (
+                    <div className="track-thumb-wrap">
+                      <span className="track-thumb-fallback">{album.album_name.charAt(0).toUpperCase()}</span>
+                      <img
+                        className="track-thumb"
+                        src={`${apiBase}/tracks/${album.sample_track_id}/artwork`}
+                        alt=""
+                        loading="lazy"
+                        onError={(e) => { e.target.style.display = 'none'; }}
+                      />
+                    </div>
+                  )}
                   <div className="missing-album-info">
                     <span className="missing-album-title">{album.album_name}</span>
                     <span className="missing-album-artist">{album.artist_name}</span>
                   </div>
                   <div className="missing-album-gap">
-                    Have {album.have_count} of {album.expected_total} &middot; missing #{album.missing_track_numbers.join(', #')}
+                    {album.have_count} available &middot; {album.missing_track_numbers.length} missing
                   </div>
                 </div>
               ))}

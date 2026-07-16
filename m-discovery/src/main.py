@@ -784,7 +784,7 @@ async def get_missing_tracks(db: psycopg2.extensions.connection = Depends(get_db
     try:
         cur = db.cursor()
         cur.execute("""
-            SELECT artist_name, album_name, track_number, track_total
+            SELECT id, artist_name, album_name, track_number, track_total
             FROM known_tracks
             WHERE album_name IS NOT NULL AND album_name <> '' AND track_number IS NOT NULL
         """)

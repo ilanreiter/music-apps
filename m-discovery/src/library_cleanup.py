@@ -134,18 +134,21 @@ MAX_PLAUSIBLE_ALBUM_SIZE = 50  # guards against corrupt track_total tags (real d
 
 
 def find_missing_tracks(rows):
-    """rows: iterable of (artist_name, album_name, track_number, track_total).
+    """rows: iterable of (id, artist_name, album_name, track_number, track_total).
     Returns albums with a gap in the track-number sequence, largest gap first.
     track_total (from an "N/M" tag) is used as the expected count when present,
     since it's authoritative; otherwise the highest track_number seen is only a
-    heuristic guess at the album length.
+    heuristic guess at the album length. sample_track_id (any track we do have
+    from that album) is included so the caller can show representative artwork -
+    there's no track row at all for the missing numbers themselves, so this is
+    the only artwork available for that album.
     """
     albums = {}
-    for artist_name, album_name, track_number, track_total in rows:
+    for track_id, artist_name, album_name, track_number, track_total in rows:
         if not album_name or track_number is None:
             continue
         key = (artist_name, album_name)
-        entry = albums.setdefault(key, {'numbers': set(), 'total_hint': None})
+        entry = albums.setdefault(key, {'numbers': set(), 'total_hint': None, 'sample_track_id': track_id})
         entry['numbers'].add(track_number)
         if track_total:
             entry['total_hint'] = max(entry['total_hint'] or 0, track_total)
@@ -166,6 +169,7 @@ def find_missing_tracks(rows):
                 'have_count': len(numbers),
                 'expected_total': expected_total,
                 'missing_track_numbers': missing,
+                'sample_track_id': entry['sample_track_id'],
             })
 
     results.sort(key=lambda r: len(r['missing_track_numbers']), reverse=True)
