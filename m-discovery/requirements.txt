@@ -5,3 +5,4 @@ google-generativeai
 mutagen
 Pillow
 requests
+PyChromecast>=13.0.0,<14

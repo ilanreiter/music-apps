@@ -10,11 +10,18 @@ from .artwork import get_or_create_thumbnail, check_artwork_presence
 from .artist_info import get_artist_info, get_artist_photo_path
 from .library_cleanup import find_duplicates, find_missing_tracks
 from . import wiim
+from . import chromecast
 import google.generativeai as genai
+import logging
 import os
 import json
 import re
 import threading
+
+# Without this, module-level loggers (e.g. chromecast.py's) have no handler
+# and INFO/WARNING records are silently dropped - only bare exceptions would
+# ever surface in `docker compose logs app`.
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(name)s: %(message)s')
 
 EXTENSION_MIME_TYPES = {
     '.mp3': 'audio/mpeg', '.flac': 'audio/flac', '.m4a': 'audio/mp4', '.mp4': 'audio/mp4',
@@ -186,6 +193,32 @@ class WiimStatus(BaseModel):
     position_ms: Optional[int] = None
     duration_ms: Optional[int] = None
     volume: Optional[int] = None
+
+class ChromecastDevice(BaseModel):
+    id: str
+    name: str
+    ip: str
+
+class ChromecastPlayRequest(BaseModel):
+    track_id: int
+    # Upcoming tracks to preload as a real Cast queue alongside track_id, so
+    # the device's own next/prev (including the TV remote's skip buttons)
+    # has something to navigate to. Capped server-side.
+    queue_track_ids: Optional[List[int]] = None
+
+class ChromecastVolumeRequest(BaseModel):
+    level: int
+
+class ChromecastSeekRequest(BaseModel):
+    position_ms: int
+
+class ChromecastStatus(BaseModel):
+    reachable: bool
+    status: Optional[str] = None
+    position_ms: Optional[int] = None
+    duration_ms: Optional[int] = None
+    volume: Optional[int] = None
+    content_id: Optional[str] = None
 
 # Dependency to get a database connection
 def get_db():
@@ -381,6 +414,26 @@ async def get_library_groups(
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
 
+@app.get("/api/tracks/{track_id}", response_model=Track)
+async def get_track(track_id: int, db: psycopg2.extensions.connection = Depends(get_db)):
+    try:
+        cur = db.cursor(cursor_factory=RealDictCursor)
+        cur.execute("""
+            SELECT id, track_name, artist_name, album_name, genre, year, duration_seconds,
+                   bitrate, sample_rate, channels, file_size_bytes, file_path, is_favorite, last_played
+            FROM known_tracks WHERE id = %s
+        """, (track_id,))
+        track = cur.fetchone()
+        cur.close()
+    except Exception as e:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+    if not track:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Track not found")
+    file_path = track.pop('file_path', None)
+    track['file_format'] = os.path.splitext(file_path)[1].lstrip('.').upper() if file_path else None
+    return track
+
 @app.get("/api/tracks/{track_id}/stream")
 async def stream_track(track_id: int, db: psycopg2.extensions.connection = Depends(get_db)):
     try:
@@ -501,6 +554,114 @@ def wiim_set_volume(device_id: str, params: WiimVolumeRequest):
 def wiim_get_status(device_id: str):
     device = _get_wiim_device_or_404(device_id)
     result = wiim.get_status(device['ip'])
+    if result is None:
+        return {"reachable": False}
+    return {"reachable": True, **result}
+
+def _get_chromecast_device_or_404(device_id: str):
+    device = chromecast.get_device(device_id)
+    if not device:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Unknown Chromecast device")
+    return device
+
+@app.get("/api/chromecast/devices", response_model=List[ChromecastDevice])
+def list_chromecast_devices():
+    return chromecast.list_devices()
+
+CHROMECAST_QUEUE_WINDOW = 30  # how many upcoming tracks to preload onto the device's own queue
+
+def _build_chromecast_item(row):
+    track_id, track_name, artist_name, album_name, file_path = row
+    content_type = EXTENSION_MIME_TYPES.get(os.path.splitext(file_path or '')[1].lower(), 'audio/mpeg')
+    return {
+        'stream_url': f"{PUBLIC_BASE_URL}/api/tracks/{track_id}/stream",
+        'art_url': f"{PUBLIC_BASE_URL}/api/tracks/{track_id}/artwork",
+        'content_type': content_type,
+        'title': track_name,
+        'artist': artist_name,
+        'album': album_name,
+    }
+
+@app.post("/api/chromecast/devices/{device_id}/play")
+def chromecast_play(device_id: str, params: ChromecastPlayRequest, db: psycopg2.extensions.connection = Depends(get_db)):
+    _get_chromecast_device_or_404(device_id)
+
+    track_ids = [params.track_id] + (params.queue_track_ids or [])[:CHROMECAST_QUEUE_WINDOW]
+
+    cur = db.cursor(cursor_factory=RealDictCursor)
+    cur.execute(
+        "SELECT id, track_name, artist_name, album_name, file_path FROM known_tracks WHERE id = ANY(%s)",
+        (track_ids,),
+    )
+    rows_by_id = {row['id']: row for row in cur.fetchall()}
+    cur.close()
+    if params.track_id not in rows_by_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Track not found")
+
+    # Preserve the requested order (ANY() doesn't), dropping any ids that
+    # weren't found rather than failing the whole cast over one bad id.
+    items = [
+        _build_chromecast_item((row['id'], row['track_name'], row['artist_name'], row['album_name'], row['file_path']))
+        for row in (rows_by_id[tid] for tid in track_ids if tid in rows_by_id)
+    ]
+
+    if not chromecast.play_queue(device_id, items):
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Could not reach Chromecast device")
+    return {"status": "playing"}
+
+@app.post("/api/chromecast/devices/{device_id}/queue-next")
+def chromecast_queue_next(device_id: str):
+    _get_chromecast_device_or_404(device_id)
+    if not chromecast.queue_next(device_id):
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Could not reach Chromecast device")
+    return {"status": "ok"}
+
+@app.post("/api/chromecast/devices/{device_id}/queue-prev")
+def chromecast_queue_prev(device_id: str):
+    _get_chromecast_device_or_404(device_id)
+    if not chromecast.queue_prev(device_id):
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Could not reach Chromecast device")
+    return {"status": "ok"}
+
+@app.post("/api/chromecast/devices/{device_id}/pause")
+def chromecast_pause(device_id: str):
+    _get_chromecast_device_or_404(device_id)
+    if not chromecast.pause(device_id):
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Could not reach Chromecast device")
+    return {"status": "paused"}
+
+@app.post("/api/chromecast/devices/{device_id}/resume")
+def chromecast_resume(device_id: str):
+    _get_chromecast_device_or_404(device_id)
+    if not chromecast.resume(device_id):
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Could not reach Chromecast device")
+    return {"status": "playing"}
+
+@app.post("/api/chromecast/devices/{device_id}/stop")
+def chromecast_stop(device_id: str):
+    _get_chromecast_device_or_404(device_id)
+    if not chromecast.stop(device_id):
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Could not reach Chromecast device")
+    return {"status": "stopped"}
+
+@app.post("/api/chromecast/devices/{device_id}/seek")
+def chromecast_seek(device_id: str, params: ChromecastSeekRequest):
+    _get_chromecast_device_or_404(device_id)
+    if not chromecast.seek(device_id, params.position_ms):
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Could not reach Chromecast device")
+    return {"status": "ok"}
+
+@app.post("/api/chromecast/devices/{device_id}/volume")
+def chromecast_set_volume(device_id: str, params: ChromecastVolumeRequest):
+    _get_chromecast_device_or_404(device_id)
+    if not chromecast.set_volume(device_id, params.level):
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Could not reach Chromecast device")
+    return {"status": "ok"}
+
+@app.get("/api/chromecast/devices/{device_id}/status", response_model=ChromecastStatus)
+def chromecast_get_status(device_id: str):
+    _get_chromecast_device_or_404(device_id)
+    result = chromecast.get_status(device_id)
     if result is None:
         return {"reachable": False}
     return {"reachable": True, **result}

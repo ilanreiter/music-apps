@@ -14,6 +14,7 @@ const SESSION_KEY = 'md_playback_session_v1';
 const POSITION_KEY = 'md_playback_position_v1';
 const QUEUE_PERSIST_CAP = 200;
 const HISTORY_PERSIST_CAP = 50;
+const CHROMECAST_QUEUE_WINDOW = 30;
 
 function shuffleArray(arr) {
   const copy = [...arr];
@@ -158,45 +159,79 @@ function App() {
   // Skips the WiiM auto-cast effect's very first run, which otherwise fires
   // immediately on mount whenever a session with an active device is restored.
   const skipInitialCastRef = useRef(true);
-  // True only when we restored a session that had an active WiiM device -
+  // True only when we restored a session that had an active cast device -
   // the first Play press for that session needs to (re-)cast the track
   // rather than just resume, since we skip the auto-cast on restore.
-  const wiimNeedsInitialCastRef = useRef(!!loadSession()?.outputDevice);
+  const destNeedsInitialCastRef = useRef(!!loadSession()?.outputDevice);
 
-  // Output routing: null = play in this browser, otherwise cast to a WiiM device
+  // Output routing: null = play in this browser, otherwise cast to a WiiM or
+  // Chromecast device. Both device lists are tagged with `type` on fetch so
+  // a single outputDevice object always carries which API prefix to use.
   const [wiimDevices, setWiimDevices] = useState([]);
+  const [chromecastDevices, setChromecastDevices] = useState([]);
+  const outputDevices = [...wiimDevices, ...chromecastDevices];
   const [outputDevice, setOutputDevice] = useState(() => loadSession()?.outputDevice || null);
-  const [wiimStatus, setWiimStatus] = useState(null);
-  const wiimStatusRef = useRef(null);
+  const [destStatus, setDestStatus] = useState(null);
+  const destStatusRef = useRef(null);
   const prevOutputDeviceRef = useRef(null);
-  const wiimAdvancingRef = useRef(false);
-  const wiimHasStartedRef = useRef(false);
+  const destAdvancingRef = useRef(false);
+  const destHasStartedRef = useRef(false);
+  // True once a Chromecast device has a real multi-item queue loaded (so its
+  // own next/prev, including the TV remote's skip buttons, has something to
+  // navigate between) - reset whenever the output device changes.
+  const chromecastQueueLoadedRef = useRef(false);
+  // Set right before handleNext/handlePrev call queue-next/queue-prev, so the
+  // generic cast effect knows this nowPlaying change was already handled
+  // device-side and shouldn't re-push/reload the queue.
+  const skipNextCastPushRef = useRef(false);
+  // Last content_id we saw from Chromecast's own status, to detect when the
+  // TV's remote (not our UI) moved to a different queue item.
+  const lastContentIdRef = useRef(null);
 
   const API_BASE_URL = process.env.REACT_APP_API_URL || '/api';
+  const deviceEndpoint = (device) => `${API_BASE_URL}/${device.type}/devices/${device.id}`;
 
   useEffect(() => {
     resumeScanIfRunning();
     axios.get(`${API_BASE_URL}/wiim/devices`)
-      .then((r) => setWiimDevices(r.data))
+      .then((r) => setWiimDevices(r.data.map((d) => ({ ...d, type: 'wiim' }))))
       .catch((err) => console.error('Error fetching WiiM devices:', err));
+    axios.get(`${API_BASE_URL}/chromecast/devices`)
+      .then((r) => setChromecastDevices(r.data.map((d) => ({ ...d, type: 'chromecast' }))))
+      .catch((err) => console.error('Error fetching Chromecast devices:', err));
     return () => {
       if (pollRef.current) clearInterval(pollRef.current);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Cast the current track to the selected WiiM device whenever it changes.
-  // The very first run is skipped: when a session with an active device is
+  // Cast the current track to the selected device whenever it changes. The
+  // very first run is skipped: when a session with an active device is
   // restored on load, outputDevice/nowPlaying are already set on mount, and
   // we don't want to blast audio to the device before the user asks for it.
+  // A second way to skip: handleNext/handlePrev already told an active
+  // Chromecast queue to advance itself via queue-next/queue-prev, so this
+  // effect shouldn't also re-push/reload the whole queue for that change.
   useEffect(() => {
     if (skipInitialCastRef.current) {
       skipInitialCastRef.current = false;
       return;
     }
     if (!outputDevice || !nowPlaying) return;
-    axios.post(`${API_BASE_URL}/wiim/devices/${outputDevice.id}/play`, { track_id: nowPlaying.id })
-      .catch((err) => console.error('Error casting to WiiM:', err));
+    if (skipNextCastPushRef.current) {
+      skipNextCastPushRef.current = false;
+      return;
+    }
+    const payload = { track_id: nowPlaying.id };
+    const isChromecast = outputDevice.type === 'chromecast';
+    if (isChromecast) {
+      payload.queue_track_ids = queue.slice(0, CHROMECAST_QUEUE_WINDOW).map((t) => t.id);
+    }
+    axios.post(`${deviceEndpoint(outputDevice)}/play`, payload)
+      .then(() => {
+        if (isChromecast) chromecastQueueLoadedRef.current = true;
+      })
+      .catch((err) => console.error('Error casting to device:', err));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [outputDevice, nowPlaying]);
 
@@ -204,16 +239,18 @@ function App() {
   useEffect(() => {
     const prev = prevOutputDeviceRef.current;
     if (prev && prev.id !== outputDevice?.id) {
-      axios.post(`${API_BASE_URL}/wiim/devices/${prev.id}/stop`).catch(() => {});
+      axios.post(`${deviceEndpoint(prev)}/stop`).catch(() => {});
     }
     prevOutputDeviceRef.current = outputDevice;
-    setWiimStatus(null);
+    setDestStatus(null);
+    chromecastQueueLoadedRef.current = false;
+    lastContentIdRef.current = null;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [outputDevice]);
 
   useEffect(() => {
-    wiimAdvancingRef.current = false;
-    wiimHasStartedRef.current = false;
+    destAdvancingRef.current = false;
+    destHasStartedRef.current = false;
   }, [nowPlaying]);
 
   // Poll the device's real playback position so the UI reflects reality and we
@@ -230,32 +267,82 @@ function App() {
   //    us having asked for that, the track ended.
   useEffect(() => {
     if (!outputDevice || !nowPlaying) return;
+    const isChromecast = outputDevice.type === 'chromecast';
+
+    // Chromecast has a real device-side queue now, so track changes (whether
+    // from the TV remote's own skip buttons or the device auto-advancing at
+    // end-of-track) are detected by diffing content_id instead of the
+    // near-end/stopped heuristics WiiM needs - that avoids double-advancing
+    // when the device has *already* moved to the next queue item itself.
+    const reconcileFromContentId = (contentId) => {
+      if (!contentId || contentId === lastContentIdRef.current) return;
+      lastContentIdRef.current = contentId;
+      const match = contentId.match(/\/tracks\/(\d+)\/stream/);
+      if (!match) return;
+      const newTrackId = Number(match[1]);
+      if (nowPlaying && newTrackId === nowPlaying.id) return;
+
+      const forwardIndex = queue.findIndex((t) => t.id === newTrackId);
+      if (forwardIndex !== -1) {
+        skipNextCastPushRef.current = true;
+        setHistory((h) => [...h, ...(nowPlaying ? [nowPlaying] : []), ...queue.slice(0, forwardIndex)]);
+        setNowPlaying(queue[forwardIndex]);
+        setIsPlaying(true);
+        setQueue((q) => q.slice(forwardIndex + 1));
+        return;
+      }
+
+      const reverseIndex = [...history].reverse().findIndex((t) => t.id === newTrackId);
+      if (reverseIndex !== -1) {
+        const historyIndex = history.length - 1 - reverseIndex;
+        skipNextCastPushRef.current = true;
+        setQueue((q) => [...history.slice(historyIndex + 1), ...(nowPlaying ? [nowPlaying] : []), ...q]);
+        setNowPlaying(history[historyIndex]);
+        setIsPlaying(true);
+        setHistory((h) => h.slice(0, historyIndex));
+        return;
+      }
+
+      // Skipped beyond our tracked window - just resync what's displayed;
+      // the upcoming-queue list may be briefly stale until the next action.
+      skipNextCastPushRef.current = true;
+      axios.get(`${API_BASE_URL}/tracks/${newTrackId}`)
+        .then((r) => { setNowPlaying(r.data); setIsPlaying(true); })
+        .catch((err) => console.error('Error fetching track for Chromecast resync:', err));
+    };
+
     const interval = setInterval(async () => {
       try {
-        const response = await axios.get(`${API_BASE_URL}/wiim/devices/${outputDevice.id}/status`);
-        wiimStatusRef.current = response.data;
-        setWiimStatus(response.data);
-        const { reachable, status: playState, duration_ms: duration, position_ms: position } = response.data;
-        if (!reachable || wiimAdvancingRef.current) return;
+        const response = await axios.get(`${deviceEndpoint(outputDevice)}/status`);
+        destStatusRef.current = response.data;
+        setDestStatus(response.data);
+        const { reachable, status: playState, duration_ms: duration, position_ms: position, content_id: contentId } = response.data;
+        if (!reachable) return;
 
+        if (isChromecast) {
+          reconcileFromContentId(contentId);
+          return;
+        }
+
+        if (destAdvancingRef.current) return;
         if (playState === 'play') {
-          wiimHasStartedRef.current = true;
+          destHasStartedRef.current = true;
         }
 
         const nearEnd = playState === 'play' && duration > 0 && duration - position < 4000;
-        const stoppedOnItsOwn = playState === 'stop' && wiimHasStartedRef.current;
+        const stoppedOnItsOwn = playState === 'stop' && destHasStartedRef.current;
 
         if (nearEnd || stoppedOnItsOwn) {
-          wiimAdvancingRef.current = true;
+          destAdvancingRef.current = true;
           handleNext();
         }
       } catch (err) {
-        console.error('Error polling WiiM status:', err);
+        console.error('Error polling device status:', err);
       }
     }, 2000);
     return () => clearInterval(interval);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [outputDevice, nowPlaying]);
+  }, [outputDevice, nowPlaying, queue, history]);
 
   useEffect(() => {
     try {
@@ -284,7 +371,7 @@ function App() {
     if (!nowPlaying) return;
     const saveNow = () => {
       const positionMs = outputDevice
-        ? (wiimStatusRef.current?.position_ms ?? null)
+        ? (destStatusRef.current?.position_ms ?? null)
         : (audioRef.current ? audioRef.current.currentTime * 1000 : null);
       if (positionMs == null) return;
       savePosition({ trackId: nowPlaying.id, positionMs });
@@ -539,15 +626,23 @@ function App() {
       // A restored session skips the auto-cast on mount, so the device never
       // actually got the track loaded - the first press here needs to cast
       // (load + play) rather than just resume a stream that was never sent.
-      if (wiimNeedsInitialCastRef.current && nowPlaying) {
-        wiimNeedsInitialCastRef.current = false;
-        axios.post(`${API_BASE_URL}/wiim/devices/${outputDevice.id}/play`, { track_id: nowPlaying.id })
-          .catch((err) => console.error('Error casting to WiiM:', err));
+      if (destNeedsInitialCastRef.current && nowPlaying) {
+        destNeedsInitialCastRef.current = false;
+        const payload = { track_id: nowPlaying.id };
+        const isChromecast = outputDevice.type === 'chromecast';
+        if (isChromecast) {
+          payload.queue_track_ids = queue.slice(0, CHROMECAST_QUEUE_WINDOW).map((t) => t.id);
+        }
+        axios.post(`${deviceEndpoint(outputDevice)}/play`, payload)
+          .then(() => {
+            if (isChromecast) chromecastQueueLoadedRef.current = true;
+          })
+          .catch((err) => console.error('Error casting to device:', err));
         return;
       }
-      const action = wiimStatus?.status === 'play' ? 'pause' : 'resume';
-      axios.post(`${API_BASE_URL}/wiim/devices/${outputDevice.id}/${action}`).catch((err) => {
-        console.error('Error toggling WiiM playback:', err);
+      const action = destStatus?.status === 'play' ? 'pause' : 'resume';
+      axios.post(`${deviceEndpoint(outputDevice)}/${action}`).catch((err) => {
+        console.error('Error toggling playback:', err);
       });
       return;
     }
@@ -561,8 +656,8 @@ function App() {
 
   const handleSeek = (positionMs) => {
     if (outputDevice) {
-      axios.post(`${API_BASE_URL}/wiim/devices/${outputDevice.id}/seek`, { position_ms: Math.round(positionMs) })
-        .catch((err) => console.error('Error seeking WiiM playback:', err));
+      axios.post(`${deviceEndpoint(outputDevice)}/seek`, { position_ms: Math.round(positionMs) })
+        .catch((err) => console.error('Error seeking playback:', err));
       return;
     }
     if (audioRef.current) {
@@ -630,6 +725,14 @@ function App() {
         setIsPlaying(false);
         return prevQueue;
       }
+      // An active Chromecast queue already has this next item loaded - tell
+      // the device to move to it natively instead of the generic cast effect
+      // re-pushing/reloading the whole queue for this change.
+      if (outputDevice?.type === 'chromecast' && chromecastQueueLoadedRef.current) {
+        skipNextCastPushRef.current = true;
+        axios.post(`${deviceEndpoint(outputDevice)}/queue-next`)
+          .catch((err) => console.error('Error advancing Chromecast queue:', err));
+      }
       setHistory((h) => (nowPlaying ? [...h, nowPlaying] : h));
       setNowPlaying(prevQueue[0]);
       setIsPlaying(true);
@@ -640,6 +743,11 @@ function App() {
   const handlePrev = () => {
     setHistory((prevHistory) => {
       if (prevHistory.length === 0) return prevHistory;
+      if (outputDevice?.type === 'chromecast' && chromecastQueueLoadedRef.current) {
+        skipNextCastPushRef.current = true;
+        axios.post(`${deviceEndpoint(outputDevice)}/queue-prev`)
+          .catch((err) => console.error('Error reversing Chromecast queue:', err));
+      }
       const last = prevHistory[prevHistory.length - 1];
       setQueue((q) => (nowPlaying ? [nowPlaying, ...q] : q));
       setNowPlaying(last);
@@ -710,7 +818,7 @@ function App() {
 
   const viewLabel = (mode) => (mode === 'all' ? 'All Tracks' : `By ${mode.charAt(0).toUpperCase()}${mode.slice(1)}`);
   const backLabel = drill && BACK_LABELS[drill.by];
-  const effectiveIsPlaying = outputDevice ? wiimStatus?.status === 'play' : isPlaying;
+  const effectiveIsPlaying = outputDevice ? destStatus?.status === 'play' : isPlaying;
 
   return (
     <div className="app">
@@ -1043,6 +1151,7 @@ function App() {
           scanResult={scanResult}
           scanError={scanError}
           onScan={handleScan}
+          outputDevices={outputDevices}
         />
       )}
 
@@ -1059,10 +1168,10 @@ function App() {
         setIsPlaying={setIsPlaying}
         audioRef={audioRef}
         apiBase={API_BASE_URL}
-        wiimDevices={wiimDevices}
+        outputDevices={outputDevices}
         outputDevice={outputDevice}
         setOutputDevice={setOutputDevice}
-        wiimStatus={wiimStatus}
+        destStatus={destStatus}
         shuffleEnabled={shuffleEnabled}
         onToggleShuffle={toggleShuffle}
         onSeek={handleSeek}
@@ -1094,7 +1203,7 @@ function channelLabel(channels) {
   return `${channels}ch`;
 }
 
-function SettingsPanel({ onClose, rootPath, setRootPath, scanning, scanResult, scanError, onScan }) {
+function SettingsPanel({ onClose, rootPath, setRootPath, scanning, scanResult, scanError, onScan, outputDevices }) {
   return (
     <div className="settings-overlay" onClick={onClose}>
       <div className="settings-modal" onClick={(e) => e.stopPropagation()}>
@@ -1128,6 +1237,27 @@ function SettingsPanel({ onClose, rootPath, setRootPath, scanning, scanResult, s
             </p>
           )}
         </form>
+
+        <div className="settings-section">
+          <label>Playback devices</label>
+          {outputDevices.length === 0 ? (
+            <p className="hint">No WiiM or Chromecast devices configured.</p>
+          ) : (
+            <div className="device-list">
+              {outputDevices.map((d) => (
+                <div className="device-row" key={`${d.type}-${d.id}`}>
+                  <span className="device-row-icon">{d.type === 'chromecast' ? '📺' : '📡'}</span>
+                  <span className="device-row-name">{d.name}</span>
+                  <span className="device-row-ip">{d.ip}</span>
+                  <span className="device-row-type">{d.type === 'chromecast' ? 'Chromecast' : 'WiiM'}</span>
+                </div>
+              ))}
+            </div>
+          )}
+          <p className="hint">
+            Edit WIIM_DEVICES / CHROMECAST_DEVICES in .env and rebuild to add, remove, or rename devices.
+          </p>
+        </div>
       </div>
     </div>
   );
@@ -1135,7 +1265,7 @@ function SettingsPanel({ onClose, rootPath, setRootPath, scanning, scanResult, s
 
 function PlayerBar({
   track, queue, isPlaying, hasNext, hasPrev, onNext, onPrev, onTogglePlay, setIsPlaying, audioRef, apiBase,
-  wiimDevices, outputDevice, setOutputDevice, wiimStatus,
+  outputDevices, outputDevice, setOutputDevice, destStatus,
   shuffleEnabled, onToggleShuffle, onSeek, onJumpToQueueItem,
   userHasInteracted, initialSeekMs, onInitialSeekApplied,
 }) {
@@ -1172,8 +1302,8 @@ function PlayerBar({
     formatFileSize(track.file_size_bytes),
   ].filter(Boolean);
 
-  const positionMs = outputDevice ? (wiimStatus?.position_ms || 0) : localProgress.currentTime * 1000;
-  const durationMs = outputDevice ? (wiimStatus?.duration_ms || 0) : localProgress.duration * 1000;
+  const positionMs = outputDevice ? (destStatus?.position_ms || 0) : localProgress.currentTime * 1000;
+  const durationMs = outputDevice ? (destStatus?.duration_ms || 0) : localProgress.duration * 1000;
   const progressRatio = durationMs > 0 ? Math.min(1, positionMs / durationMs) : 0;
 
   const handleProgressClick = (e) => {
@@ -1184,6 +1314,7 @@ function PlayerBar({
   };
 
   const destinationLabel = outputDevice ? outputDevice.name : 'This Browser';
+  const deviceIcon = (d) => (d.type === 'chromecast' ? '📺' : '📡');
 
   return (
     <div className="player-root">
@@ -1322,7 +1453,7 @@ function PlayerBar({
                     aria-label="Playback destination"
                     title={`Playing on ${destinationLabel}`}
                   >
-                    {outputDevice ? '📡' : '🔊'}
+                    {outputDevice ? deviceIcon(outputDevice) : '🔊'}
                   </button>
                   {destMenuOpen && (
                     <div className="np-destination-menu">
@@ -1332,13 +1463,13 @@ function PlayerBar({
                       >
                         🔊 This Browser
                       </button>
-                      {wiimDevices.map((d) => (
+                      {outputDevices.map((d) => (
                         <button
                           key={d.id}
                           className={outputDevice?.id === d.id ? 'active' : ''}
                           onClick={() => { setOutputDevice(d); setDestMenuOpen(false); }}
                         >
-                          📡 {d.name}
+                          {deviceIcon(d)} {d.name}
                         </button>
                       ))}
                     </div>
@@ -1397,7 +1528,7 @@ function PlayerBar({
               aria-label="Playback destination"
               title={`Playing on ${destinationLabel}`}
             >
-              {outputDevice ? '📡' : '🔊'}
+              {outputDevice ? deviceIcon(outputDevice) : '🔊'}
             </button>
             {destMenuOpen && (
               <div className="np-destination-menu">
@@ -1407,13 +1538,13 @@ function PlayerBar({
                 >
                   🔊 This Browser
                 </button>
-                {wiimDevices.map((d) => (
+                {outputDevices.map((d) => (
                   <button
                     key={d.id}
                     className={outputDevice?.id === d.id ? 'active' : ''}
                     onClick={() => { setOutputDevice(d); setDestMenuOpen(false); }}
                   >
-                    📡 {d.name}
+                    {deviceIcon(d)} {d.name}
                   </button>
                 ))}
               </div>
