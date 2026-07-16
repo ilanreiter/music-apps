@@ -339,6 +339,7 @@ async def get_known_tracks(
     favorite: Optional[bool] = None,
     length: Optional[str] = None,
     spotify_matched: Optional[bool] = None,
+    external_artwork_found: Optional[bool] = None,
     shuffle: bool = False,
     limit: int = Query(100, ge=1, le=20000),
     offset: int = Query(0, ge=0),
@@ -382,6 +383,12 @@ async def get_known_tracks(
         if spotify_matched is not None:
             where_clauses.append("(spotify_track_id IS NOT NULL) = %(spotify_matched)s")
             params['spotify_matched'] = spotify_matched
+        if external_artwork_found is not None:
+            # external_artwork_checked is only ever set on rows the external-artwork
+            # job actually processed (has_artwork was FALSE going in), so this
+            # correctly excludes tracks whose art was always found locally.
+            where_clauses.append("(external_artwork_checked IS TRUE AND has_artwork IS TRUE) = %(external_artwork_found)s")
+            params['external_artwork_found'] = external_artwork_found
 
         where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
 

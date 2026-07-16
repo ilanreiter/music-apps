@@ -1691,6 +1691,8 @@ function CleanupTab({ apiBase, activeTab, nowPlaying, isPlaying, onTrackPlayClic
   const artworkPollRef = useRef(null);
 
   const [externalArtworkStatus, setExternalArtworkStatus] = useState(null);
+  const [externalArtworkFoundTracks, setExternalArtworkFoundTracks] = useState([]);
+  const [externalArtworkFoundTotal, setExternalArtworkFoundTotal] = useState(0);
   const externalArtworkPollRef = useRef(null);
 
   const [spotifyEnrichStatus, setSpotifyEnrichStatus] = useState(null);
@@ -1761,6 +1763,16 @@ function CleanupTab({ apiBase, activeTab, nowPlaying, isPlaying, onTrackPlayClic
     }
   };
 
+  const fetchExternalArtworkFound = async (offset) => {
+    try {
+      const response = await axios.get(`${apiBase}/tracks/known`, { params: { external_artwork_found: true, limit: 100, offset } });
+      setExternalArtworkFoundTotal(response.data.total);
+      setExternalArtworkFoundTracks((prev) => (offset === 0 ? response.data.tracks : [...prev, ...response.data.tracks]));
+    } catch (err) {
+      console.error('Error fetching externally-found artwork tracks:', err);
+    }
+  };
+
   const pollExternalArtwork = () => {
     if (externalArtworkPollRef.current) clearInterval(externalArtworkPollRef.current);
     externalArtworkPollRef.current = setInterval(async () => {
@@ -1768,11 +1780,13 @@ function CleanupTab({ apiBase, activeTab, nowPlaying, isPlaying, onTrackPlayClic
         const response = await axios.get(`${apiBase}/library/external-artwork/status`);
         setExternalArtworkStatus(response.data);
         // Keeps polling through 'waiting' (MusicBrainz/iTunes rate limits) -
-        // only a real end state stops it. Re-fetching the missing-artwork
-        // list while work is happening shows it visibly shrinking as
-        // external matches come in, not just once the whole run finishes.
+        // only a real end state stops it. Re-fetching both lists while work
+        // is happening shows missing-artwork visibly shrinking and the
+        // found-via-external list visibly growing, not just once the whole
+        // run finishes.
         if (response.data.status === 'running' || response.data.status === 'done') {
           fetchMissingArtwork(0);
+          fetchExternalArtworkFound(0);
         }
         if (response.data.status === 'done' || response.data.status === 'error') {
           clearInterval(externalArtworkPollRef.current);
@@ -1863,6 +1877,7 @@ function CleanupTab({ apiBase, activeTab, nowPlaying, isPlaying, onTrackPlayClic
       axios.get(`${apiBase}/library/external-artwork/status`).then((response) => {
         setExternalArtworkStatus(response.data);
         if (response.data.status === 'running' || response.data.status === 'waiting') pollExternalArtwork();
+        fetchExternalArtworkFound(0);
       }).catch((err) => console.error('Error checking external artwork status:', err));
     }
     if (subTab === 'spotify-enrich' && spotifyEnrichStatus === null) {
@@ -2033,6 +2048,43 @@ function CleanupTab({ apiBase, activeTab, nowPlaying, isPlaying, onTrackPlayClic
                     ? `Done — ${(externalArtworkStatus.found || 0).toLocaleString()} found, ${(externalArtworkStatus.still_missing || 0).toLocaleString()} still missing`
                     : externalArtworkStatus.status === 'error' ? `Error: ${externalArtworkStatus.error}` : ''}
             </p>
+          )}
+          {externalArtworkFoundTracks.length > 0 && (
+            <>
+              <div className="library-header">
+                <h2>Found via External Sources</h2>
+                <span className="library-count">{externalArtworkFoundTotal.toLocaleString()} tracks</span>
+              </div>
+              <div className="tracks-grid">
+                {externalArtworkFoundTracks.map((track) => {
+                  const isCurrent = nowPlaying && nowPlaying.id === track.id;
+                  return (
+                    <div key={track.id} className={`track-card${isCurrent ? ' playing' : ''}`}>
+                      <button
+                        className="play-btn"
+                        onClick={() => onTrackPlayClick(track, externalArtworkFoundTracks)}
+                        aria-label={isCurrent && isPlaying ? 'Pause' : 'Play'}
+                      >
+                        {isCurrent && isPlaying ? '❚❚' : '▶'}
+                      </button>
+                      <div className="track-thumb-wrap">
+                        <span className="track-thumb-fallback">{track.track_name.charAt(0).toUpperCase()}</span>
+                        <img className="track-thumb" src={`${apiBase}/tracks/${track.id}/artwork`} alt="" loading="lazy" onError={(e) => { e.target.style.display = 'none'; }} />
+                      </div>
+                      <div className="track-info">
+                        <h3>{track.track_name}</h3>
+                        <p className="artist">{track.artist_name}</p>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+              {externalArtworkFoundTracks.length < externalArtworkFoundTotal && (
+                <button className="load-more-btn" onClick={() => fetchExternalArtworkFound(externalArtworkFoundTracks.length)}>
+                  Load more ({externalArtworkFoundTracks.length.toLocaleString()} of {externalArtworkFoundTotal.toLocaleString()})
+                </button>
+              )}
+            </>
           )}
           {missingArtworkTracks.length > 0 && (
             <>
