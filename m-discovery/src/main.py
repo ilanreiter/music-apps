@@ -8,7 +8,7 @@ from .database import get_db_connection, create_tables
 from .library_scanner import run_scan
 from .artwork import get_or_create_thumbnail, check_artwork_presence, cache_key_for, normalize_album_name, normalized_album_sql
 from .artist_info import get_artist_info, get_artist_photo_path
-from .library_cleanup import find_duplicates, find_missing_tracks
+from .library_cleanup import find_duplicates, find_missing_tracks, COMPILATION_MIN_ARTISTS, COMPILATION_MIN_TRACKS
 from . import wiim
 from . import chromecast
 import google.generativeai as genai
@@ -167,6 +167,11 @@ class LibraryStats(BaseModel):
 class TrackListResponse(BaseModel):
     total: int
     tracks: List[Track]
+
+class TrackAlbumPosition(BaseModel):
+    track_number: Optional[int] = None
+    track_total: Optional[int] = None
+    library_track_count: Optional[int] = None
 
 class GroupEntry(BaseModel):
     key: str
@@ -489,6 +494,58 @@ async def get_track(track_id: int, db: psycopg2.extensions.connection = Depends(
     file_path = track.pop('file_path', None)
     track['file_format'] = os.path.splitext(file_path)[1].lstrip('.').upper() if file_path else None
     return track
+
+@app.get("/api/tracks/{track_id}/album-position", response_model=TrackAlbumPosition)
+async def get_track_album_position(track_id: int, db: psycopg2.extensions.connection = Depends(get_db)):
+    """How this track's own track_number/track_total tags relate to how many of
+    that album's tracks are actually present in the library - e.g. "Track #3,
+    of 12 (10 in Lib)" in the Now Playing panel. Grouping is compilation-aware
+    (same heuristic as find_missing_tracks/"by album" browsing): a "Various
+    Artists" style album is matched by album name alone, since every track
+    there has a different artist tag."""
+    try:
+        cur = db.cursor(cursor_factory=RealDictCursor)
+        cur.execute(
+            "SELECT artist_name, album_name, track_number, track_total FROM known_tracks WHERE id = %s",
+            (track_id,),
+        )
+        track = cur.fetchone()
+        if not track:
+            cur.close()
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Track not found")
+
+        if not track['album_name']:
+            cur.close()
+            return {'track_number': track['track_number'], 'track_total': track['track_total'], 'library_track_count': None}
+
+        cur.execute(
+            "SELECT COUNT(DISTINCT artist_name) AS artists, COUNT(*) AS cnt FROM known_tracks WHERE album_name = %(album)s",
+            {'album': track['album_name']},
+        )
+        meta = cur.fetchone()
+        is_compilation = meta['artists'] > COMPILATION_MIN_ARTISTS and meta['cnt'] >= COMPILATION_MIN_TRACKS
+
+        if is_compilation:
+            cur.execute(
+                "SELECT COUNT(DISTINCT track_number) AS cnt FROM known_tracks WHERE album_name = %(album)s AND track_number IS NOT NULL",
+                {'album': track['album_name']},
+            )
+        else:
+            cur.execute(
+                "SELECT COUNT(DISTINCT track_number) AS cnt FROM known_tracks WHERE album_name = %(album)s AND artist_name = %(artist)s AND track_number IS NOT NULL",
+                {'album': track['album_name'], 'artist': track['artist_name']},
+            )
+        library_track_count = cur.fetchone()['cnt']
+        cur.close()
+        return {
+            'track_number': track['track_number'],
+            'track_total': track['track_total'],
+            'library_track_count': library_track_count,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
 
 @app.get("/api/tracks/{track_id}/stream")
 async def stream_track(track_id: int, db: psycopg2.extensions.connection = Depends(get_db)):

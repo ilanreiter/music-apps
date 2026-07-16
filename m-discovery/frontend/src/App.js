@@ -1284,7 +1284,9 @@ function PlayerBar({
   const [bioExpanded, setBioExpanded] = useState(false);
   const [destMenuOpen, setDestMenuOpen] = useState(false);
   const [localProgress, setLocalProgress] = useState({ currentTime: 0, duration: 0 });
+  const [albumPosition, setAlbumPosition] = useState(null);
   const lastArtistRef = useRef(null);
+  const lastAlbumPositionTrackIdRef = useRef(null);
 
   useEffect(() => {
     if (!expanded || !track) return;
@@ -1295,6 +1297,16 @@ function PlayerBar({
     axios.get(`${apiBase}/artist-info`, { params: { name: track.artist_name } })
       .then((r) => setArtistInfo(r.data))
       .catch(() => setArtistInfo({ found: false }));
+  }, [expanded, track, apiBase]);
+
+  useEffect(() => {
+    if (!expanded || !track) return;
+    if (lastAlbumPositionTrackIdRef.current === track.id) return;
+    lastAlbumPositionTrackIdRef.current = track.id;
+    setAlbumPosition(null);
+    axios.get(`${apiBase}/tracks/${track.id}/album-position`)
+      .then((r) => setAlbumPosition(r.data))
+      .catch(() => setAlbumPosition(null));
   }, [expanded, track, apiBase]);
 
   useEffect(() => {
@@ -1311,6 +1323,13 @@ function PlayerBar({
     channelLabel(track.channels),
     formatFileSize(track.file_size_bytes),
   ].filter(Boolean);
+
+  let albumPositionLabel = null;
+  if (albumPosition && albumPosition.track_number != null) {
+    albumPositionLabel = `Track #${albumPosition.track_number}`;
+    if (albumPosition.track_total != null) albumPositionLabel += `, of ${albumPosition.track_total}`;
+    if (albumPosition.library_track_count != null) albumPositionLabel += ` (${albumPosition.library_track_count} in Lib)`;
+  }
 
   const positionMs = outputDevice ? (destStatus?.position_ms || 0) : localProgress.currentTime * 1000;
   const durationMs = outputDevice ? (destStatus?.duration_ms || 0) : localProgress.duration * 1000;
@@ -1365,6 +1384,7 @@ function PlayerBar({
                   {track.album_name && <p className="now-playing-album">{track.album_name}</p>}
                   {metaParts.length > 0 && <p className="now-playing-meta">{metaParts.join(' · ')}</p>}
                   {techParts.length > 0 && <p className="now-playing-tech">{techParts.join(' · ')}</p>}
+                  {albumPositionLabel && <p className="now-playing-tech">{albumPositionLabel}</p>}
                 </section>
               </div>
 
