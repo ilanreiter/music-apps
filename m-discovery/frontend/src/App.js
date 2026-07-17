@@ -163,6 +163,13 @@ function App() {
   // id of a local track currently being searched for on Spotify (drives a
   // loading indicator on its play button) - null when nothing's in flight.
   const [matchingTrackId, setMatchingTrackId] = useState(null);
+  // Session-long history for the Library/Playlists track grid: every id
+  // that's been nowPlaying at some point (any destination) gets a green
+  // checkmark, every local track a Spotify batch-match couldn't find gets a
+  // red X. Both just accumulate for the life of the page load - not
+  // persisted, not reset between queues.
+  const [playedTrackIds, setPlayedTrackIds] = useState(() => new Set());
+  const [skippedTrackIds, setSkippedTrackIds] = useState(() => new Set());
   const [searchInput, setSearchInput] = useState('');
   const [search, setSearch] = useState('');
   const [filterGenre, setFilterGenre] = useState('');
@@ -570,6 +577,17 @@ function App() {
     return () => clearTimeout(t);
   }, [spotifyPlayHint]);
 
+  // Marks a track as "played this session" the moment it becomes nowPlaying,
+  // for any destination. A local track matched to Spotify (see
+  // mapMatchedLocalTrack) carries local_id alongside its Spotify uri id, so
+  // the checkmark lands on the *local* track shown in the Library tab, not
+  // an id nothing in that view will ever match.
+  useEffect(() => {
+    if (!nowPlaying) return;
+    const playedId = nowPlaying.local_id ?? nowPlaying.id;
+    setPlayedTrackIds((prev) => (prev.has(playedId) ? prev : new Set(prev).add(playedId)));
+  }, [nowPlaying]);
+
   useEffect(() => {
     if (activeTab !== 'library') return;
     // Spotify playlists aren't in known_tracks - can't reuse the SQL-backed
@@ -886,6 +904,10 @@ function App() {
   function mapMatchedLocalTrack(localTrack, matchResult) {
     return {
       id: matchResult.uri, source: 'spotify', uri: matchResult.uri, context_uri: null,
+      // The Library tab renders the *local* track (local_id), not this
+      // Spotify-uri-keyed id - carried along so played/skipped tracking can
+      // mark the right card once this becomes nowPlaying.
+      local_id: localTrack.id,
       track_name: localTrack.track_name, artist_name: localTrack.artist_name,
       album_name: localTrack.album_name, duration_seconds: localTrack.duration_seconds,
       artwork_url: matchResult.artwork_url || localTrack.artwork_url,
@@ -926,16 +948,20 @@ function App() {
       if (spotifyMatchRequestIdRef.current !== requestId) return; // superseded by a newer click
       const byId = new Map(candidates.map((t) => [t.id, t]));
       const matchedTracks = [];
-      let skipped = 0;
+      const newlySkipped = [];
       response.data.forEach((result) => {
         const local = byId.get(result.track_id);
         if (!local) return;
         if (result.matched) {
           matchedTracks.push(mapMatchedLocalTrack(local, result));
         } else {
-          skipped += 1;
+          newlySkipped.push(result.track_id);
         }
       });
+      if (newlySkipped.length > 0) {
+        setSkippedTrackIds((prev) => new Set([...prev, ...newlySkipped]));
+      }
+      const skipped = newlySkipped.length;
       if (matchedTracks.length === 0) {
         setSpotifyPlayHint(noMatchHint || 'No Spotify match found for these tracks.');
         return;
@@ -1060,10 +1086,21 @@ function App() {
   // Shared between list and grid display styles - grid mode overlays the play
   // button on the artwork instead of showing it as a separate row element.
   const renderTrackCard = (track, list) => {
-    const isCurrent = nowPlaying && nowPlaying.id === track.id;
+    // nowPlaying.id is a Spotify uri for a locally-matched track (see
+    // mapMatchedLocalTrack), not the local id this card is keyed by - bridge
+    // via local_id so "currently playing" still highlights the right card.
+    const nowPlayingId = nowPlaying && (nowPlaying.local_id ?? nowPlaying.id);
+    const isCurrent = nowPlayingId === track.id;
     const isCardPlaying = isCurrent && effectiveIsPlaying;
     const isMatching = matchingTrackId === track.id;
+    const hasPlayed = !isCurrent && playedTrackIds.has(track.id);
+    const wasSkipped = !isCurrent && !hasPlayed && skippedTrackIds.has(track.id);
     const playIcon = isMatching ? '⏳' : isCardPlaying ? '❚❚' : '▶';
+    const statusBadge = hasPlayed ? (
+      <span className="track-status-badge played" title="Already played this session">✓</span>
+    ) : wasSkipped ? (
+      <span className="track-status-badge skipped" title="No Spotify match found - skipped">✕</span>
+    ) : null;
     const thumb = (
       <div className="track-thumb-wrap">
         <span className="track-thumb-fallback">{track.track_name.charAt(0).toUpperCase()}</span>
@@ -1074,6 +1111,7 @@ function App() {
           loading="lazy"
           onError={(e) => { e.target.style.display = 'none'; }}
         />
+        {statusBadge}
         {trackViewStyle === 'grid' && (
           <button
             className="play-btn overlay"

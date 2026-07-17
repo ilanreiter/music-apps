@@ -978,11 +978,39 @@ main.with-player {
 
 .track-card.playing {
   border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent-soft);
 }
 
 .track-card.playing .play-btn {
   background: var(--accent);
   color: white;
+}
+
+.track-status-badge {
+  /* .track-thumb-wrap clips overflow, so this sits just inside the corner
+     rather than straddling the edge. */
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.65rem;
+  font-weight: 700;
+  color: white;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.5);
+  z-index: 1;
+}
+
+.track-status-badge.played {
+  background: #22c55e;
+}
+
+.track-status-badge.skipped {
+  background: #ef4444;
 }
 
 .tracks-grid.grid-view {
