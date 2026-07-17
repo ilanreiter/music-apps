@@ -55,6 +55,20 @@ const SPOTIFY_PLAY_QUEUE_LIMIT = 100;
 // *something* playable in a given pool - protects against burning requests
 // unboundedly into a long dry streak in an unlucky shuffle order.
 const SPOTIFY_MATCH_CONSECUTIVE_CAP = 20;
+// How long to wait before retrying the lookahead-refill search after it hits
+// a rate limit - without a retry, one rate-limited attempt permanently
+// stalls Next/Prev for the rest of that playback session (queue never
+// refills), even once the rate limit clears seconds later.
+const SPOTIFY_LOOKAHEAD_RETRY_DELAY_MS = 20000;
+// The device-status poll (below) runs continuously while a destination is
+// selected - at the default 2s interval that's ~1,800 Spotify API calls/hour
+// for a single open session, a real contributor to hitting Spotify's
+// account-wide rate limit on the player endpoints (confirmed live: a burst
+// of testing triggered a ~2 hour lockout on /me/player*). WiiM/Chromecast
+// polling stays fast since those are free local-network calls, not a quota
+// concern - only Spotify's poll interval is widened.
+const SPOTIFY_STATUS_POLL_INTERVAL_MS = 5000;
+const DEFAULT_STATUS_POLL_INTERVAL_MS = 2000;
 
 function shuffleArray(arr) {
   const copy = [...arr];
@@ -180,6 +194,10 @@ function App() {
   // /api/tracks/known.
   const [filterQuality, setFilterQuality] = useState('best');
   const [filterFormat, setFilterFormat] = useState('');
+  // Restricts to tracks that already have a cached Spotify match, so Shuffle
+  // All/Play All can be tested without any live search - isolates playback
+  // bugs from the currently-active Spotify search rate limit.
+  const [filterSpotifyAvailable, setFilterSpotifyAvailable] = useState(false);
   const [genreOptions, setGenreOptions] = useState([]);
   const [decadeOptions, setDecadeOptions] = useState([]);
   const [qualityOptions, setQualityOptions] = useState([]);
@@ -553,7 +571,7 @@ function App() {
       } catch (err) {
         console.error('Error polling device status:', err);
       }
-    }, 2000);
+    }, isSpotify ? SPOTIFY_STATUS_POLL_INTERVAL_MS : DEFAULT_STATUS_POLL_INTERVAL_MS);
     return () => { cancelled = true; clearInterval(interval); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [outputDevice, nowPlaying, queue, history]);
@@ -628,6 +646,11 @@ function App() {
     setPlayedTrackIds((prev) => (prev.has(playedId) ? prev : new Set(prev).add(playedId)));
   }, [nowPlaying]);
 
+  // Bumped after a rate-limited lookahead attempt, purely to retrigger the
+  // refill effect below on a delay (see SPOTIFY_LOOKAHEAD_RETRY_DELAY_MS) -
+  // its value is never read for anything else.
+  const [lookaheadRetryTick, setLookaheadRetryTick] = useState(0);
+
   // Keeps exactly one Spotify match "ahead" in the queue for an ad-hoc
   // (non-playlist, non-context_uri) Spotify sequence - local-track click,
   // Shuffle All, etc. Refills whenever the queue empties: once right after
@@ -643,21 +666,28 @@ function App() {
     if (pool.cursor >= pool.candidates.length) return; // nothing left to try
     const requestId = spotifyMatchRequestIdRef.current;
     let cancelled = false;
+    let retryTimer = null;
     (async () => {
       const { found, rateLimited } = await findNextSpotifyMatch(requestId);
       if (cancelled || spotifyMatchRequestIdRef.current !== requestId) return;
       setMatchingTrackId(null);
       if (!found) {
-        if (rateLimited) setSpotifyPlayHint("Spotify's search is temporarily rate-limited - try again later.");
+        if (rateLimited) {
+          setSpotifyPlayHint("Spotify's search is temporarily rate-limited - try again later.");
+          // Otherwise this permanently stalls Next/Prev for the rest of the
+          // playback session once rate-limited - queue.length stays 0 with
+          // nothing left to retrigger this effect on its own.
+          retryTimer = setTimeout(() => setLookaheadRetryTick((t) => t + 1), SPOTIFY_LOOKAHEAD_RETRY_DELAY_MS);
+        }
         return;
       }
       axios.post(`${deviceEndpoint(outputDevice)}/queue`, { uri: found.uri })
         .catch((err) => console.error('Error queuing next Spotify track:', err));
       setQueue((q) => [...q, found]);
     })();
-    return () => { cancelled = true; };
+    return () => { cancelled = true; if (retryTimer) clearTimeout(retryTimer); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [outputDevice, nowPlaying, queue.length]);
+  }, [outputDevice, nowPlaying, queue.length, lookaheadRetryTick]);
 
   useEffect(() => {
     if (activeTab !== 'library') return;
@@ -677,7 +707,7 @@ function App() {
       fetchGroups();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeTab, libraryMode, drill, search, filterGenre, filterDecade, filterQuality, filterFormat]);
+  }, [activeTab, libraryMode, drill, search, filterGenre, filterDecade, filterQuality, filterFormat, filterSpotifyAvailable]);
 
   useEffect(() => {
     if (activeTab !== 'library') return;
@@ -714,18 +744,20 @@ function App() {
     if (filterDecade) params.decade = Number(filterDecade);
     if (filterQuality) params.quality = filterQuality;
     if (filterFormat) params.format = filterFormat;
+    if (filterSpotifyAvailable) params.spotify_available = true;
     return params;
   };
 
   // 'best' is the default quality filter (dedup to the best copy of each
   // track), not a user-applied filter, so it doesn't count as "active".
-  const hasActiveFilters = !!(filterGenre || filterDecade || (filterQuality && filterQuality !== 'best') || filterFormat);
+  const hasActiveFilters = !!(filterGenre || filterDecade || (filterQuality && filterQuality !== 'best') || filterFormat || filterSpotifyAvailable);
 
   const clearFilters = () => {
     setFilterGenre('');
     setFilterDecade('');
     setFilterQuality('best');
     setFilterFormat('');
+    setFilterSpotifyAvailable(false);
   };
 
   const buildTrackFilterParams = () => {
@@ -940,6 +972,11 @@ function App() {
     setUserHasInteracted(true);
     setInitialSeekMs(null);
     preShuffleQueueRef.current = null;
+    // This nowPlaying/queue just replaced whatever was there before (possibly
+    // a stale restored session) - the cast-on-change effect below will send
+    // it fresh, so togglePlay's separate "cast the restored session" fallback
+    // is no longer applicable.
+    destNeedsInitialCastRef.current = false;
   };
 
   // For a Spotify playlist we can't read the track listing of (not owned by
@@ -1039,6 +1076,16 @@ function App() {
   // everything up front.
   const matchAndPlayLocalTracksOnSpotify = async (tracks, { noMatchHint } = {}) => {
     if (tracks.length === 0) return;
+    // A user-initiated attempt to play something new - even one that ends up
+    // finding no match (e.g. rate-limited) - means the stale nowPlaying/queue
+    // restored from localStorage on load is no longer what should get cast on
+    // the next Play press. Without this, a rate-limited Shuffle All silently
+    // fails, then pressing Play falls into togglePlay's initial-cast fallback
+    // and casts whatever unrelated track was left over from a prior session -
+    // confirmed live (a rate-limited Shuffle All left nowPlaying untouched,
+    // and the next Play press sent a leftover "Say Hello 2 Heaven" queue that
+    // had nothing to do with the shuffled list on screen).
+    destNeedsInitialCastRef.current = false;
     const requestId = ++spotifyMatchRequestIdRef.current;
     spotifyLookaheadRef.current = { candidates: tracks, cursor: 0 };
     try {
@@ -1253,7 +1300,17 @@ function App() {
       }
       if (outputDevice?.type === 'spotify') {
         skipNextCastPushRef.current = true;
-        axios.post(`${deviceEndpoint(outputDevice)}/next`)
+        // Play the known next track explicitly rather than calling Spotify's
+        // native /next - that just steps its own server-side queue, which
+        // only ever has the single lookahead track appended by a *separate*,
+        // independently-timed request (see the lookahead-refill effect
+        // above). If Next is pressed before that append has landed (or
+        // twice quickly), Spotify's queue is momentarily empty and it falls
+        // back to its own autoplay/radio pick instead - confirmed live via
+        // request timestamps, a /next call landing ~2s before the
+        // corresponding /queue append for that slot. Sending the exact URI
+        // we already have locally sidesteps that race entirely.
+        axios.post(`${deviceEndpoint(outputDevice)}/play-uris`, { uris: [prevQueue[0].uri] })
           .catch((err) => console.error('Error advancing Spotify playback:', err));
       }
       setHistory((h) => (nowPlaying ? [...h, nowPlaying] : h));
@@ -1271,12 +1328,16 @@ function App() {
         axios.post(`${deviceEndpoint(outputDevice)}/queue-prev`)
           .catch((err) => console.error('Error reversing Chromecast queue:', err));
       }
+      const last = prevHistory[prevHistory.length - 1];
       if (outputDevice?.type === 'spotify') {
         skipNextCastPushRef.current = true;
-        axios.post(`${deviceEndpoint(outputDevice)}/previous`)
+        // Same reasoning as handleNext above: play the known previous track
+        // directly instead of relying on Spotify's native /previous, which
+        // steps through server-side history we don't control the timing or
+        // exact contents of.
+        axios.post(`${deviceEndpoint(outputDevice)}/play-uris`, { uris: [last.uri] })
           .catch((err) => console.error('Error reversing Spotify playback:', err));
       }
-      const last = prevHistory[prevHistory.length - 1];
       setQueue((q) => (nowPlaying ? [nowPlaying, ...q] : q));
       setNowPlaying(last);
       setIsPlaying(true);
@@ -1595,6 +1656,14 @@ function App() {
                   <option value="">All Formats</option>
                   {formatOptions.map((f) => <option key={f.key} value={f.key}>{f.label} ({f.count})</option>)}
                 </select>
+                <label className="filter-checkbox-label" title="Only tracks with an already-cached Spotify match - no live search needed to play them">
+                  <input
+                    type="checkbox"
+                    checked={filterSpotifyAvailable}
+                    onChange={(e) => setFilterSpotifyAvailable(e.target.checked)}
+                  />
+                  Available on Spotify
+                </label>
                 {hasActiveFilters && (
                   <button className="clear-filters-btn" onClick={clearFilters}>Clear Filters</button>
                 )}
@@ -2288,6 +2357,15 @@ function CleanupTab({ apiBase, activeTab, nowPlaying, isPlaying, onTrackPlayClic
   const [externalArtworkFoundTotal, setExternalArtworkFoundTotal] = useState(0);
   const externalArtworkPollRef = useRef(null);
 
+  const [tagCleanupStatus, setTagCleanupStatus] = useState(null);
+  const [tagCleanupFixedTracks, setTagCleanupFixedTracks] = useState([]);
+  const [tagCleanupFixedTotal, setTagCleanupFixedTotal] = useState(0);
+  const tagCleanupPollRef = useRef(null);
+
+  const [spotifyPrewarmStatus, setSpotifyPrewarmStatus] = useState(null);
+  const [spotifyPrewarmStats, setSpotifyPrewarmStats] = useState(null);
+  const spotifyPrewarmPollRef = useRef(null);
+
   const fetchDuplicates = async () => {
     setDuplicatesLoading(true);
     try {
@@ -2399,6 +2477,64 @@ function CleanupTab({ apiBase, activeTab, nowPlaying, isPlaying, onTrackPlayClic
     }
   };
 
+  const fetchTagCleanupFixed = async (offset) => {
+    try {
+      const response = await axios.get(`${apiBase}/library/tag-cleanup/fixed`, { params: { limit: 100, offset } });
+      setTagCleanupFixedTotal(response.data.total);
+      setTagCleanupFixedTracks((prev) => (offset === 0 ? response.data.tracks : [...prev, ...response.data.tracks]));
+    } catch (err) {
+      console.error('Error fetching fixed tags:', err);
+    }
+  };
+
+  const pollTagCleanup = () => {
+    if (tagCleanupPollRef.current) clearInterval(tagCleanupPollRef.current);
+    tagCleanupPollRef.current = setInterval(async () => {
+      try {
+        const response = await axios.get(`${apiBase}/library/tag-cleanup/status`);
+        setTagCleanupStatus(response.data);
+        if (response.data.status === 'done' || response.data.status === 'error') {
+          clearInterval(tagCleanupPollRef.current);
+          tagCleanupPollRef.current = null;
+          if (response.data.status === 'done') fetchTagCleanupFixed(0);
+        }
+      } catch (err) {
+        clearInterval(tagCleanupPollRef.current);
+        tagCleanupPollRef.current = null;
+        console.error('Error polling tag cleanup status:', err);
+      }
+    }, 1500);
+  };
+
+  const startTagCleanup = async () => {
+    try {
+      const response = await axios.post(`${apiBase}/library/tag-cleanup`);
+      setTagCleanupStatus(response.data);
+      pollTagCleanup();
+    } catch (err) {
+      setTagCleanupStatus({ status: 'error', error: err.response?.data?.detail || 'Failed to start' });
+      console.error('Error starting tag cleanup:', err);
+    }
+  };
+
+  const fetchSpotifyPrewarmInfo = async () => {
+    try {
+      const [statusResponse, statsResponse] = await Promise.all([
+        axios.get(`${apiBase}/spotify/prewarm/status`),
+        axios.get(`${apiBase}/spotify/prewarm/stats`),
+      ]);
+      setSpotifyPrewarmStatus(statusResponse.data);
+      setSpotifyPrewarmStats(statsResponse.data);
+    } catch (err) {
+      console.error('Error fetching Spotify pre-warm info:', err);
+    }
+  };
+
+  const pollSpotifyPrewarm = () => {
+    if (spotifyPrewarmPollRef.current) clearInterval(spotifyPrewarmPollRef.current);
+    spotifyPrewarmPollRef.current = setInterval(fetchSpotifyPrewarmInfo, 5000);
+  };
+
   useEffect(() => {
     if (activeTab !== 'cleanup') return;
     if (subTab === 'duplicates' && duplicateGroups === null) fetchDuplicates();
@@ -2422,12 +2558,32 @@ function CleanupTab({ apiBase, activeTab, nowPlaying, isPlaying, onTrackPlayClic
         fetchExternalArtworkFound(0);
       }).catch((err) => console.error('Error checking external artwork status:', err));
     }
+    if (subTab === 'bad-tags' && tagCleanupStatus === null) {
+      axios.get(`${apiBase}/library/tag-cleanup/status`).then((response) => {
+        setTagCleanupStatus(response.data);
+        if (response.data.status === 'running') pollTagCleanup();
+        fetchTagCleanupFixed(0);
+      }).catch((err) => console.error('Error checking tag cleanup status:', err));
+    }
+    if (subTab === 'spotify-matching') {
+      fetchSpotifyPrewarmInfo();
+      pollSpotifyPrewarm();
+    } else if (spotifyPrewarmPollRef.current) {
+      // Only worth polling while this subtab is actually visible - unlike
+      // the other jobs here, the pre-warm job runs continuously in the
+      // background regardless, so there's no "done" state to stop polling
+      // for on its own.
+      clearInterval(spotifyPrewarmPollRef.current);
+      spotifyPrewarmPollRef.current = null;
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeTab, subTab]);
 
   useEffect(() => () => {
     if (artworkPollRef.current) clearInterval(artworkPollRef.current);
     if (externalArtworkPollRef.current) clearInterval(externalArtworkPollRef.current);
+    if (tagCleanupPollRef.current) clearInterval(tagCleanupPollRef.current);
+    if (spotifyPrewarmPollRef.current) clearInterval(spotifyPrewarmPollRef.current);
   }, []);
 
   const bestTrack = (tracks) => tracks.reduce((best, t) => ((t.bitrate || 0) > (best.bitrate || 0) ? t : best), tracks[0]);
@@ -2438,6 +2594,8 @@ function CleanupTab({ apiBase, activeTab, nowPlaying, isPlaying, onTrackPlayClic
         <button className={subTab === 'duplicates' ? 'active' : ''} onClick={() => setSubTab('duplicates')}>Duplicates</button>
         <button className={subTab === 'missing-tracks' ? 'active' : ''} onClick={() => setSubTab('missing-tracks')}>Missing Tracks</button>
         <button className={subTab === 'missing-artwork' ? 'active' : ''} onClick={() => setSubTab('missing-artwork')}>Missing Artwork</button>
+        <button className={subTab === 'bad-tags' ? 'active' : ''} onClick={() => setSubTab('bad-tags')}>Bad Tags</button>
+        <button className={subTab === 'spotify-matching' ? 'active' : ''} onClick={() => setSubTab('spotify-matching')}>Spotify Matching</button>
       </div>
 
       {subTab === 'duplicates' && (
@@ -2659,6 +2817,113 @@ function CleanupTab({ apiBase, activeTab, nowPlaying, isPlaying, onTrackPlayClic
                 </button>
               )}
             </>
+          )}
+        </div>
+      )}
+
+      {subTab === 'bad-tags' && (
+        <div className="cleanup-panel">
+          <p className="hint">
+            Fixes tracks whose title/artist tags got mangled by whatever ripped or tagged them - a
+            bogus artist (a track number, a truncated "Various..." compilation tag) with the real
+            artist and title jammed together in the title field instead, and leftover leading track
+            numbers ("17 - Song Title"). Only ever touches a row when it's confident, and keeps the
+            original values so this is fully reversible. Tracks it actually changes also get a fresh
+            shot at Spotify matching, since a bogus artist tag guaranteed a search miss before.
+          </p>
+          <button
+            className="scan-btn"
+            onClick={startTagCleanup}
+            disabled={tagCleanupStatus?.status === 'running'}
+          >
+            {tagCleanupStatus?.status === 'running' ? 'Fixing…' : 'Fix Tags'}
+          </button>
+          {tagCleanupStatus && tagCleanupStatus.status !== 'idle' && (
+            <p className="scan-summary">
+              {tagCleanupStatus.status === 'running'
+                ? `Checking… ${(tagCleanupStatus.processed || 0).toLocaleString()} of ${(tagCleanupStatus.total || 0).toLocaleString()}`
+                : tagCleanupStatus.status === 'done'
+                  ? `Done — ${(tagCleanupStatus.fixed || 0).toLocaleString()} fixed, ${(tagCleanupStatus.unrecoverable || 0).toLocaleString()} left as-is (no recoverable artist/title)`
+                  : tagCleanupStatus.status === 'error' ? `Error: ${tagCleanupStatus.error}` : ''}
+            </p>
+          )}
+          {tagCleanupFixedTracks.length > 0 && (
+            <>
+              <div className="library-header">
+                <h2>Fixed Tags</h2>
+                <span className="library-count">{tagCleanupFixedTotal.toLocaleString()} tracks</span>
+              </div>
+              {tagCleanupFixedTracks.map((track) => (
+                <div key={track.id} className="dup-track">
+                  <div className="track-thumb-wrap">
+                    <span className="track-thumb-fallback">{track.track_name.charAt(0).toUpperCase()}</span>
+                    <img
+                      className="track-thumb"
+                      src={`${apiBase}/tracks/${track.id}/artwork`}
+                      alt=""
+                      loading="lazy"
+                      onError={(e) => { e.target.style.display = 'none'; }}
+                    />
+                  </div>
+                  <div className="dup-track-info">
+                    <span className="dup-track-title">
+                      {track.original_track_name && track.original_track_name !== track.track_name && (
+                        <span className="tag-cleanup-before">{track.original_track_name}</span>
+                      )}
+                      {track.track_name}
+                    </span>
+                    <span className="dup-track-artist">
+                      {track.original_artist_name && track.original_artist_name !== track.artist_name && (
+                        <span className="tag-cleanup-before">{track.original_artist_name}</span>
+                      )}
+                      {track.artist_name}
+                    </span>
+                  </div>
+                </div>
+              ))}
+              {tagCleanupFixedTracks.length < tagCleanupFixedTotal && (
+                <button className="load-more-btn" onClick={() => fetchTagCleanupFixed(tagCleanupFixedTracks.length)}>
+                  Load more ({tagCleanupFixedTracks.length.toLocaleString()} of {tagCleanupFixedTotal.toLocaleString()})
+                </button>
+              )}
+            </>
+          )}
+        </div>
+      )}
+
+      {subTab === 'spotify-matching' && (
+        <div className="cleanup-panel">
+          <p className="hint">
+            A background job slowly searches the library against Spotify's catalog while the app is
+            idle (about one track every 5 minutes, so it never bursts into Spotify's search rate
+            limit) - this just shows how far it's gotten. No button here since it just runs on its
+            own; see the "Available on Spotify" filter in the Library tab to browse what's matched
+            so far.
+          </p>
+          {spotifyPrewarmStats && (
+            <p className="scan-summary">
+              {(spotifyPrewarmStats.matched || 0).toLocaleString()} matched &middot;{' '}
+              {(spotifyPrewarmStats.checked || 0).toLocaleString()} of {(spotifyPrewarmStats.total || 0).toLocaleString()} checked
+              {spotifyPrewarmStats.total > 0
+                ? ` (${Math.round((spotifyPrewarmStats.checked / spotifyPrewarmStats.total) * 100)}%)`
+                : ''}
+            </p>
+          )}
+          {spotifyPrewarmStatus && (
+            <p className="hint">
+              Status:{' '}
+              {spotifyPrewarmStatus.status === 'running'
+                ? 'running'
+                : spotifyPrewarmStatus.status === 'waiting_active_use'
+                  ? 'paused while the app is in use'
+                  : spotifyPrewarmStatus.status === 'waiting_not_connected'
+                    ? 'paused (Spotify not connected)'
+                    : spotifyPrewarmStatus.status === 'done'
+                      ? 'done — whole library checked'
+                      : spotifyPrewarmStatus.status === 'error'
+                        ? `error: ${spotifyPrewarmStatus.error}`
+                        : spotifyPrewarmStatus.status}
+            </p>
           )}
         </div>
       )}

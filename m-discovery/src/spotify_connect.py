@@ -220,6 +220,26 @@ def pause(device_id):
 
 
 def resume(device_id):
+    """A bare PUT /me/player/play with no body restarts the current track
+    from 0 instead of continuing - confirmed live on this account's Spotify
+    Connect devices: a lone position_ms with no accompanying uris/context_uri
+    is silently ignored. Re-fetches the paused track's uri/position and
+    replays it explicitly with position_ms, which does resume in place.
+
+    Also runs the device through _transfer_to_device first, same as
+    play()/play_uris() - a device that's been paused for a while (or has
+    quietly dropped its connection, which these budget Connect devices are
+    already known to do) isn't reliably woken by /play alone; confirmed live
+    that skipping this left the account with no active device at all after
+    a resume, requiring a fresh play_uris call to recover."""
+    current = get_status(device_id)
+    if current and current.get('track_uri') and current.get('position_ms') is not None:
+        _transfer_to_device(device_id)
+        result = _api_request('PUT', '/me/player/play', params={'device_id': device_id}, json_body={
+            'uris': [current['track_uri']],
+            'position_ms': current['position_ms'],
+        })
+        return result is not None
     result = _api_request('PUT', '/me/player/play', params={'device_id': device_id})
     return result is not None
 

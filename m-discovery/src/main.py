@@ -6,7 +6,7 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 from .database import get_db_connection, create_tables
 from .library_scanner import run_scan
-from .artwork import get_or_create_thumbnail, check_artwork_presence, cache_key_for, normalize_album_name, normalized_album_sql
+from .artwork import get_or_create_thumbnail, check_artwork_presence, cache_key_for, normalize_album_name, normalized_album_sql, save_thumbnail
 from .artist_info import get_artist_info, get_artist_photo_path
 from .library_cleanup import (
     find_duplicates, find_missing_tracks,
@@ -18,6 +18,7 @@ from . import chromecast
 from . import spotify_connect
 from . import external_artwork
 from . import spotify_prewarm
+from . import tag_cleanup
 import google.generativeai as genai
 import logging
 import os
@@ -112,6 +113,9 @@ external_artwork_progress = {"status": "idle"}
 spotify_prewarm_lock = threading.Lock()
 spotify_prewarm_progress = {"status": "idle"}
 
+tag_cleanup_lock = threading.Lock()
+tag_cleanup_progress = {"status": "idle"}
+
 # Timestamp of the last non-polling request, used by the Spotify pre-warm
 # background job to tell "actively using the app" apart from "idle" so it
 # only spends search requests when nothing else needs them.
@@ -201,6 +205,14 @@ class SpotifyPrewarmStatus(BaseModel):
     status: str  # idle | running | waiting_active_use | waiting_not_connected | done | error
     processed: Optional[int] = None
     matched: Optional[int] = None
+    error: Optional[str] = None
+
+class TagCleanupStatus(BaseModel):
+    status: str  # idle | running | done | error
+    processed: Optional[int] = None
+    total: Optional[int] = None
+    fixed: Optional[int] = None
+    unrecoverable: Optional[int] = None
     error: Optional[str] = None
 
 class CountEntry(BaseModel):
@@ -411,6 +423,7 @@ async def get_known_tracks(
     favorite: Optional[bool] = None,
     length: Optional[str] = None,
     external_artwork_found: Optional[bool] = None,
+    spotify_available: Optional[bool] = None,
     shuffle: bool = False,
     limit: int = Query(100, ge=1, le=20000),
     offset: int = Query(0, ge=0),
@@ -457,6 +470,13 @@ async def get_known_tracks(
             # correctly excludes tracks whose art was always found locally.
             where_clauses.append("(external_artwork_checked IS TRUE AND has_artwork IS TRUE) = %(external_artwork_found)s")
             params['external_artwork_found'] = external_artwork_found
+        if spotify_available is not None:
+            # Already has a cached Spotify match (spotify_track_id set) - lets
+            # Shuffle All be tested against a sub-list that never needs a live
+            # search, so playback behavior can be verified independently of
+            # whether Spotify's search is currently rate-limited.
+            where_clauses.append("(spotify_track_id IS NOT NULL) = %(spotify_available)s")
+            params['spotify_available'] = spotify_available
 
         where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
 
@@ -730,19 +750,19 @@ async def stream_track(track_id: int, db: psycopg2.extensions.connection = Depen
 async def get_track_artwork(track_id: int, db: psycopg2.extensions.connection = Depends(get_db)):
     try:
         cur = db.cursor()
-        cur.execute("SELECT file_path, artist_name, album_name FROM known_tracks WHERE id = %s", (track_id,))
+        cur.execute("SELECT file_path, artist_name, album_name, spotify_album_art_url FROM known_tracks WHERE id = %s", (track_id,))
         row = cur.fetchone()
-        if not row or not row[0]:
+        if not row or (not row[0] and not row[3]):
             cur.close()
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No artwork available")
-        file_path, artist_name, album_name = row
+        file_path, artist_name, album_name, spotify_album_art_url = row
 
         # Tracks sharing an artist+album share one cache entry and fall back
         # to a sibling's embedded art if this file itself has none, so an
         # album shows one consistent thumbnail instead of it varying per file.
         # Albums are matched loosely (normalized_album_sql), not by exact
         # string, so e.g. "Album Songtrack" and "Album [Songtrack]" share art.
-        candidate_paths = [file_path]
+        candidate_paths = [file_path] if file_path else []
         if album_name:
             # has_artwork is already known (from the background check-artwork
             # scan) for most tracks, so order by it: a sibling already
@@ -771,6 +791,16 @@ async def get_track_artwork(track_id: int, db: psycopg2.extensions.connection = 
 
     cache_key = cache_key_for(track_id, artist_name, album_name)
     cache_path = get_or_create_thumbnail(cache_key, candidate_paths)
+    if not cache_path and spotify_album_art_url:
+        # No embedded/local art anywhere in the album - a track that's
+        # already matched to Spotify has a real cover art URL sitting right
+        # there in known_tracks, so try that before giving up. Downloaded and
+        # cached the same way the external-artwork job does (same cache_key,
+        # same save_thumbnail), so this is a one-time cost per album, not a
+        # remote fetch on every request.
+        raw = external_artwork.download_bytes(spotify_album_art_url)
+        if raw:
+            cache_path = save_thumbnail(cache_key, raw)
     if not cache_path:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No artwork available")
 
@@ -1180,6 +1210,22 @@ def _start_spotify_prewarm_background():
 async def get_spotify_prewarm_status():
     return spotify_prewarm_progress
 
+@app.get("/api/spotify/prewarm/stats")
+async def get_spotify_prewarm_stats(db: psycopg2.extensions.connection = Depends(get_db)):
+    # spotify_prewarm_progress only tracks *this run's* processed/matched
+    # counts (reset each time the job (re)starts) - these are cumulative
+    # totals across the whole library, for a meaningful "X of Y checked"
+    # readout regardless of how many times the background job has restarted.
+    cur = db.cursor()
+    cur.execute("SELECT COUNT(*) FROM known_tracks")
+    total = cur.fetchone()[0]
+    cur.execute("SELECT COUNT(*) FROM known_tracks WHERE spotify_checked IS TRUE")
+    checked = cur.fetchone()[0]
+    cur.execute("SELECT COUNT(*) FROM known_tracks WHERE spotify_track_id IS NOT NULL")
+    matched = cur.fetchone()[0]
+    cur.close()
+    return {"total": total, "checked": checked, "matched": matched}
+
 @app.post("/api/library/scan", response_model=ScanStatus, status_code=status.HTTP_202_ACCEPTED)
 async def scan_library(params: LibraryScanRequest):
     if not scan_lock.acquire(blocking=False):
@@ -1309,6 +1355,65 @@ async def start_artwork_check():
 @app.get("/api/library/check-artwork/status", response_model=ArtworkCheckStatus)
 async def get_artwork_check_status():
     return artwork_check_progress
+
+def _start_tag_cleanup_background():
+    """Kicks off a background tag-cleanup pass if one isn't already running.
+    Returns False (no-op, no error) if one is already in flight - same
+    pattern as the other library background jobs above."""
+    if not tag_cleanup_lock.acquire(blocking=False):
+        return False
+    try:
+        tag_cleanup_progress.clear()
+        tag_cleanup_progress.update(status="running")
+
+        def _run():
+            try:
+                tag_cleanup.clean_tags(get_db_connection, tag_cleanup_progress)
+            finally:
+                tag_cleanup_lock.release()
+
+        threading.Thread(target=_run, daemon=True).start()
+        return True
+    except Exception:
+        tag_cleanup_lock.release()
+        raise
+
+@app.post("/api/library/tag-cleanup", response_model=TagCleanupStatus, status_code=status.HTTP_202_ACCEPTED)
+async def start_tag_cleanup():
+    if not _start_tag_cleanup_background():
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="A tag cleanup is already running.")
+    return tag_cleanup_progress
+
+@app.get("/api/library/tag-cleanup/status", response_model=TagCleanupStatus)
+async def get_tag_cleanup_status():
+    return tag_cleanup_progress
+
+@app.get("/api/library/tag-cleanup/fixed")
+async def get_tag_cleanup_fixed(
+    limit: int = Query(100, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+    db: psycopg2.extensions.connection = Depends(get_db),
+):
+    # original_track_name/original_artist_name are only ever set on a row
+    # this job actually changed (see tag_cleanup.clean_tags) - either one
+    # being non-null is enough to identify a "fixed" row, since a change can
+    # touch just the title (leading track-number strip) or just the artist.
+    cur = db.cursor(cursor_factory=RealDictCursor)
+    cur.execute("""
+        SELECT COUNT(*) AS count FROM known_tracks
+        WHERE original_track_name IS NOT NULL OR original_artist_name IS NOT NULL
+    """)
+    total = cur.fetchone()['count']
+    cur.execute("""
+        SELECT id, original_track_name, original_artist_name, track_name, artist_name
+        FROM known_tracks
+        WHERE original_track_name IS NOT NULL OR original_artist_name IS NOT NULL
+        ORDER BY id
+        LIMIT %(limit)s OFFSET %(offset)s
+    """, {'limit': limit, 'offset': offset})
+    tracks = cur.fetchall()
+    cur.close()
+    return {"total": total, "tracks": tracks}
 
 def _start_external_artwork_background():
     """Kicks off a background external-artwork backfill if one isn't already

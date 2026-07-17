@@ -679,6 +679,21 @@ main.with-player {
   font-size: 0.85rem;
 }
 
+.filter-checkbox-label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+  padding: 9px 12px;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text-main);
+  font-size: 0.85rem;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
 .clear-filters-btn {
   flex-shrink: 0;
   padding: 9px 14px;
@@ -1867,6 +1882,13 @@ main.with-player {
   flex-direction: column;
   gap: 2px;
   min-width: 0;
+}
+
+.tag-cleanup-before {
+  text-decoration: line-through;
+  color: var(--text-muted);
+  opacity: 0.7;
+  margin-right: 6px;
 }
 
 .dup-track-title {
