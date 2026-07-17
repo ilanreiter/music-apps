@@ -85,11 +85,98 @@ def create_tables():
                 );
             """)
             print("Table 'discovery_history' checked/created successfully.")
-            
+
+            # Spotify Connect OAuth tokens - single row (id=1), this is a
+            # personal single-user tool so there's no per-user table.
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS spotify_auth (
+                    id INTEGER PRIMARY KEY DEFAULT 1,
+                    access_token TEXT,
+                    refresh_token TEXT,
+                    expires_at BIGINT,
+                    scope TEXT,
+                    updated_at TIMESTAMP DEFAULT NOW()
+                );
+            """)
+            print("Table 'spotify_auth' checked/created successfully.")
+
             conn.commit()
             cur.close()
     except Error as e:
         print(f"Error creating tables: {e}")
+    finally:
+        if conn:
+            conn.close()
+
+
+def save_spotify_tokens(access_token, refresh_token, expires_at, scope):
+    """Upserts the single spotify_auth row. refresh_token is only sent by
+    Spotify on the very first authorization, not on subsequent refreshes -
+    callers pass None in that case and the existing refresh_token is kept."""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        if refresh_token:
+            cur.execute("""
+                INSERT INTO spotify_auth (id, access_token, refresh_token, expires_at, scope, updated_at)
+                VALUES (1, %s, %s, %s, %s, NOW())
+                ON CONFLICT (id) DO UPDATE SET
+                    access_token = EXCLUDED.access_token,
+                    refresh_token = EXCLUDED.refresh_token,
+                    expires_at = EXCLUDED.expires_at,
+                    scope = EXCLUDED.scope,
+                    updated_at = NOW()
+            """, (access_token, refresh_token, expires_at, scope))
+        else:
+            cur.execute("""
+                INSERT INTO spotify_auth (id, access_token, expires_at, scope, updated_at)
+                VALUES (1, %s, %s, %s, NOW())
+                ON CONFLICT (id) DO UPDATE SET
+                    access_token = EXCLUDED.access_token,
+                    expires_at = EXCLUDED.expires_at,
+                    scope = EXCLUDED.scope,
+                    updated_at = NOW()
+            """, (access_token, expires_at, scope))
+        conn.commit()
+        cur.close()
+    except Error as e:
+        print(f"Error saving Spotify tokens: {e}")
+    finally:
+        if conn:
+            conn.close()
+
+
+def get_spotify_tokens():
+    """Returns {'access_token', 'refresh_token', 'expires_at', 'scope'} or None."""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT access_token, refresh_token, expires_at, scope FROM spotify_auth WHERE id = 1")
+        row = cur.fetchone()
+        cur.close()
+        if not row or not row[1]:
+            return None
+        return {'access_token': row[0], 'refresh_token': row[1], 'expires_at': row[2], 'scope': row[3]}
+    except Error as e:
+        print(f"Error reading Spotify tokens: {e}")
+        return None
+    finally:
+        if conn:
+            conn.close()
+
+
+def clear_spotify_tokens():
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("DELETE FROM spotify_auth WHERE id = 1")
+        conn.commit()
+        cur.close()
+    except Error as e:
+        print(f"Error clearing Spotify tokens: {e}")
     finally:
         if conn:
             conn.close()

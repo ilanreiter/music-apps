@@ -1,5 +1,5 @@
 from fastapi import FastAPI, Depends, HTTPException, Query, status
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, RedirectResponse
 from pydantic import BaseModel
 from typing import List, Optional
 import psycopg2
@@ -15,12 +15,14 @@ from .library_cleanup import (
 )
 from . import wiim
 from . import chromecast
+from . import spotify_connect
 from . import external_artwork
 import google.generativeai as genai
 import logging
 import os
 import json
 import re
+from concurrent.futures import ThreadPoolExecutor
 import threading
 
 # Without this, module-level loggers (e.g. chromecast.py's) have no handler
@@ -257,6 +259,65 @@ class ChromecastStatus(BaseModel):
     duration_ms: Optional[int] = None
     volume: Optional[int] = None
     content_id: Optional[str] = None
+
+class SpotifyDevice(BaseModel):
+    id: str
+    name: str
+
+class SpotifyPlayRequest(BaseModel):
+    context_uri: str
+    track_uri: Optional[str] = None
+
+class SpotifyPlayUrisRequest(BaseModel):
+    uris: List[str]
+
+class SpotifyVolumeRequest(BaseModel):
+    level: int
+
+class SpotifySeekRequest(BaseModel):
+    position_ms: int
+
+class SpotifyStatus(BaseModel):
+    reachable: bool
+    status: Optional[str] = None
+    position_ms: Optional[int] = None
+    duration_ms: Optional[int] = None
+    volume: Optional[int] = None
+    track_uri: Optional[str] = None
+    title: Optional[str] = None
+    artist: Optional[str] = None
+    album: Optional[str] = None
+    artwork_url: Optional[str] = None
+
+class SpotifyPlaylist(BaseModel):
+    id: str
+    name: str
+    track_count: int
+    artwork_url: Optional[str] = None
+    uri: str
+
+class SpotifyTrack(BaseModel):
+    uri: str
+    name: str
+    artists: str
+    album: Optional[str] = None
+    duration_ms: Optional[int] = None
+    artwork_url: Optional[str] = None
+
+class SpotifyMatchResult(BaseModel):
+    matched: bool
+    uri: Optional[str] = None
+    artwork_url: Optional[str] = None
+    reason: Optional[str] = None  # "no_match" | "unavailable", set when matched=False
+
+class SpotifyMatchBatchRequest(BaseModel):
+    track_ids: List[int]
+
+class SpotifyBatchMatchEntry(BaseModel):
+    track_id: int
+    matched: bool
+    uri: Optional[str] = None
+    artwork_url: Optional[str] = None
 
 # Dependency to get a database connection
 def get_db():
@@ -871,6 +932,220 @@ def chromecast_get_status(device_id: str):
     if result is None:
         return {"reachable": False}
     return {"reachable": True, **result}
+
+@app.get("/api/spotify/auth/login")
+def spotify_auth_login():
+    if not spotify_connect.is_configured():
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="SPOTIFY_CLIENT_ID/SPOTIFY_CLIENT_SECRET not set in .env")
+    return RedirectResponse(spotify_connect.get_auth_url())
+
+@app.get("/api/spotify/auth/callback")
+def spotify_auth_callback(code: Optional[str] = None, state: Optional[str] = None, error: Optional[str] = None):
+    if error or not code or not spotify_connect.verify_and_consume_state(state):
+        return RedirectResponse(f"{PUBLIC_BASE_URL}?spotify=error")
+    if not spotify_connect.exchange_code_for_tokens(code):
+        return RedirectResponse(f"{PUBLIC_BASE_URL}?spotify=error")
+    return RedirectResponse(f"{PUBLIC_BASE_URL}?spotify=connected")
+
+@app.get("/api/spotify/auth/status")
+def spotify_auth_status():
+    return {"connected": spotify_connect.is_connected()}
+
+@app.post("/api/spotify/auth/logout")
+def spotify_auth_logout():
+    spotify_connect.disconnect()
+    return {"status": "disconnected"}
+
+def _get_spotify_device_or_404(device_id: str):
+    device = spotify_connect.get_device(device_id)
+    if not device:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Unknown Spotify Connect device")
+    return device
+
+@app.get("/api/spotify/devices", response_model=List[SpotifyDevice])
+def list_spotify_devices():
+    return spotify_connect.list_devices()
+
+@app.post("/api/spotify/devices/{device_id}/play")
+def spotify_play(device_id: str, params: SpotifyPlayRequest):
+    _get_spotify_device_or_404(device_id)
+    if not spotify_connect.play(device_id, params.context_uri, params.track_uri):
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Could not reach Spotify")
+    return {"status": "playing"}
+
+@app.post("/api/spotify/devices/{device_id}/play-uris")
+def spotify_play_uris(device_id: str, params: SpotifyPlayUrisRequest):
+    _get_spotify_device_or_404(device_id)
+    if not spotify_connect.play_uris(device_id, params.uris):
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Could not reach Spotify")
+    return {"status": "playing"}
+
+@app.post("/api/spotify/devices/{device_id}/pause")
+def spotify_pause(device_id: str):
+    _get_spotify_device_or_404(device_id)
+    if not spotify_connect.pause(device_id):
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Could not reach Spotify")
+    return {"status": "paused"}
+
+@app.post("/api/spotify/devices/{device_id}/resume")
+def spotify_resume(device_id: str):
+    _get_spotify_device_or_404(device_id)
+    if not spotify_connect.resume(device_id):
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Could not reach Spotify")
+    return {"status": "playing"}
+
+@app.post("/api/spotify/devices/{device_id}/stop")
+def spotify_stop(device_id: str):
+    _get_spotify_device_or_404(device_id)
+    if not spotify_connect.stop(device_id):
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Could not reach Spotify")
+    return {"status": "stopped"}
+
+@app.post("/api/spotify/devices/{device_id}/seek")
+def spotify_seek(device_id: str, params: SpotifySeekRequest):
+    _get_spotify_device_or_404(device_id)
+    if not spotify_connect.seek(device_id, params.position_ms):
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Could not reach Spotify")
+    return {"status": "ok"}
+
+@app.post("/api/spotify/devices/{device_id}/volume")
+def spotify_set_volume(device_id: str, params: SpotifyVolumeRequest):
+    _get_spotify_device_or_404(device_id)
+    if not spotify_connect.set_volume(device_id, params.level):
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Could not reach Spotify")
+    return {"status": "ok"}
+
+@app.post("/api/spotify/devices/{device_id}/next")
+def spotify_next(device_id: str):
+    _get_spotify_device_or_404(device_id)
+    if not spotify_connect.next_track(device_id):
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Could not reach Spotify")
+    return {"status": "ok"}
+
+@app.post("/api/spotify/devices/{device_id}/previous")
+def spotify_previous(device_id: str):
+    _get_spotify_device_or_404(device_id)
+    if not spotify_connect.previous_track(device_id):
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Could not reach Spotify")
+    return {"status": "ok"}
+
+@app.get("/api/spotify/devices/{device_id}/status", response_model=SpotifyStatus)
+def spotify_get_status(device_id: str):
+    _get_spotify_device_or_404(device_id)
+    result = spotify_connect.get_status(device_id)
+    if result is None:
+        return {"reachable": False}
+    return result
+
+@app.get("/api/spotify/playlists", response_model=List[SpotifyPlaylist])
+def list_spotify_playlists():
+    if not spotify_connect.is_connected():
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Spotify not connected")
+    return spotify_connect.list_playlists()
+
+@app.get("/api/spotify/playlists/{playlist_id}/tracks", response_model=List[SpotifyTrack])
+def get_spotify_playlist_tracks(playlist_id: str):
+    if not spotify_connect.is_connected():
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Spotify not connected")
+    tracks = spotify_connect.get_playlist_tracks(playlist_id)
+    if tracks is None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Spotify doesn't allow reading the track listing of a playlist you don't own - play it directly instead",
+        )
+    return tracks
+
+def _match_track_to_spotify(db, track_id):
+    """Looks up (or performs and caches) a local track's Spotify match. Shared
+    by the single-track and batch match routes. Returns a dict shaped like
+    SpotifyMatchResult, or None if track_id doesn't exist in known_tracks."""
+    cur = db.cursor()
+    cur.execute(
+        "SELECT track_name, artist_name, spotify_track_id, spotify_checked, spotify_album_art_url "
+        "FROM known_tracks WHERE id = %s",
+        (track_id,),
+    )
+    row = cur.fetchone()
+    if not row:
+        cur.close()
+        return None
+    track_name, artist_name, cached_id, checked, cached_art = row
+
+    if checked:
+        cur.close()
+        if not cached_id:
+            return {"matched": False, "reason": "no_match"}
+        return {"matched": True, "uri": f"spotify:track:{cached_id}", "artwork_url": cached_art}
+
+    result, match = spotify_connect.search_track(track_name, artist_name)
+    if result == 'unavailable':
+        cur.close()
+        return {"matched": False, "reason": "unavailable"}
+
+    if match:
+        spotify_id = match['uri'].split(':')[-1]
+        cur.execute(
+            "UPDATE known_tracks SET spotify_track_id = %s, spotify_url = %s, spotify_album_art_url = %s, spotify_checked = TRUE WHERE id = %s",
+            (spotify_id, f"https://open.spotify.com/track/{spotify_id}", match['artwork_url'], track_id),
+        )
+    else:
+        cur.execute("UPDATE known_tracks SET spotify_checked = TRUE WHERE id = %s", (track_id,))
+    db.commit()
+    cur.close()
+
+    if not match:
+        return {"matched": False, "reason": "no_match"}
+    return {"matched": True, "uri": match['uri'], "artwork_url": match['artwork_url']}
+
+@app.post("/api/spotify/tracks/{track_id}/match", response_model=SpotifyMatchResult)
+def match_local_track_to_spotify(track_id: int, db: psycopg2.extensions.connection = Depends(get_db)):
+    if not spotify_connect.is_connected():
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Spotify not connected")
+    result = _match_track_to_spotify(db, track_id)
+    if result is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Track not found")
+    return result
+
+# Caps how many tracks a single "play this list via Spotify" click will
+# match up front - each uncached track is its own /search call, so this
+# bounds one click to a worst-case ~50 requests rather than e.g. an entire
+# unfiltered library.
+SPOTIFY_MATCH_BATCH_LIMIT = 50
+# Uncached matches run concurrently (each is its own independent Spotify API
+# round-trip, ~200-300ms) rather than one at a time - at 50 tracks, sequential
+# took ~13s in testing (clearly visible as "unresponsive" to the user
+# clicking play), a few seconds concurrent. Modest concurrency, not "as many
+# as possible": stays closer to how a human clicking around actually
+# generates traffic, since aggressive parallel bursts are more likely to look
+# abusive to Spotify's rate limiter than the same total requests spread out.
+SPOTIFY_MATCH_BATCH_CONCURRENCY = 5
+
+@app.post("/api/spotify/tracks/match-batch", response_model=List[SpotifyBatchMatchEntry])
+def match_local_tracks_batch(params: SpotifyMatchBatchRequest):
+    if not spotify_connect.is_connected():
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Spotify not connected")
+
+    def _match_one(track_id):
+        # Own DB connection per thread - psycopg2 connections aren't safe to
+        # share across concurrent threads, so the shared request-scoped `db`
+        # dependency can't be reused here.
+        conn = None
+        try:
+            conn = get_db_connection()
+            match = _match_track_to_spotify(conn, track_id)
+        except Exception:
+            match = None
+        finally:
+            if conn:
+                conn.close()
+        if match is None:
+            return None
+        return {"track_id": track_id, "matched": match["matched"], "uri": match.get("uri"), "artwork_url": match.get("artwork_url")}
+
+    track_ids = params.track_ids[:SPOTIFY_MATCH_BATCH_LIMIT]
+    with ThreadPoolExecutor(max_workers=SPOTIFY_MATCH_BATCH_CONCURRENCY) as executor:
+        raw_results = list(executor.map(_match_one, track_ids))
+    return [r for r in raw_results if r is not None]
 
 @app.post("/api/library/scan", response_model=ScanStatus, status_code=status.HTTP_202_ACCEPTED)
 async def scan_library(params: LibraryScanRequest):

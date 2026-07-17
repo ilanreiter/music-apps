@@ -4,17 +4,56 @@ import './App.css';
 
 const LIBRARY_PAGE_SIZE = 100;
 const GROUP_QUEUE_LIMIT = 500;
-const VIEW_MODES = ['all', 'album', 'genre', 'decade', 'quality', 'format', 'favorite', 'length'];
+const VIEW_MODES = ['all', 'album', 'genre', 'decade', 'quality', 'format', 'favorite', 'length', 'playlist'];
 const BACK_LABELS = {
   album: 'Albums', genre: 'Genres', decade: 'Decades',
   quality: 'Quality Tiers', format: 'Formats', favorite: 'Favorites', length: 'Lengths',
+  playlist: 'Playlists',
 };
+
+// Adapts a Spotify API track into the same shape renderTrackCard/queue/now-playing
+// expect from a local known_tracks row. The Spotify URI is used as `.id` -
+// distinct from local numeric ids, so `===` comparisons never collide across
+// the two, and `source`/`uri` carry what the playback dispatch code needs to
+// route to Spotify instead of a local stream. context_uri is always null
+// here (deliberately, not just unset) - these tracks always play via an
+// explicit uris queue, not a context_uri+offset, because Spotify's own
+// context-based advancement doesn't follow a client-side shuffle/reorder of
+// this array: sending context_uri would mean what's displayed as "the queue"
+// and what Spotify actually plays next silently diverge the moment the list
+// is shuffled or reordered from Spotify's own notion of the playlist order
+// (confirmed live - this exact mismatch was the root cause of a "queue
+// doesn't match what's playing" bug). context_uri-based play still exists,
+// just only for playSpotifyContextDirectly's fallback (playlists this app
+// can't read the track list of at all, so there's no list to build uris from).
+function mapSpotifyTrack(t) {
+  return {
+    id: t.uri,
+    source: 'spotify',
+    uri: t.uri,
+    context_uri: null,
+    track_name: t.name,
+    artist_name: t.artists,
+    album_name: t.album,
+    duration_seconds: t.duration_ms != null ? t.duration_ms / 1000 : null,
+    artwork_url: t.artwork_url,
+  };
+}
 
 const SESSION_KEY = 'md_playback_session_v1';
 const POSITION_KEY = 'md_playback_position_v1';
 const QUEUE_PERSIST_CAP = 200;
 const HISTORY_PERSIST_CAP = 50;
 const CHROMECAST_QUEUE_WINDOW = 30;
+// Caps how many track uris get sent to Spotify (and kept in our own queue)
+// for a Spotify playlist's tracks - these already have known uris (no /search
+// needed, unlike matched local tracks), so this is just a sane payload-size
+// cap, not a rate-limit concern.
+const SPOTIFY_PLAY_QUEUE_LIMIT = 100;
+// Matches the backend's own cap (main.py's SPOTIFY_MATCH_BATCH_LIMIT) - each
+// track here costs a real /search call unless already cached, so this is
+// kept separate from and smaller than SPOTIFY_PLAY_QUEUE_LIMIT above.
+const SPOTIFY_MATCH_BATCH_LIMIT = 50;
 
 function shuffleArray(arr) {
   const copy = [...arr];
@@ -114,6 +153,16 @@ function App() {
   // Library browsing: flat search/filter or grouped-by-album/genre/decade/... with drill-down
   const [libraryMode, setLibraryMode] = useState('all');
   const [drill, setDrill] = useState(null); // { by, key, label } once a group is opened
+  // Briefly shown when a track's source (local vs. Spotify) doesn't match
+  // the current output destination - null when hidden, a message when shown.
+  const [spotifyPlayHint, setSpotifyPlayHint] = useState(null);
+  // True when the currently-drilled Spotify playlist's tracks came back 403 -
+  // Spotify blocks reading the track listing of a playlist you don't own,
+  // even public/followed ones, though playing it via context_uri still works.
+  const [playlistTracksRestricted, setPlaylistTracksRestricted] = useState(false);
+  // id of a local track currently being searched for on Spotify (drives a
+  // loading indicator on its play button) - null when nothing's in flight.
+  const [matchingTrackId, setMatchingTrackId] = useState(null);
   const [searchInput, setSearchInput] = useState('');
   const [search, setSearch] = useState('');
   const [filterGenre, setFilterGenre] = useState('');
@@ -178,7 +227,9 @@ function App() {
   // a single outputDevice object always carries which API prefix to use.
   const [wiimDevices, setWiimDevices] = useState([]);
   const [chromecastDevices, setChromecastDevices] = useState([]);
-  const outputDevices = [...wiimDevices, ...chromecastDevices];
+  const [spotifyDevices, setSpotifyDevices] = useState([]);
+  const [spotifyConnected, setSpotifyConnected] = useState(false);
+  const outputDevices = [...wiimDevices, ...chromecastDevices, ...spotifyDevices];
   const [outputDevice, setOutputDevice] = useState(() => loadSession()?.outputDevice || null);
   const [destStatus, setDestStatus] = useState(null);
   const destStatusRef = useRef(null);
@@ -200,6 +251,21 @@ function App() {
   const API_BASE_URL = process.env.REACT_APP_API_URL || '/api';
   const deviceEndpoint = (device) => `${API_BASE_URL}/${device.type}/devices/${device.id}`;
 
+  const refreshSpotifyStatus = () => {
+    axios.get(`${API_BASE_URL}/spotify/auth/status`)
+      .then((r) => {
+        setSpotifyConnected(r.data.connected);
+        if (r.data.connected) {
+          axios.get(`${API_BASE_URL}/spotify/devices`)
+            .then((dr) => setSpotifyDevices(dr.data.map((d) => ({ ...d, type: 'spotify' }))))
+            .catch((err) => console.error('Error fetching Spotify devices:', err));
+        } else {
+          setSpotifyDevices([]);
+        }
+      })
+      .catch((err) => console.error('Error fetching Spotify auth status:', err));
+  };
+
   useEffect(() => {
     resumeScanIfRunning();
     axios.get(`${API_BASE_URL}/wiim/devices`)
@@ -208,6 +274,13 @@ function App() {
     axios.get(`${API_BASE_URL}/chromecast/devices`)
       .then((r) => setChromecastDevices(r.data.map((d) => ({ ...d, type: 'chromecast' }))))
       .catch((err) => console.error('Error fetching Chromecast devices:', err));
+    refreshSpotifyStatus();
+    // Landed back here from the Spotify OAuth redirect (main.py's
+    // /api/spotify/auth/callback) - the ?spotify=... param is just a signal
+    // to re-check status, not something to keep in the URL/history.
+    if (window.location.search.includes('spotify=')) {
+      window.history.replaceState({}, '', window.location.pathname);
+    }
     return () => {
       if (pollRef.current) clearInterval(pollRef.current);
     };
@@ -231,6 +304,21 @@ function App() {
       skipNextCastPushRef.current = false;
       return;
     }
+    if (nowPlaying.source === 'spotify') {
+      if (outputDevice.type !== 'spotify') return; // guarded earlier at queue time, but don't cast a Spotify URI anywhere else
+      const endpoint = nowPlaying.context_uri ? 'play' : 'play-uris';
+      // For an ad-hoc (non-playlist) queue, hand Spotify the *whole* matched
+      // queue in this one call, not just the current track - that's what
+      // gives Spotify a real queue to advance through, so Next/Prev work
+      // both via our /next//previous proxy and natively in the Spotify app.
+      const payload = nowPlaying.context_uri
+        ? { context_uri: nowPlaying.context_uri, track_uri: nowPlaying.uri }
+        : { uris: [nowPlaying.uri, ...queue.slice(0, SPOTIFY_PLAY_QUEUE_LIMIT).map((t) => t.uri)] };
+      axios.post(`${deviceEndpoint(outputDevice)}/${endpoint}`, payload)
+        .catch((err) => console.error('Error casting to Spotify device:', err));
+      return;
+    }
+    if (outputDevice.type === 'spotify') return; // stale/local nowPlaying - Spotify Connect can't stream a local file
     const payload = { track_id: nowPlaying.id };
     const isChromecast = outputDevice.type === 'chromecast';
     if (isChromecast) {
@@ -277,6 +365,70 @@ function App() {
   useEffect(() => {
     if (!outputDevice || !nowPlaying) return;
     const isChromecast = outputDevice.type === 'chromecast';
+    const isSpotify = outputDevice.type === 'spotify';
+    // This whole effect (including the interval below) is torn down and
+    // recreated whenever outputDevice/nowPlaying/queue/history change - e.g.
+    // the instant a fresh play action sets a new nowPlaying. clearInterval
+    // only stops *future* ticks though: a poll request already in flight at
+    // that exact moment keeps running, and if it resolves afterward it would
+    // otherwise reconcile using this closure's now-stale nowPlaying/queue/
+    // history, incorrectly conclude the freshly-requested track "isn't
+    // playing yet" and stomp it back to whatever the device was already on -
+    // exactly the "plays its own queue" symptom. `cancelled` guards against
+    // that: set once this effect instance is superseded, checked right after
+    // the await, before touching any state.
+    let cancelled = false;
+
+    // Spotify (like Chromecast) advances its own queue/context on its own -
+    // same "observe and reconcile, don't drive" shape as reconcileFromContentId
+    // below, but matching directly on the polled track_uri (no id regex needed,
+    // since SpotifyStatus already reports the bare URI).
+    const reconcileFromSpotifyTrackUri = (statusData) => {
+      const trackUri = statusData.track_uri;
+      if (!trackUri || trackUri === lastContentIdRef.current) return;
+      lastContentIdRef.current = trackUri;
+      if (nowPlaying && trackUri === nowPlaying.uri) return;
+
+      const forwardIndex = queue.findIndex((t) => t.uri === trackUri);
+      if (forwardIndex !== -1) {
+        skipNextCastPushRef.current = true;
+        setHistory((h) => [...h, ...(nowPlaying ? [nowPlaying] : []), ...queue.slice(0, forwardIndex)]);
+        setNowPlaying(queue[forwardIndex]);
+        setIsPlaying(true);
+        setQueue((q) => q.slice(forwardIndex + 1));
+        return;
+      }
+
+      const reverseIndex = [...history].reverse().findIndex((t) => t.uri === trackUri);
+      if (reverseIndex !== -1) {
+        const historyIndex = history.length - 1 - reverseIndex;
+        skipNextCastPushRef.current = true;
+        setQueue((q) => [...history.slice(historyIndex + 1), ...(nowPlaying ? [nowPlaying] : []), ...q]);
+        setNowPlaying(history[historyIndex]);
+        setIsPlaying(true);
+        setHistory((h) => h.slice(0, historyIndex));
+        return;
+      }
+
+      // Not in our tracked queue/history - either this is a playlist we can't
+      // read the track listing of (started via playSpotifyContextDirectly, so
+      // there was never a queue to match against) or playback moved somewhere
+      // we didn't queue (e.g. skipped from the Spotify app itself). The status
+      // response already carries enough metadata to display directly.
+      skipNextCastPushRef.current = true;
+      setNowPlaying((prev) => ({
+        id: trackUri,
+        source: 'spotify',
+        uri: trackUri,
+        context_uri: prev?.context_uri ?? null,
+        track_name: statusData.title,
+        artist_name: statusData.artist,
+        album_name: statusData.album,
+        duration_seconds: statusData.duration_ms != null ? statusData.duration_ms / 1000 : null,
+        artwork_url: statusData.artwork_url,
+      }));
+      setIsPlaying(true);
+    };
 
     // Chromecast has a real device-side queue now, so track changes (whether
     // from the TV remote's own skip buttons or the device auto-advancing at
@@ -323,10 +475,16 @@ function App() {
     const interval = setInterval(async () => {
       try {
         const response = await axios.get(`${deviceEndpoint(outputDevice)}/status`);
+        if (cancelled) return; // superseded by a newer effect instance while this request was in flight - discard
         destStatusRef.current = response.data;
         setDestStatus(response.data);
         const { reachable, status: playState, duration_ms: duration, position_ms: position, content_id: contentId } = response.data;
         if (!reachable) return;
+
+        if (isSpotify) {
+          reconcileFromSpotifyTrackUri(response.data);
+          return;
+        }
 
         if (isChromecast) {
           reconcileFromContentId(contentId);
@@ -349,7 +507,7 @@ function App() {
         console.error('Error polling device status:', err);
       }
     }, 2000);
-    return () => clearInterval(interval);
+    return () => { cancelled = true; clearInterval(interval); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [outputDevice, nowPlaying, queue, history]);
 
@@ -407,7 +565,19 @@ function App() {
   }, [searchInput]);
 
   useEffect(() => {
+    if (!spotifyPlayHint) return;
+    const t = setTimeout(() => setSpotifyPlayHint(null), 4000);
+    return () => clearTimeout(t);
+  }, [spotifyPlayHint]);
+
+  useEffect(() => {
     if (activeTab !== 'library') return;
+    // Spotify playlists aren't in known_tracks - can't reuse the SQL-backed
+    // /api/tracks/known / /api/library/groups fetches below at all.
+    if (libraryMode === 'playlist') {
+      if (drill) fetchSpotifyPlaylistTracks(drill.key); else fetchSpotifyPlaylistsAsGroups();
+      return;
+    }
     if (drill || libraryMode === 'all') {
       // If Shuffle All is already on, a filter change re-shuffles the new
       // matching set rather than silently reverting to alphabetical order.
@@ -526,6 +696,42 @@ function App() {
     }
   };
 
+  const fetchSpotifyPlaylistsAsGroups = async () => {
+    setGroupsLoading(true);
+    try {
+      const response = await axios.get(`${API_BASE_URL}/spotify/playlists`);
+      setGroups(response.data.map((p) => ({
+        key: p.id, label: p.name, count: p.track_count, artwork_url: p.artwork_url,
+      })));
+    } catch (err) {
+      console.error('Error fetching Spotify playlists:', err);
+      setGroups([]);
+    } finally {
+      setGroupsLoading(false);
+    }
+  };
+
+  const fetchSpotifyPlaylistTracks = async (playlistId) => {
+    setLibraryLoading(true);
+    setPlaylistTracksRestricted(false);
+    try {
+      const response = await axios.get(`${API_BASE_URL}/spotify/playlists/${playlistId}/tracks`);
+      const tracks = response.data.map((t) => mapSpotifyTrack(t));
+      setLibraryTracks(tracks);
+      setLibraryTotal(tracks.length);
+    } catch (err) {
+      if (err.response?.status === 403) {
+        setPlaylistTracksRestricted(true);
+      } else {
+        console.error('Error fetching Spotify playlist tracks:', err);
+      }
+      setLibraryTracks([]);
+      setLibraryTotal(0);
+    } finally {
+      setLibraryLoading(false);
+    }
+  };
+
   const fetchStats = async () => {
     setStatsLoading(true);
     try {
@@ -621,6 +827,21 @@ function App() {
 
   const startQueue = (tracks, { shuffle = false } = {}) => {
     if (!tracks || tracks.length === 0) return;
+    // Central guard for every "Play All"/"Shuffle" entry point (library flat
+    // view, album/genre/etc. groups, playlist tracks, single-track clicks) -
+    // a local-track queue against a Spotify destination (or vice versa) would
+    // otherwise silently fail to cast while leaving the destination's status
+    // poll to overwrite nowPlaying with whatever Spotify's device already
+    // happens to be playing, which looks like "the wrong song is playing."
+    const isSpotifyTracks = tracks[0]?.source === 'spotify';
+    if (isSpotifyTracks && outputDevice?.type !== 'spotify') {
+      setSpotifyPlayHint('Select a Spotify Connect device (destination picker) to play Spotify playlists.');
+      return;
+    }
+    if (!isSpotifyTracks && outputDevice?.type === 'spotify') {
+      setSpotifyPlayHint('Switch the destination off Spotify Connect to play local library tracks.');
+      return;
+    }
     const ordered = shuffle ? shuffleArray(tracks) : tracks;
     setHistory([]);
     setNowPlaying(ordered[0]);
@@ -632,9 +853,112 @@ function App() {
     preShuffleQueueRef.current = null;
   };
 
+  // For a Spotify playlist we can't read the track listing of (not owned by
+  // this account - Spotify blocks that even though playback still works):
+  // start it from the top via context_uri alone, with a placeholder
+  // "nowPlaying" that the status-poll reconciliation (reconcileFromSpotifyTrackUri)
+  // fills in with the real title/artist/artwork within one poll tick.
+  const playSpotifyContextDirectly = (contextUri) => {
+    setHistory([]);
+    setQueue([]);
+    setNowPlaying({
+      id: contextUri, source: 'spotify', uri: null, context_uri: contextUri,
+      track_name: 'Loading…', artist_name: '', album_name: null,
+      duration_seconds: null, artwork_url: null,
+    });
+    setIsPlaying(true);
+    setShuffleEnabled(false);
+    setUserHasInteracted(true);
+    setInitialSeekMs(null);
+  };
+
   const playTrackFromList = (track, list) => {
     const index = list.findIndex((t) => t.id === track.id);
     startQueue(index >= 0 ? list.slice(index) : [track]);
+  };
+
+  // A local track matched to its Spotify catalog equivalent, adapted into
+  // the same shape mapSpotifyTrack produces from a real Spotify API response
+  // - but keeps the *local* track's own title/artist/album/duration (we
+  // already know exactly what this is), only taking uri/artwork from the
+  // match. context_uri stays null - this isn't a playlist, just an ad-hoc
+  // queue built from matched local tracks (see attemptSpotifyMatchAndPlay).
+  function mapMatchedLocalTrack(localTrack, matchResult) {
+    return {
+      id: matchResult.uri, source: 'spotify', uri: matchResult.uri, context_uri: null,
+      track_name: localTrack.track_name, artist_name: localTrack.artist_name,
+      album_name: localTrack.album_name, duration_seconds: localTrack.duration_seconds,
+      artwork_url: matchResult.artwork_url || localTrack.artwork_url,
+    };
+  }
+
+  // Clicking play on a local track (with Spotify Connect as the destination)
+  // matches it *and the rest of the current list* (capped server-side at
+  // SPOTIFY_MATCH_BATCH_LIMIT) against Spotify's catalog in one batch call,
+  // skipping any that aren't found - same "queue the rest of the list from
+  // here" behavior as local/WiiM/Chromecast playback (playTrackFromList),
+  // just resolved through Spotify's catalog first. Building a real multi-
+  // track queue (rather than a single ad-hoc track) is what makes Next/Prev
+  // work, both in this app and in the Spotify app itself - the cast-on-change
+  // effect hands Spotify the whole matched queue in one play-uris call.
+  // Guards against a slower, older match request resolving *after* a newer
+  // one the user triggered by clicking a different track in the meantime -
+  // without this, the stale result could win and silently replace the
+  // just-started (correct) queue with the old click's, which looks exactly
+  // like "clicking a track does nothing / plays the previous playlist."
+  const spotifyMatchRequestIdRef = useRef(0);
+
+  // Shared by every "play these local tracks via Spotify" entry point -
+  // single-track click, Shuffle All, Play All, and Play All/Shuffle on an
+  // album/genre/etc. group. Only the first SPOTIFY_MATCH_BATCH_LIMIT tracks
+  // of whatever order is passed in get matched (already-shuffled input stays
+  // a valid random sample after truncating, since the shuffle happened
+  // before this cap is applied).
+  const matchAndPlayLocalTracksOnSpotify = async (tracks, { noMatchHint } = {}) => {
+    const candidates = tracks.slice(0, SPOTIFY_MATCH_BATCH_LIMIT);
+    if (candidates.length === 0) return;
+    const requestId = ++spotifyMatchRequestIdRef.current;
+    setMatchingTrackId(candidates[0].id);
+    try {
+      const response = await axios.post(`${API_BASE_URL}/spotify/tracks/match-batch`, {
+        track_ids: candidates.map((t) => t.id),
+      });
+      if (spotifyMatchRequestIdRef.current !== requestId) return; // superseded by a newer click
+      const byId = new Map(candidates.map((t) => [t.id, t]));
+      const matchedTracks = [];
+      let skipped = 0;
+      response.data.forEach((result) => {
+        const local = byId.get(result.track_id);
+        if (!local) return;
+        if (result.matched) {
+          matchedTracks.push(mapMatchedLocalTrack(local, result));
+        } else {
+          skipped += 1;
+        }
+      });
+      if (matchedTracks.length === 0) {
+        setSpotifyPlayHint(noMatchHint || 'No Spotify match found for these tracks.');
+        return;
+      }
+      startQueue(matchedTracks);
+      if (skipped > 0) {
+        setSpotifyPlayHint(`Skipped ${skipped} track${skipped === 1 ? '' : 's'} not found on Spotify.`);
+      }
+    } catch (err) {
+      if (spotifyMatchRequestIdRef.current !== requestId) return;
+      console.error('Error matching tracks to Spotify:', err);
+      setSpotifyPlayHint('Could not reach Spotify to search for a match.');
+    } finally {
+      if (spotifyMatchRequestIdRef.current === requestId) setMatchingTrackId(null);
+    }
+  };
+
+  const attemptSpotifyMatchAndPlay = (track, list) => {
+    const startIndex = list ? list.findIndex((t) => t.id === track.id) : -1;
+    const candidates = startIndex >= 0 ? list.slice(startIndex) : [track];
+    matchAndPlayLocalTracksOnSpotify(candidates, {
+      noMatchHint: `No Spotify match found for "${track.track_name}"${candidates.length > 1 ? ' or the tracks after it' : ''}.`,
+    });
   };
 
   // Toggle shuffling of the *remaining* queue, keeping the currently-playing
@@ -662,6 +986,17 @@ function App() {
       // (load + play) rather than just resume a stream that was never sent.
       if (destNeedsInitialCastRef.current && nowPlaying) {
         destNeedsInitialCastRef.current = false;
+        if (nowPlaying.source === 'spotify') {
+          if (outputDevice.type !== 'spotify') return;
+          const endpoint = nowPlaying.context_uri ? 'play' : 'play-uris';
+          const spotifyPayload = nowPlaying.context_uri
+            ? { context_uri: nowPlaying.context_uri, track_uri: nowPlaying.uri }
+            : { uris: [nowPlaying.uri, ...queue.slice(0, SPOTIFY_PLAY_QUEUE_LIMIT).map((t) => t.uri)] };
+          axios.post(`${deviceEndpoint(outputDevice)}/${endpoint}`, spotifyPayload)
+            .catch((err) => console.error('Error casting to Spotify device:', err));
+          return;
+        }
+        if (outputDevice.type === 'spotify') return;
         const payload = { track_id: nowPlaying.id };
         const isChromecast = outputDevice.type === 'chromecast';
         if (isChromecast) {
@@ -702,9 +1037,24 @@ function App() {
   const handleTrackPlayClick = (track, list) => {
     if (nowPlaying && nowPlaying.id === track.id) {
       togglePlay();
-    } else {
-      playTrackFromList(track, list);
+      return;
     }
+    // Spotify tracks stream from Spotify's own servers to a Spotify Connect
+    // device - there's no local file to hand to WiiM/Chromecast/this browser,
+    // and the reverse (a local file to Spotify Connect) doesn't work either.
+    if (track.source === 'spotify' && outputDevice?.type !== 'spotify') {
+      setSpotifyPlayHint('Select a Spotify Connect device (destination picker) to play Spotify playlists.');
+      return;
+    }
+    // A local track with Spotify Connect as the destination: the actual
+    // local file can never reach a Connect device, so match this track (and
+    // queue the rest of the list) against Spotify's catalog and play that
+    // instead.
+    if (track.source !== 'spotify' && outputDevice?.type === 'spotify') {
+      attemptSpotifyMatchAndPlay(track, list);
+      return;
+    }
+    playTrackFromList(track, list);
   };
 
   // Shared between list and grid display styles - grid mode overlays the play
@@ -712,12 +1062,14 @@ function App() {
   const renderTrackCard = (track, list) => {
     const isCurrent = nowPlaying && nowPlaying.id === track.id;
     const isCardPlaying = isCurrent && effectiveIsPlaying;
+    const isMatching = matchingTrackId === track.id;
+    const playIcon = isMatching ? '⏳' : isCardPlaying ? '❚❚' : '▶';
     const thumb = (
       <div className="track-thumb-wrap">
         <span className="track-thumb-fallback">{track.track_name.charAt(0).toUpperCase()}</span>
         <img
           className="track-thumb"
-          src={`${API_BASE_URL}/tracks/${track.id}/artwork`}
+          src={track.artwork_url || `${API_BASE_URL}/tracks/${track.id}/artwork`}
           alt=""
           loading="lazy"
           onError={(e) => { e.target.style.display = 'none'; }}
@@ -726,9 +1078,10 @@ function App() {
           <button
             className="play-btn overlay"
             onClick={() => handleTrackPlayClick(track, list)}
+            disabled={isMatching}
             aria-label={isCardPlaying ? 'Pause' : 'Play'}
           >
-            {isCardPlaying ? '❚❚' : '▶'}
+            {playIcon}
           </button>
         )}
       </div>
@@ -739,9 +1092,10 @@ function App() {
           <button
             className="play-btn"
             onClick={() => handleTrackPlayClick(track, list)}
+            disabled={isMatching}
             aria-label={isCardPlaying ? 'Pause' : 'Play'}
           >
-            {isCardPlaying ? '❚❚' : '▶'}
+            {playIcon}
           </button>
         )}
         {thumb}
@@ -767,6 +1121,11 @@ function App() {
         axios.post(`${deviceEndpoint(outputDevice)}/queue-next`)
           .catch((err) => console.error('Error advancing Chromecast queue:', err));
       }
+      if (outputDevice?.type === 'spotify') {
+        skipNextCastPushRef.current = true;
+        axios.post(`${deviceEndpoint(outputDevice)}/next`)
+          .catch((err) => console.error('Error advancing Spotify playback:', err));
+      }
       setHistory((h) => (nowPlaying ? [...h, nowPlaying] : h));
       setNowPlaying(prevQueue[0]);
       setIsPlaying(true);
@@ -781,6 +1140,11 @@ function App() {
         skipNextCastPushRef.current = true;
         axios.post(`${deviceEndpoint(outputDevice)}/queue-prev`)
           .catch((err) => console.error('Error reversing Chromecast queue:', err));
+      }
+      if (outputDevice?.type === 'spotify') {
+        skipNextCastPushRef.current = true;
+        axios.post(`${deviceEndpoint(outputDevice)}/previous`)
+          .catch((err) => console.error('Error reversing Spotify playback:', err));
       }
       const last = prevHistory[prevHistory.length - 1];
       setQueue((q) => (nowPlaying ? [nowPlaying, ...q] : q));
@@ -823,13 +1187,33 @@ function App() {
   };
 
   const playGroup = async (group, { shuffle = false } = {}) => {
+    if (group.by === 'playlist') {
+      if (outputDevice?.type !== 'spotify') {
+        setSpotifyPlayHint('Select a Spotify Connect device (destination picker) to play Spotify playlists.');
+        return;
+      }
+      try {
+        const response = await axios.get(`${API_BASE_URL}/spotify/playlists/${group.key}/tracks`);
+        const tracks = response.data.map((t) => mapSpotifyTrack(t));
+        startQueue(tracks, { shuffle });
+      } catch (err) {
+        if (err.response?.status === 403) {
+          playSpotifyContextDirectly(`spotify:playlist:${group.key}`);
+        } else {
+          console.error('Error queuing Spotify playlist playback:', err);
+        }
+      }
+      return;
+    }
     try {
       const params = { ...buildAmbientFilterParams(), ...paramsForGroupKey(group.by, group.key) };
-      if (shuffle) {
-        startQueue(await fetchAllMatchingShuffled(params));
+      const tracks = shuffle
+        ? await fetchAllMatchingShuffled(params)
+        : (await axios.get(`${API_BASE_URL}/tracks/known`, { params: { ...params, limit: GROUP_QUEUE_LIMIT, offset: 0 } })).data.tracks;
+      if (outputDevice?.type === 'spotify') {
+        matchAndPlayLocalTracksOnSpotify(tracks);
       } else {
-        const response = await axios.get(`${API_BASE_URL}/tracks/known`, { params: { ...params, limit: GROUP_QUEUE_LIMIT, offset: 0 } });
-        startQueue(response.data.tracks);
+        startQueue(tracks);
       }
     } catch (err) {
       console.error('Error queuing group playback:', err);
@@ -839,11 +1223,13 @@ function App() {
   const playCurrentFilter = async ({ shuffle = false } = {}) => {
     try {
       const params = buildTrackFilterParams();
-      if (shuffle) {
-        startQueue(await fetchAllMatchingShuffled(params));
+      const tracks = shuffle
+        ? await fetchAllMatchingShuffled(params)
+        : (await axios.get(`${API_BASE_URL}/tracks/known`, { params: { ...params, limit: GROUP_QUEUE_LIMIT, offset: 0 } })).data.tracks;
+      if (outputDevice?.type === 'spotify') {
+        matchAndPlayLocalTracksOnSpotify(tracks);
       } else {
-        const response = await axios.get(`${API_BASE_URL}/tracks/known`, { params: { ...params, limit: GROUP_QUEUE_LIMIT, offset: 0 } });
-        startQueue(response.data.tracks);
+        startQueue(tracks);
       }
     } catch (err) {
       console.error('Error queuing playback:', err);
@@ -862,10 +1248,19 @@ function App() {
     }
     setLibraryShuffleOn(true);
     const tracks = await fetchLibraryTracksShuffled();
-    if (tracks.length > 0) startQueue(tracks);
+    if (tracks.length === 0) return;
+    if (outputDevice?.type === 'spotify') {
+      matchAndPlayLocalTracksOnSpotify(tracks);
+    } else {
+      startQueue(tracks);
+    }
   };
 
-  const viewLabel = (mode) => (mode === 'all' ? 'All Tracks' : `By ${mode.charAt(0).toUpperCase()}${mode.slice(1)}`);
+  const viewLabel = (mode) => {
+    if (mode === 'all') return 'All Tracks';
+    if (mode === 'playlist') return 'Playlists';
+    return `By ${mode.charAt(0).toUpperCase()}${mode.slice(1)}`;
+  };
   const backLabel = drill && BACK_LABELS[drill.by];
   const effectiveIsPlaying = outputDevice ? destStatus?.status === 'play' : isPlaying;
 
@@ -1010,6 +1405,9 @@ function App() {
           </section>
         ) : activeTab === 'library' ? (
           <section className="library-section">
+            {spotifyPlayHint && (
+              <p className="empty-state spotify-play-hint">{spotifyPlayHint}</p>
+            )}
             <div className="library-controls">
               <div className="search-row">
                 <input
@@ -1103,7 +1501,13 @@ function App() {
                 </div>
                 {libraryTracks.length === 0 ? (
                   <p className="empty-state">
-                    {libraryLoading ? 'Loading…' : 'No tracks found. Open Settings to scan a library folder.'}
+                    {libraryLoading
+                      ? 'Loading…'
+                      : playlistTracksRestricted
+                        ? "Spotify doesn't allow browsing individual tracks in a playlist you don't own — use Play All / Shuffle above to play the whole playlist."
+                        : drill?.by === 'playlist'
+                          ? 'This playlist has no tracks.'
+                          : 'No tracks found. Open Settings to scan a library folder.'}
                   </p>
                 ) : (
                   <div className={`tracks-grid${trackViewStyle === 'grid' ? ' grid-view' : ''}`}>
@@ -1124,6 +1528,8 @@ function App() {
               <div className={`groups-grid${trackViewStyle === 'grid' ? ' grid-view' : ''}`}>
                 {groupsLoading ? (
                   <p className="empty-state">Loading…</p>
+                ) : libraryMode === 'playlist' && !spotifyConnected ? (
+                  <p className="empty-state">Connect Spotify in Settings to browse your playlists.</p>
                 ) : groups.length === 0 ? (
                   <p className="empty-state">No {libraryMode}s found.</p>
                 ) : (
@@ -1131,10 +1537,10 @@ function App() {
                     <div key={g.key} className="group-card">
                       <div className="group-thumb-wrap">
                         <span className="group-thumb-fallback">{g.label.charAt(0).toUpperCase()}</span>
-                        {g.sample_track_id != null && (
+                        {(g.artwork_url || g.sample_track_id != null) && (
                           <img
                             className="group-thumb"
-                            src={`${API_BASE_URL}/tracks/${g.sample_track_id}/artwork`}
+                            src={g.artwork_url || `${API_BASE_URL}/tracks/${g.sample_track_id}/artwork`}
                             alt=""
                             loading="lazy"
                             onError={(e) => { e.target.style.display = 'none'; }}
@@ -1209,6 +1615,9 @@ function App() {
           scanError={scanError}
           onScan={handleScan}
           outputDevices={outputDevices}
+          apiBase={API_BASE_URL}
+          spotifyConnected={spotifyConnected}
+          onSpotifyDisconnect={() => axios.post(`${API_BASE_URL}/spotify/auth/logout`).finally(refreshSpotifyStatus)}
         />
       )}
 
@@ -1260,7 +1669,7 @@ function channelLabel(channels) {
   return `${channels}ch`;
 }
 
-function SettingsPanel({ onClose, rootPath, setRootPath, scanning, scanResult, scanError, onScan, outputDevices }) {
+function SettingsPanel({ onClose, rootPath, setRootPath, scanning, scanResult, scanError, onScan, outputDevices, apiBase, spotifyConnected, onSpotifyDisconnect }) {
   return (
     <div className="settings-overlay" onClick={onClose}>
       <div className="settings-modal" onClick={(e) => e.stopPropagation()}>
@@ -1298,22 +1707,38 @@ function SettingsPanel({ onClose, rootPath, setRootPath, scanning, scanResult, s
         <div className="settings-section">
           <label>Playback devices</label>
           {outputDevices.length === 0 ? (
-            <p className="hint">No WiiM or Chromecast devices configured.</p>
+            <p className="hint">No WiiM, Chromecast, or Spotify Connect devices available.</p>
           ) : (
             <div className="device-list">
               {outputDevices.map((d) => (
                 <div className="device-row" key={`${d.type}-${d.id}`}>
-                  <span className="device-row-icon">{d.type === 'chromecast' ? '📺' : '📡'}</span>
+                  <span className="device-row-icon">{d.type === 'chromecast' ? '📺' : d.type === 'spotify' ? '🟢' : '📡'}</span>
                   <span className="device-row-name">{d.name}</span>
-                  <span className="device-row-ip">{d.ip}</span>
-                  <span className="device-row-type">{d.type === 'chromecast' ? 'Chromecast' : 'WiiM'}</span>
+                  <span className="device-row-ip">{d.ip || ''}</span>
+                  <span className="device-row-type">{d.type === 'chromecast' ? 'Chromecast' : d.type === 'spotify' ? 'Spotify Connect' : 'WiiM'}</span>
                 </div>
               ))}
             </div>
           )}
           <p className="hint">
-            Edit WIIM_DEVICES / CHROMECAST_DEVICES in .env and rebuild to add, remove, or rename devices.
+            Edit WIIM_DEVICES / CHROMECAST_DEVICES in .env and rebuild to add, remove, or rename WiiM/Chromecast devices.
+            Spotify Connect devices are whatever the Spotify app reports as active on your account.
           </p>
+        </div>
+
+        <div className="settings-section">
+          <label>Spotify</label>
+          {spotifyConnected ? (
+            <>
+              <p className="hint">Connected. Spotify Connect devices and playlists are available above and under the Playlists tab.</p>
+              <button type="button" className="scan-btn" onClick={onSpotifyDisconnect}>Disconnect Spotify</button>
+            </>
+          ) : (
+            <>
+              <p className="hint">Connect your Spotify account to play playlists on a Spotify Connect device (phone, desktop app, speaker, etc.).</p>
+              <a className="scan-btn" href={`${apiBase}/spotify/auth/login`}>Connect Spotify</a>
+            </>
+          )}
         </div>
       </div>
     </div>
@@ -1347,7 +1772,7 @@ function PlayerBar({
   }, [expanded, track, apiBase]);
 
   useEffect(() => {
-    if (!expanded || !track) return;
+    if (!expanded || !track || track.source === 'spotify') return;
     if (lastAlbumPositionTrackIdRef.current === track.id) return;
     lastAlbumPositionTrackIdRef.current = track.id;
     setAlbumPosition(null);
@@ -1390,7 +1815,8 @@ function PlayerBar({
   };
 
   const destinationLabel = outputDevice ? outputDevice.name : 'This Browser';
-  const deviceIcon = (d) => (d.type === 'chromecast' ? '📺' : '📡');
+  const deviceIcon = (d) => (d.type === 'chromecast' ? '📺' : d.type === 'spotify' ? '🟢' : '📡');
+  const trackArtworkUrl = (t) => t.artwork_url || `${apiBase}/tracks/${t.id}/artwork`;
 
   return (
     <div className="player-root">
@@ -1398,7 +1824,7 @@ function PlayerBar({
         <div className="now-playing-panel">
           <div
             className="now-playing-backdrop"
-            style={{ backgroundImage: `url(${apiBase}/tracks/${track.id}/artwork)` }}
+            style={{ backgroundImage: `url(${trackArtworkUrl(track)})` }}
           />
           <button className="now-playing-collapse" onClick={() => setExpanded(false)} aria-label="Collapse">&#9660;</button>
 
@@ -1408,7 +1834,7 @@ function PlayerBar({
                 <section className="np-section np-art-section">
                   <div className="now-playing-art">
                     <img
-                      src={`${apiBase}/tracks/${track.id}/artwork`}
+                      src={trackArtworkUrl(track)}
                       alt=""
                       onError={(e) => { e.target.style.display = 'none'; }}
                     />
@@ -1472,7 +1898,7 @@ function PlayerBar({
                           <span className="queue-thumb-fallback">{t.track_name.charAt(0).toUpperCase()}</span>
                           <img
                             className="queue-thumb"
-                            src={`${apiBase}/tracks/${t.id}/artwork`}
+                            src={trackArtworkUrl(t)}
                             alt=""
                             loading="lazy"
                             onError={(e) => { e.target.style.display = 'none'; }}
@@ -1561,7 +1987,7 @@ function PlayerBar({
       <div className="player-bar">
         <div className="player-thumb-wrap" onClick={() => setExpanded(true)}>
           <img
-            src={`${apiBase}/tracks/${track.id}/artwork`}
+            src={trackArtworkUrl(track)}
             alt=""
             onError={(e) => { e.target.style.display = 'none'; }}
           />

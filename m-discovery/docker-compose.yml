@@ -15,8 +15,11 @@ services:
     build:
       context: ./frontend
       dockerfile: Dockerfile
+    volumes:
+      - ./certs:/etc/nginx/certs:ro
     ports:
       - "6009:80"
+      - "6443:443"
     depends_on:
       - app
 
