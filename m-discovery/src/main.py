@@ -17,13 +17,14 @@ from . import wiim
 from . import chromecast
 from . import spotify_connect
 from . import external_artwork
+from . import spotify_prewarm
 import google.generativeai as genai
 import logging
 import os
 import json
 import re
-from concurrent.futures import ThreadPoolExecutor
 import threading
+import time
 
 # Without this, module-level loggers (e.g. chromecast.py's) have no handler
 # and INFO/WARNING records are silently dropped - only bare exceptions would
@@ -108,6 +109,28 @@ artwork_check_progress = {"status": "idle"}
 external_artwork_lock = threading.Lock()
 external_artwork_progress = {"status": "idle"}
 
+spotify_prewarm_lock = threading.Lock()
+spotify_prewarm_progress = {"status": "idle"}
+
+# Timestamp of the last non-polling request, used by the Spotify pre-warm
+# background job to tell "actively using the app" apart from "idle" so it
+# only spends search requests when nothing else needs them.
+IDLE_THRESHOLD_SECONDS = 120
+_last_activity_at = 0.0
+
+def _is_idle():
+    return (time.time() - _last_activity_at) > IDLE_THRESHOLD_SECONDS
+
+@app.middleware("http")
+async def track_activity(request, call_next):
+    # Routine status polling happens every ~2s during any ongoing playback -
+    # counting it as "activity" would mean the pre-warm job could never run
+    # during a long listening session, which isn't the intent of "idle".
+    global _last_activity_at
+    if not request.url.path.endswith("/status"):
+        _last_activity_at = time.time()
+    return await call_next(request)
+
 # Configure Gemini API
 genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
 model = genai.GenerativeModel('gemini-1.5-pro')
@@ -172,6 +195,12 @@ class ExternalArtworkStatus(BaseModel):
     found: Optional[int] = None
     still_missing: Optional[int] = None
     resume_at: Optional[float] = None  # unix timestamp; set only while status == 'waiting'
+    error: Optional[str] = None
+
+class SpotifyPrewarmStatus(BaseModel):
+    status: str  # idle | running | waiting_active_use | waiting_not_connected | done | error
+    processed: Optional[int] = None
+    matched: Optional[int] = None
     error: Optional[str] = None
 
 class CountEntry(BaseModel):
@@ -271,6 +300,9 @@ class SpotifyPlayRequest(BaseModel):
 class SpotifyPlayUrisRequest(BaseModel):
     uris: List[str]
 
+class SpotifyQueueRequest(BaseModel):
+    uri: str
+
 class SpotifyVolumeRequest(BaseModel):
     level: int
 
@@ -310,15 +342,6 @@ class SpotifyMatchResult(BaseModel):
     artwork_url: Optional[str] = None
     reason: Optional[str] = None  # "no_match" | "unavailable", set when matched=False
 
-class SpotifyMatchBatchRequest(BaseModel):
-    track_ids: List[int]
-
-class SpotifyBatchMatchEntry(BaseModel):
-    track_id: int
-    matched: bool
-    uri: Optional[str] = None
-    artwork_url: Optional[str] = None
-
 # Dependency to get a database connection
 def get_db():
     conn = None
@@ -354,6 +377,22 @@ async def startup_event():
         if remaining > 0:
             print(f"Resuming external artwork backfill in the background ({remaining} tracks not yet checked).")
             _start_external_artwork_background()
+
+    # Same idea for the Spotify pre-warm job: it needs a connected account to
+    # do anything, so only auto-start it if one's already linked at boot.
+    if spotify_connect.is_connected():
+        conn = get_db_connection()
+        if conn:
+            try:
+                cur = conn.cursor()
+                cur.execute("SELECT COUNT(*) FROM known_tracks WHERE spotify_checked IS NOT TRUE")
+                remaining = cur.fetchone()[0]
+                cur.close()
+            finally:
+                conn.close()
+            if remaining > 0:
+                print(f"Resuming Spotify pre-warm in the background ({remaining} tracks not yet checked).")
+                _start_spotify_prewarm_background()
 
 @app.get("/")
 async def read_root():
@@ -980,6 +1019,13 @@ def spotify_play_uris(device_id: str, params: SpotifyPlayUrisRequest):
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Could not reach Spotify")
     return {"status": "playing"}
 
+@app.post("/api/spotify/devices/{device_id}/queue")
+def spotify_add_to_queue(device_id: str, params: SpotifyQueueRequest):
+    _get_spotify_device_or_404(device_id)
+    if not spotify_connect.add_to_queue(device_id, params.uri):
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Could not reach Spotify")
+    return {"status": "queued"}
+
 @app.post("/api/spotify/devices/{device_id}/pause")
 def spotify_pause(device_id: str):
     _get_spotify_device_or_404(device_id)
@@ -1106,46 +1152,33 @@ def match_local_track_to_spotify(track_id: int, db: psycopg2.extensions.connecti
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Track not found")
     return result
 
-# Caps how many tracks a single "play this list via Spotify" click will
-# match up front - each uncached track is its own /search call, so this
-# bounds one click to a worst-case ~50 requests rather than e.g. an entire
-# unfiltered library.
-SPOTIFY_MATCH_BATCH_LIMIT = 50
-# Uncached matches run concurrently (each is its own independent Spotify API
-# round-trip, ~200-300ms) rather than one at a time - at 50 tracks, sequential
-# took ~13s in testing (clearly visible as "unresponsive" to the user
-# clicking play), a few seconds concurrent. Modest concurrency, not "as many
-# as possible": stays closer to how a human clicking around actually
-# generates traffic, since aggressive parallel bursts are more likely to look
-# abusive to Spotify's rate limiter than the same total requests spread out.
-SPOTIFY_MATCH_BATCH_CONCURRENCY = 5
+def _start_spotify_prewarm_background():
+    """Kicks off the background Spotify pre-warm job if one isn't already
+    running. Returns False (no-op, no error) if one is already in flight -
+    same pattern as _start_external_artwork_background, for the same reason
+    (a run interrupted by a container rebuild needs to auto-resume, since the
+    in-memory progress/lock don't survive the process exiting)."""
+    if not spotify_prewarm_lock.acquire(blocking=False):
+        return False
+    try:
+        spotify_prewarm_progress.clear()
+        spotify_prewarm_progress.update(status="running")
 
-@app.post("/api/spotify/tracks/match-batch", response_model=List[SpotifyBatchMatchEntry])
-def match_local_tracks_batch(params: SpotifyMatchBatchRequest):
-    if not spotify_connect.is_connected():
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Spotify not connected")
+        def _run():
+            try:
+                spotify_prewarm.run(get_db_connection, spotify_prewarm_progress, _is_idle)
+            finally:
+                spotify_prewarm_lock.release()
 
-    def _match_one(track_id):
-        # Own DB connection per thread - psycopg2 connections aren't safe to
-        # share across concurrent threads, so the shared request-scoped `db`
-        # dependency can't be reused here.
-        conn = None
-        try:
-            conn = get_db_connection()
-            match = _match_track_to_spotify(conn, track_id)
-        except Exception:
-            match = None
-        finally:
-            if conn:
-                conn.close()
-        if match is None:
-            return None
-        return {"track_id": track_id, "matched": match["matched"], "uri": match.get("uri"), "artwork_url": match.get("artwork_url")}
+        threading.Thread(target=_run, daemon=True).start()
+        return True
+    except Exception:
+        spotify_prewarm_lock.release()
+        raise
 
-    track_ids = params.track_ids[:SPOTIFY_MATCH_BATCH_LIMIT]
-    with ThreadPoolExecutor(max_workers=SPOTIFY_MATCH_BATCH_CONCURRENCY) as executor:
-        raw_results = list(executor.map(_match_one, track_ids))
-    return [r for r in raw_results if r is not None]
+@app.get("/api/spotify/prewarm/status", response_model=SpotifyPrewarmStatus)
+async def get_spotify_prewarm_status():
+    return spotify_prewarm_progress
 
 @app.post("/api/library/scan", response_model=ScanStatus, status_code=status.HTTP_202_ACCEPTED)
 async def scan_library(params: LibraryScanRequest):

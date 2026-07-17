@@ -1207,6 +1207,13 @@ main.with-player {
   opacity: 0.75;
 }
 
+.player-no-local-file {
+  margin: 0;
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
 .player-controls {
   flex-shrink: 0;
   display: flex;

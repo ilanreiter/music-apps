@@ -387,6 +387,14 @@ def play_uris(device_id, uris):
     return result is not None
 
 
+def add_to_queue(device_id, uri):
+    """Appends a single track to the end of the currently active playback
+    queue, without interrupting what's already playing - used to feed one
+    lookahead match at a time instead of front-loading a whole batch."""
+    result = _api_request('POST', '/me/player/queue', params={'uri': uri, 'device_id': device_id})
+    return result is not None
+
+
 # How close a search result's own title/artist must be to what we searched for
 # before we trust it as a real match, rather than an unrelated track that
 # happened to rank first (common for generic titles like "Intro" or "Home").
