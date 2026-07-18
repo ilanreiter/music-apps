@@ -578,6 +578,37 @@ function App() {
       const trackChanged = sessionId != null && sessionId !== lastContentIdRef.current;
       if (trackChanged) lastContentIdRef.current = sessionId;
 
+      // The backend's own lookahead-refill (playback_advancer._advance_spotify)
+      // now drives ongoing matching during playback, not just the frontend's
+      // one-shot findNextSpotifyMatch on the initial click - but it has no
+      // channel back to the frontend for which candidates it tried and
+      // skipped, so skippedTrackIds (the ✕ badge) only ever reflected that
+      // first click and went stale for everything after (confirmed live:
+      // most skips during an ongoing Shuffle-All-via-Spotify session showed
+      // no badge at all). spotify_match_pool.cursor is already synced every
+      // poll regardless - candidates[0:cursor] minus whatever's actually
+      // playing or buffered next is exactly the set the backend tried and
+      // rejected.
+      const pool = session.spotify_match_pool;
+      if (pool && Array.isArray(pool.candidates) && pool.cursor > 0) {
+        const currentLocalId = sessionTrack?.local_id;
+        const queuedLocalIds = new Set((session.queue || []).map((t) => t.local_id).filter((id) => id != null));
+        const skippedIds = pool.candidates
+          .slice(0, pool.cursor)
+          .map((c) => c.id)
+          .filter((id) => id !== currentLocalId && !queuedLocalIds.has(id));
+        if (skippedIds.length) {
+          setSkippedTrackIds((prev) => {
+            const next = new Set(prev);
+            let changed = false;
+            for (const id of skippedIds) {
+              if (!next.has(id)) { next.add(id); changed = true; }
+            }
+            return changed ? next : prev;
+          });
+        }
+      }
+
       if (trackChanged && !(nowPlaying && sessionId === nowPlaying.id)) {
         const forwardIndex = queue.findIndex((t) => t.id === sessionId);
         if (forwardIndex !== -1) {
