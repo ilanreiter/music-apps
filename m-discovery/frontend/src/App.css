@@ -1100,6 +1100,20 @@ main.with-player {
     margin-left: 50%;
     transform: translateX(-50%);
   }
+
+  /* Same breakout, applied to the title/search/filter bars above the grid
+     so they align with it edge-to-edge instead of sitting in the narrower
+     900px column while the grid below is 2/3 of the viewport. Scoped to
+     .library-section so it doesn't also widen the Cleanup tab's own
+     (unrelated) .library-header usage. */
+  .library-section .library-controls,
+  .library-section .library-header,
+  .library-section .drill-header {
+    width: 66.67vw;
+    max-width: 66.67vw;
+    margin-left: 50%;
+    transform: translateX(-50%);
+  }
 }
 
 .load-more-btn {

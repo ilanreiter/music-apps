@@ -55,11 +55,6 @@ const SPOTIFY_PLAY_QUEUE_LIMIT = 100;
 // *something* playable in a given pool - protects against burning requests
 // unboundedly into a long dry streak in an unlucky shuffle order.
 const SPOTIFY_MATCH_CONSECUTIVE_CAP = 20;
-// How long to wait before retrying the lookahead-refill search after it hits
-// a rate limit - without a retry, one rate-limited attempt permanently
-// stalls Next/Prev for the rest of that playback session (queue never
-// refills), even once the rate limit clears seconds later.
-const SPOTIFY_LOOKAHEAD_RETRY_DELAY_MS = 20000;
 // The device-status poll (below) runs continuously while a destination is
 // selected - at the default 2s interval that's ~1,800 Spotify API calls/hour
 // for a single open session, a real contributor to hitting Spotify's
@@ -78,6 +73,49 @@ function shuffleArray(arr) {
   }
   return copy;
 }
+
+// Player-bar icons as SVGs (currentColor) rather than emoji - a color emoji
+// glyph (the old 🔊/📡/📺 destination icons) renders with its own built-in
+// color regardless of CSS `color`, which is why the destination button could
+// never actually match the shuffle button's color even though both use the
+// exact same .active background/color rules underneath.
+const IconPlay = (props) => (
+  <svg viewBox="0 0 24 24" width="1em" height="1em" {...props}><polygon points="6,4 20,12 6,20" fill="currentColor" /></svg>
+);
+const IconPause = (props) => (
+  <svg viewBox="0 0 24 24" width="1em" height="1em" {...props}>
+    <rect x="5" y="4" width="5" height="16" fill="currentColor" />
+    <rect x="14" y="4" width="5" height="16" fill="currentColor" />
+  </svg>
+);
+const IconPrev = (props) => (
+  <svg viewBox="0 0 24 24" width="1em" height="1em" {...props}>
+    <rect x="4" y="4" width="3" height="16" fill="currentColor" />
+    <polygon points="20,4 9,12 20,20" fill="currentColor" />
+  </svg>
+);
+const IconNext = (props) => (
+  <svg viewBox="0 0 24 24" width="1em" height="1em" {...props}>
+    <polygon points="4,4 15,12 4,20" fill="currentColor" />
+    <rect x="17" y="4" width="3" height="16" fill="currentColor" />
+  </svg>
+);
+const IconShuffle = (props) => (
+  <svg viewBox="0 0 24 24" width="1em" height="1em" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" {...props}>
+    <polyline points="16 3 21 3 21 8" />
+    <line x1="4" y1="20" x2="21" y2="3" />
+    <polyline points="21 16 21 21 16 21" />
+    <line x1="15" y1="15" x2="21" y2="21" />
+    <line x1="4" y1="4" x2="9" y2="9" />
+  </svg>
+);
+const IconSpeaker = (props) => (
+  <svg viewBox="0 0 24 24" width="1em" height="1em" {...props}>
+    <polygon points="11,5 6,9 2,9 2,15 6,15 11,19" fill="currentColor" />
+    <path d="M15.54 8.46a5 5 0 0 1 0 7.07" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
+    <path d="M18.07 5.93a9 9 0 0 1 0 12.14" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
+  </svg>
+);
 
 // Maps a browse-by group ("genre", "quality", ...) and its key to the query
 // params /api/tracks/known expects for that group, shared between filtering
@@ -260,8 +298,6 @@ function App() {
   const [destStatus, setDestStatus] = useState(null);
   const destStatusRef = useRef(null);
   const prevOutputDeviceRef = useRef(null);
-  const destAdvancingRef = useRef(false);
-  const destHasStartedRef = useRef(false);
   // True once a Chromecast device has a real multi-item queue loaded (so its
   // own next/prev, including the TV remote's skip buttons, has something to
   // navigate between) - reset whenever the output device changes.
@@ -398,27 +434,22 @@ function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [outputDevice]);
 
-  useEffect(() => {
-    destAdvancingRef.current = false;
-    destHasStartedRef.current = false;
-  }, [nowPlaying]);
-
-  // Poll the device's real playback position so the UI reflects reality and we
-  // can auto-advance the queue near end-of-track (there's no "onEnded" event to
-  // hook into like the local <audio> element has). Two ways this can fire:
-  //  - "near end while still playing" - the common case, but the 2s poll
-  //    interval means a poll can land after the track has *already* stopped on
-  //    its own before ever seeing a "near end" tick, which silently killed
-  //    playback after one track (confirmed empirically: natural end-of-track
-  //    reports transport state STOPPED, i.e. status "stop", not "pause").
-  //  - "stopped on its own" - a fallback that catches exactly that case: if
-  //    we've confirmed the device actually started playing this track and it
-  //    later reports "stop" (not "pause", which is the user's own doing) without
-  //    us having asked for that, the track ended.
+  // Poll the device's real playback position so the UI reflects reality, and
+  // detect track changes the app itself didn't just cause (natural end-of-
+  // track, a device's own remote/app being used directly, or - for WiiM - the
+  // backend's own playback_advancer having auto-advanced the queue while this
+  // tab was asleep). WiiM has no native "what's playing" signal of its own
+  // (see src/wiim.py) and no native advance either, so *driving* advancement
+  // for it now happens entirely server-side (src/playback_advancer.py) - this
+  // effect polls the resulting server-side session instead of the raw device
+  // status, purely to keep the display in sync. Chromecast/Spotify still
+  // self-advance (Chromecast's native queue, Spotify's own queue) and are
+  // only reconciled here, not driven - same as before.
   useEffect(() => {
     if (!outputDevice || !nowPlaying) return;
     const isChromecast = outputDevice.type === 'chromecast';
     const isSpotify = outputDevice.type === 'spotify';
+    const isWiim = outputDevice.type === 'wiim';
     // This whole effect (including the interval below) is torn down and
     // recreated whenever outputDevice/nowPlaying/queue/history change - e.g.
     // the instant a fresh play action sets a new nowPlaying. clearInterval
@@ -431,57 +462,6 @@ function App() {
     // that: set once this effect instance is superseded, checked right after
     // the await, before touching any state.
     let cancelled = false;
-
-    // Spotify (like Chromecast) advances its own queue/context on its own -
-    // same "observe and reconcile, don't drive" shape as reconcileFromContentId
-    // below, but matching directly on the polled track_uri (no id regex needed,
-    // since SpotifyStatus already reports the bare URI).
-    const reconcileFromSpotifyTrackUri = (statusData) => {
-      const trackUri = statusData.track_uri;
-      if (!trackUri || trackUri === lastContentIdRef.current) return;
-      lastContentIdRef.current = trackUri;
-      if (nowPlaying && trackUri === nowPlaying.uri) return;
-
-      const forwardIndex = queue.findIndex((t) => t.uri === trackUri);
-      if (forwardIndex !== -1) {
-        skipNextCastPushRef.current = true;
-        setHistory((h) => [...h, ...(nowPlaying ? [nowPlaying] : []), ...queue.slice(0, forwardIndex)]);
-        setNowPlaying(queue[forwardIndex]);
-        setIsPlaying(true);
-        setQueue((q) => q.slice(forwardIndex + 1));
-        return;
-      }
-
-      const reverseIndex = [...history].reverse().findIndex((t) => t.uri === trackUri);
-      if (reverseIndex !== -1) {
-        const historyIndex = history.length - 1 - reverseIndex;
-        skipNextCastPushRef.current = true;
-        setQueue((q) => [...history.slice(historyIndex + 1), ...(nowPlaying ? [nowPlaying] : []), ...q]);
-        setNowPlaying(history[historyIndex]);
-        setIsPlaying(true);
-        setHistory((h) => h.slice(0, historyIndex));
-        return;
-      }
-
-      // Not in our tracked queue/history - either this is a playlist we can't
-      // read the track listing of (started via playSpotifyContextDirectly, so
-      // there was never a queue to match against) or playback moved somewhere
-      // we didn't queue (e.g. skipped from the Spotify app itself). The status
-      // response already carries enough metadata to display directly.
-      skipNextCastPushRef.current = true;
-      setNowPlaying((prev) => ({
-        id: trackUri,
-        source: 'spotify',
-        uri: trackUri,
-        context_uri: prev?.context_uri ?? null,
-        track_name: statusData.title,
-        artist_name: statusData.artist,
-        album_name: statusData.album,
-        duration_seconds: statusData.duration_ms != null ? statusData.duration_ms / 1000 : null,
-        artwork_url: statusData.artwork_url,
-      }));
-      setIsPlaying(true);
-    };
 
     // Chromecast has a real device-side queue now, so track changes (whether
     // from the TV remote's own skip buttons or the device auto-advancing at
@@ -525,48 +505,83 @@ function App() {
         .catch((err) => console.error('Error fetching track for Chromecast resync:', err));
     };
 
+    // WiiM equivalent of reconcileFromContentId/reconcileFromSpotifyTrackUri,
+    // but diffing against our own backend's playback_session row instead of
+    // a device-reported identity - WiiM's own status has no such signal (see
+    // src/wiim.py), so the backend's playback_advancer is what's now driving
+    // advancement, and this just notices when it has.
+    const reconcileFromServerSession = (session) => {
+      const sessionTrack = session.now_playing;
+      const sessionId = sessionTrack?.id;
+      if (sessionId == null || sessionId === lastContentIdRef.current) return;
+      lastContentIdRef.current = sessionId;
+      if (nowPlaying && sessionId === nowPlaying.id) return;
+
+      const forwardIndex = queue.findIndex((t) => t.id === sessionId);
+      if (forwardIndex !== -1) {
+        skipNextCastPushRef.current = true;
+        setHistory((h) => [...h, ...(nowPlaying ? [nowPlaying] : []), ...queue.slice(0, forwardIndex)]);
+        setNowPlaying(queue[forwardIndex]);
+        setIsPlaying(true);
+        setQueue((q) => q.slice(forwardIndex + 1));
+        return;
+      }
+
+      const reverseIndex = [...history].reverse().findIndex((t) => t.id === sessionId);
+      if (reverseIndex !== -1) {
+        const historyIndex = history.length - 1 - reverseIndex;
+        skipNextCastPushRef.current = true;
+        setQueue((q) => [...history.slice(historyIndex + 1), ...(nowPlaying ? [nowPlaying] : []), ...q]);
+        setNowPlaying(history[historyIndex]);
+        setIsPlaying(true);
+        setHistory((h) => h.slice(0, historyIndex));
+        return;
+      }
+
+      // Not in our tracked queue/history - e.g. this tab just reloaded and
+      // lost its in-memory queue, or the backend advanced further than what
+      // we'd tracked. Trust the session's own track + remaining queue wholesale.
+      skipNextCastPushRef.current = true;
+      setNowPlaying(sessionTrack);
+      setQueue(session.queue || []);
+      setIsPlaying(true);
+    };
+
     const interval = setInterval(async () => {
       try {
+        if (isWiim || isSpotify) {
+          if (isSpotify && nowPlaying.source !== 'spotify') {
+            // nowPlaying hasn't caught up to being Spotify-sourced yet - e.g.
+            // this poll's closure was set up mid-transition, while a local
+            // track was still being matched against Spotify's catalog
+            // (that's async and can take a couple of seconds). There's
+            // nothing meaningful to reconcile against a local track object,
+            // and doing so anyway used to overwrite nowPlaying with whatever
+            // Spotify already happened to be playing - permanently losing
+            // local_id in the process (confirmed live: it broke switching
+            // back to a local destination for that track afterward). Just
+            // skip this tick.
+            return;
+          }
+          const response = await axios.get(`${API_BASE_URL}/playback-session`);
+          if (cancelled) return;
+          if (response.data.last_status) {
+            destStatusRef.current = response.data.last_status;
+            setDestStatus(response.data.last_status);
+          }
+          reconcileFromServerSession(response.data);
+          return;
+        }
+
         const response = await axios.get(`${deviceEndpoint(outputDevice)}/status`);
         if (cancelled) return; // superseded by a newer effect instance while this request was in flight - discard
         destStatusRef.current = response.data;
         setDestStatus(response.data);
-        const { reachable, status: playState, duration_ms: duration, position_ms: position, content_id: contentId } = response.data;
+        const { reachable, content_id: contentId } = response.data;
         if (!reachable) return;
-
-        if (isSpotify && nowPlaying.source !== 'spotify') {
-          // nowPlaying hasn't caught up to being Spotify-sourced yet - e.g.
-          // this poll's closure was set up mid-transition, while a local
-          // track was still being matched against Spotify's catalog (that's
-          // async and can take a couple of seconds). There's nothing
-          // meaningful to reconcile against a local track object, and doing
-          // so anyway used to overwrite nowPlaying with whatever Spotify
-          // already happened to be playing - permanently losing local_id in
-          // the process (confirmed live: it broke switching back to a local
-          // destination for that track afterward). Just skip this tick.
-          return;
-        }
-        if (isSpotify) {
-          reconcileFromSpotifyTrackUri(response.data);
-          return;
-        }
 
         if (isChromecast) {
           reconcileFromContentId(contentId);
-          return;
-        }
-
-        if (destAdvancingRef.current) return;
-        if (playState === 'play') {
-          destHasStartedRef.current = true;
-        }
-
-        const nearEnd = playState === 'play' && duration > 0 && duration - position < 4000;
-        const stoppedOnItsOwn = playState === 'stop' && destHasStartedRef.current;
-
-        if (nearEnd || stoppedOnItsOwn) {
-          destAdvancingRef.current = true;
-          handleNext();
         }
       } catch (err) {
         console.error('Error polling device status:', err);
@@ -595,6 +610,35 @@ function App() {
       shuffleEnabled,
       outputDevice,
     });
+    // Mirrors the same state server-side (playback_session table) so a
+    // background job can keep advancing the queue even once this tab goes
+    // to sleep - see src/playback_advancer.py. "This Browser" playback has
+    // no remote device for a background job to drive, so it just clears the
+    // server-side session instead of syncing one.
+    if (outputDevice) {
+      const payload = {
+        destination_type: outputDevice.type,
+        destination_id: outputDevice.id,
+        now_playing: nowPlaying,
+        queue: queue.slice(0, QUEUE_PERSIST_CAP),
+        shuffle_enabled: shuffleEnabled,
+      };
+      // Only for Spotify, and only the untried remainder - lets
+      // playback_advancer keep searching for a lookahead match after this
+      // tab sleeps, picking up exactly where the last click's search left
+      // off rather than restarting the whole pool.
+      if (outputDevice.type === 'spotify') {
+        const pool = spotifyLookaheadRef.current;
+        if (pool && pool.cursor < pool.candidates.length) {
+          payload.spotify_match_pool = { candidates: pool.candidates, cursor: pool.cursor };
+        }
+      }
+      axios.post(`${API_BASE_URL}/playback-session`, payload)
+        .catch((err) => console.error('Error syncing playback session:', err));
+    } else {
+      axios.post(`${API_BASE_URL}/playback-session`, { destination_type: null }).catch(() => {});
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [nowPlaying, queue, history, shuffleEnabled, outputDevice]);
 
   // Separately snapshot just the playback position on a timer (cheap, small
@@ -645,49 +689,6 @@ function App() {
     const playedId = nowPlaying.local_id ?? nowPlaying.id;
     setPlayedTrackIds((prev) => (prev.has(playedId) ? prev : new Set(prev).add(playedId)));
   }, [nowPlaying]);
-
-  // Bumped after a rate-limited lookahead attempt, purely to retrigger the
-  // refill effect below on a delay (see SPOTIFY_LOOKAHEAD_RETRY_DELAY_MS) -
-  // its value is never read for anything else.
-  const [lookaheadRetryTick, setLookaheadRetryTick] = useState(0);
-
-  // Keeps exactly one Spotify match "ahead" in the queue for an ad-hoc
-  // (non-playlist, non-context_uri) Spotify sequence - local-track click,
-  // Shuffle All, etc. Refills whenever the queue empties: once right after
-  // the first track starts (queue starts empty), and again each time
-  // playback advances into that single buffered track. This is what paces
-  // searches to roughly one per track instead of a burst up front, and what
-  // makes Next/Prev keep working (Spotify's own queue always has one more
-  // item once this lands, via /me/player/queue).
-  useEffect(() => {
-    if (outputDevice?.type !== 'spotify' || !nowPlaying || nowPlaying.source !== 'spotify' || nowPlaying.context_uri) return;
-    if (queue.length > 0) return; // already have a lookahead buffered
-    const pool = spotifyLookaheadRef.current;
-    if (pool.cursor >= pool.candidates.length) return; // nothing left to try
-    const requestId = spotifyMatchRequestIdRef.current;
-    let cancelled = false;
-    let retryTimer = null;
-    (async () => {
-      const { found, rateLimited } = await findNextSpotifyMatch(requestId);
-      if (cancelled || spotifyMatchRequestIdRef.current !== requestId) return;
-      setMatchingTrackId(null);
-      if (!found) {
-        if (rateLimited) {
-          setSpotifyPlayHint("Spotify's search is temporarily rate-limited - try again later.");
-          // Otherwise this permanently stalls Next/Prev for the rest of the
-          // playback session once rate-limited - queue.length stays 0 with
-          // nothing left to retrigger this effect on its own.
-          retryTimer = setTimeout(() => setLookaheadRetryTick((t) => t + 1), SPOTIFY_LOOKAHEAD_RETRY_DELAY_MS);
-        }
-        return;
-      }
-      axios.post(`${deviceEndpoint(outputDevice)}/queue`, { uri: found.uri })
-        .catch((err) => console.error('Error queuing next Spotify track:', err));
-      setQueue((q) => [...q, found]);
-    })();
-    return () => { cancelled = true; if (retryTimer) clearTimeout(retryTimer); };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [outputDevice, nowPlaying, queue.length, lookaheadRetryTick]);
 
   useEffect(() => {
     if (activeTab !== 'library') return;
@@ -1684,7 +1685,7 @@ function App() {
             {drill || libraryMode === 'all' ? (
               <>
                 <div className="library-header">
-                  <h2>{drill ? '' : 'Your Library'}</h2>
+                  <h2>{drill ? '' : `Playing on: ${outputDevice ? outputDevice.name : 'This Browser'}`}</h2>
                   {!drill && libraryTracks.length > 0 && (
                     <div className="group-actions">
                       <button className="group-action-btn" onClick={() => playCurrentFilter()}>&#9654; Play All</button>
@@ -2174,14 +2175,14 @@ function PlayerBar({
                   aria-pressed={shuffleEnabled}
                   title="Shuffle"
                 >
-                  &#128256;
+                  <IconShuffle />
                 </button>
                 <div className="np-transport">
-                  <button className="player-btn large" onClick={onPrev} disabled={!hasPrev} aria-label="Previous">&#9198;</button>
+                  <button className="player-btn large" onClick={onPrev} disabled={!hasPrev} aria-label="Previous"><IconPrev /></button>
                   <button className="player-btn xlarge" onClick={onTogglePlay} aria-label={isPlaying ? 'Pause' : 'Play'}>
-                    {isPlaying ? '❚❚' : '▶'}
+                    {isPlaying ? <IconPause /> : <IconPlay />}
                   </button>
-                  <button className="player-btn large" onClick={onNext} disabled={!hasNext} aria-label="Next">&#9197;</button>
+                  <button className="player-btn large" onClick={onNext} disabled={!hasNext} aria-label="Next"><IconNext /></button>
                 </div>
                 <div className="np-destination">
                   <button
@@ -2190,7 +2191,7 @@ function PlayerBar({
                     aria-label="Playback destination"
                     title={`Playing on ${destinationLabel}`}
                   >
-                    {outputDevice ? deviceIcon(outputDevice) : '🔊'}
+                    <IconSpeaker />
                   </button>
                   {destMenuOpen && (
                     <div className="np-destination-menu">
@@ -2251,13 +2252,13 @@ function PlayerBar({
             aria-pressed={shuffleEnabled}
             title="Shuffle"
           >
-            &#128256;
+            <IconShuffle />
           </button>
-          <button className="player-btn" onClick={onPrev} disabled={!hasPrev} aria-label="Previous">&#9198;</button>
+          <button className="player-btn" onClick={onPrev} disabled={!hasPrev} aria-label="Previous"><IconPrev /></button>
           <button className="player-btn" onClick={onTogglePlay} aria-label={isPlaying ? 'Pause' : 'Play'}>
-            {isPlaying ? '❚❚' : '▶'}
+            {isPlaying ? <IconPause /> : <IconPlay />}
           </button>
-          <button className="player-btn" onClick={onNext} disabled={!hasNext} aria-label="Next">&#9197;</button>
+          <button className="player-btn" onClick={onNext} disabled={!hasNext} aria-label="Next"><IconNext /></button>
           <div className="np-destination">
             <button
               className={`player-btn${outputDevice ? ' active' : ''}`}
@@ -2265,7 +2266,7 @@ function PlayerBar({
               aria-label="Playback destination"
               title={`Playing on ${destinationLabel}`}
             >
-              {outputDevice ? deviceIcon(outputDevice) : '🔊'}
+              <IconSpeaker />
             </button>
             {destMenuOpen && (
               <div className="np-destination-menu">

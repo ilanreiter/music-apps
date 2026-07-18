@@ -1,6 +1,7 @@
 import os
 import psycopg2
 from psycopg2 import Error
+from psycopg2.extras import Json
 
 def get_db_connection():
     """Establishes and returns a database connection."""
@@ -103,6 +104,28 @@ def create_tables():
             """)
             print("Table 'spotify_auth' checked/created successfully.")
 
+            # Server-side mirror of the frontend's queue/nowPlaying/destination
+            # state - single row (id=1), same personal-single-user-tool pattern
+            # as spotify_auth. Exists so a background poller can keep playback
+            # advancing to the next track even when no browser tab is open to
+            # drive it (the frontend's own setInterval-based poll dies the
+            # moment a phone locks or a tab backgrounds).
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS playback_session (
+                    id INTEGER PRIMARY KEY DEFAULT 1,
+                    destination_type TEXT,
+                    destination_id TEXT,
+                    now_playing JSONB,
+                    queue JSONB,
+                    shuffle_enabled BOOLEAN DEFAULT FALSE,
+                    spotify_match_pool JSONB,
+                    chromecast_pushed_count INTEGER,
+                    last_status JSONB,
+                    updated_at TIMESTAMP DEFAULT NOW()
+                );
+            """)
+            print("Table 'playback_session' checked/created successfully.")
+
             conn.commit()
             cur.close()
     except Error as e:
@@ -180,6 +203,124 @@ def clear_spotify_tokens():
         cur.close()
     except Error as e:
         print(f"Error clearing Spotify tokens: {e}")
+    finally:
+        if conn:
+            conn.close()
+
+
+def save_playback_session(destination_type, destination_id, now_playing, queue,
+                           shuffle_enabled=False, spotify_match_pool=None,
+                           chromecast_pushed_count=None, last_status=None):
+    """Upserts the single playback_session row. Callers always pass the full
+    set of fields they want persisted (not a partial patch) - the background
+    advancer reads the row with SELECT ... FOR UPDATE before writing it back,
+    so it always has the current values in hand for whichever fields it isn't
+    actively changing."""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO playback_session (id, destination_type, destination_id, now_playing, queue,
+                                           shuffle_enabled, spotify_match_pool, chromecast_pushed_count,
+                                           last_status, updated_at)
+            VALUES (1, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+            ON CONFLICT (id) DO UPDATE SET
+                destination_type = EXCLUDED.destination_type,
+                destination_id = EXCLUDED.destination_id,
+                now_playing = EXCLUDED.now_playing,
+                queue = EXCLUDED.queue,
+                shuffle_enabled = EXCLUDED.shuffle_enabled,
+                spotify_match_pool = EXCLUDED.spotify_match_pool,
+                chromecast_pushed_count = EXCLUDED.chromecast_pushed_count,
+                last_status = EXCLUDED.last_status,
+                updated_at = NOW()
+        """, (
+            destination_type, destination_id,
+            Json(now_playing) if now_playing is not None else None,
+            Json(queue) if queue is not None else None,
+            shuffle_enabled,
+            Json(spotify_match_pool) if spotify_match_pool is not None else None,
+            chromecast_pushed_count,
+            Json(last_status) if last_status is not None else None,
+        ))
+        conn.commit()
+        cur.close()
+    except Error as e:
+        print(f"Error saving playback session: {e}")
+    finally:
+        if conn:
+            conn.close()
+
+
+def get_playback_session():
+    """Returns the full row as a dict, or None if nothing has ever been saved."""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT destination_type, destination_id, now_playing, queue, shuffle_enabled,
+                   spotify_match_pool, chromecast_pushed_count, last_status, updated_at
+            FROM playback_session WHERE id = 1
+        """)
+        row = cur.fetchone()
+        cur.close()
+        if not row:
+            return None
+        return {
+            'destination_type': row[0], 'destination_id': row[1], 'now_playing': row[2], 'queue': row[3],
+            'shuffle_enabled': row[4], 'spotify_match_pool': row[5], 'chromecast_pushed_count': row[6],
+            'last_status': row[7], 'updated_at': row[8].isoformat() if row[8] else None,
+        }
+    except Error as e:
+        print(f"Error reading playback session: {e}")
+        return None
+    finally:
+        if conn:
+            conn.close()
+
+
+def update_chromecast_pushed_count(count):
+    """Targeted single-column update (not a full save_playback_session upsert)
+    - called right after the interactive Chromecast /play route successfully
+    sends its initial QUEUE_LOAD, so it can't race/clobber the frontend's own
+    concurrent now_playing/queue session sync, which happens around the same
+    moment from the same user action."""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("UPDATE playback_session SET chromecast_pushed_count = %s, updated_at = NOW() WHERE id = 1", (count,))
+        conn.commit()
+        cur.close()
+    except Error as e:
+        print(f"Error updating chromecast_pushed_count: {e}")
+    finally:
+        if conn:
+            conn.close()
+
+
+def clear_playback_session():
+    """Nulls out the active session (destination/now_playing/queue) rather than
+    deleting the row - the background advancer always SELECTs id=1, so keeping
+    a stable (empty) row avoids a "no row to lock yet" edge case on its very
+    next poll tick."""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            UPDATE playback_session SET
+                destination_type = NULL, destination_id = NULL, now_playing = NULL, queue = NULL,
+                shuffle_enabled = FALSE, spotify_match_pool = NULL, chromecast_pushed_count = NULL,
+                last_status = NULL, updated_at = NOW()
+            WHERE id = 1
+        """)
+        conn.commit()
+        cur.close()
+    except Error as e:
+        print(f"Error clearing playback session: {e}")
     finally:
         if conn:
             conn.close()

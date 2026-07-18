@@ -1,10 +1,14 @@
 from fastapi import FastAPI, Depends, HTTPException, Query, status
 from fastapi.responses import FileResponse, RedirectResponse
 from pydantic import BaseModel
-from typing import List, Optional
+from typing import List, Optional, Any, Dict
 import psycopg2
 from psycopg2.extras import RealDictCursor
-from .database import get_db_connection, create_tables
+from .database import (
+    get_db_connection, create_tables,
+    save_playback_session, get_playback_session, clear_playback_session,
+    update_chromecast_pushed_count,
+)
 from .library_scanner import run_scan
 from .artwork import get_or_create_thumbnail, check_artwork_presence, cache_key_for, normalize_album_name, normalized_album_sql, save_thumbnail
 from .artist_info import get_artist_info, get_artist_photo_path
@@ -19,6 +23,7 @@ from . import spotify_connect
 from . import external_artwork
 from . import spotify_prewarm
 from . import tag_cleanup
+from . import playback_advancer
 import google.generativeai as genai
 import logging
 import os
@@ -115,6 +120,10 @@ spotify_prewarm_progress = {"status": "idle"}
 
 tag_cleanup_lock = threading.Lock()
 tag_cleanup_progress = {"status": "idle"}
+
+# Not a one-shot backfill like the jobs above (no lock/trigger-route needed -
+# there's nothing to "start" on demand) - see playback_advancer.run for why.
+playback_advancer_progress = {"status": "idle"}
 
 # Timestamp of the last non-polling request, used by the Spotify pre-warm
 # background job to tell "actively using the app" apart from "idle" so it
@@ -405,6 +414,19 @@ async def startup_event():
             if remaining > 0:
                 print(f"Resuming Spotify pre-warm in the background ({remaining} tracks not yet checked).")
                 _start_spotify_prewarm_background()
+
+    # Unconditional, unlike the backfill jobs above - this is a supervisor
+    # that keeps playback advancing to the next track even once the browser
+    # tab that started it goes to sleep (see playback_advancer.run). Normally
+    # idle-polling with nothing to do until a session is synced via
+    # POST /api/playback-session, so there's no "only start if there's known
+    # work" check to make here.
+    print("Starting playback advancer in the background.")
+    threading.Thread(
+        target=playback_advancer.run,
+        args=(get_playback_session, save_playback_session, playback_advancer_progress),
+        daemon=True,
+    ).start()
 
 @app.get("/")
 async def read_root():
@@ -943,6 +965,12 @@ def chromecast_play(device_id: str, params: ChromecastPlayRequest, db: psycopg2.
 
     if not chromecast.play_queue(device_id, items):
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Could not reach Chromecast device")
+    # Tells playback_advancer how many *upcoming* items (beyond this first
+    # one) are already sitting in the device's native queue, so it knows when
+    # to top it up via queue_insert rather than double-pushing what's already
+    # there. A single-column update (not a full session upsert) so it can't
+    # race the frontend's own now_playing/queue sync from this same action.
+    update_chromecast_pushed_count(len(items) - 1)
     return {"status": "playing"}
 
 @app.post("/api/chromecast/devices/{device_id}/queue-next")
@@ -1225,6 +1253,71 @@ async def get_spotify_prewarm_stats(db: psycopg2.extensions.connection = Depends
     matched = cur.fetchone()[0]
     cur.close()
     return {"total": total, "checked": checked, "matched": matched}
+
+class PlaybackSessionUpdate(BaseModel):
+    # Loosely typed on purpose - track objects already vary by source
+    # (local_id/context_uri/uri are all conditional depending on whether a
+    # track is local, Spotify-matched, or a real Spotify playlist item) and
+    # are already untyped JSON once they hit the frontend's own localStorage
+    # copy. A strict schema here would just be duplicate maintenance for a
+    # personal single-user tool.
+    destination_type: Optional[str] = None
+    destination_id: Optional[str] = None
+    now_playing: Optional[Dict[str, Any]] = None
+    queue: Optional[List[Dict[str, Any]]] = None
+    shuffle_enabled: bool = False
+    # Only ever sent right after a fresh Spotify match attempt (see
+    # matchAndPlayLocalTracksOnSpotify in App.js) - the remaining
+    # not-yet-tried candidate pool for playback_advancer's lookahead refill
+    # to keep working through. Omitted on routine syncs (Next/Prev, a plain
+    # queue reorder), in which case the backend's own tracked pool is kept.
+    spotify_match_pool: Optional[Dict[str, Any]] = None
+
+@app.post("/api/playback-session")
+async def post_playback_session(params: PlaybackSessionUpdate):
+    if not params.destination_type:
+        # Mirrors DELETE - the frontend posts destination_type: null when
+        # switching to "This Browser" (nothing for a background job to drive).
+        clear_playback_session()
+        return {"status": "cleared"}
+    # spotify_match_pool/chromecast_pushed_count/last_status are backend-owned
+    # (written by playback_advancer, not the frontend, except spotify_match_pool
+    # right after a fresh match attempt - see the model field above). Preserve
+    # the backend's own fields across this sync as long as the destination
+    # itself hasn't changed; a full unconditional overwrite here would
+    # otherwise wipe chromecast_pushed_count back to None on every single
+    # queue change, making the advancer think nothing has ever been pushed to
+    # the device's native queue and refill (potentially duplicating) it
+    # unnecessarily.
+    existing = get_playback_session()
+    same_destination = (
+        existing and existing.get('destination_type') == params.destination_type
+        and existing.get('destination_id') == params.destination_id
+    )
+    save_playback_session(
+        destination_type=params.destination_type,
+        destination_id=params.destination_id,
+        now_playing=params.now_playing,
+        queue=params.queue,
+        shuffle_enabled=params.shuffle_enabled,
+        spotify_match_pool=params.spotify_match_pool if params.spotify_match_pool is not None
+            else (existing.get('spotify_match_pool') if same_destination else None),
+        chromecast_pushed_count=existing.get('chromecast_pushed_count') if same_destination else None,
+        last_status=existing.get('last_status') if same_destination else None,
+    )
+    return {"status": "saved"}
+
+@app.get("/api/playback-session")
+async def get_playback_session_route():
+    session = get_playback_session()
+    if not session:
+        return {"destination_type": None}
+    return session
+
+@app.delete("/api/playback-session")
+async def delete_playback_session():
+    clear_playback_session()
+    return {"status": "cleared"}
 
 @app.post("/api/library/scan", response_model=ScanStatus, status_code=status.HTTP_202_ACCEPTED)
 async def scan_library(params: LibraryScanRequest):

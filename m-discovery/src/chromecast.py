@@ -145,6 +145,33 @@ def play_queue(device_id, items):
         return False
 
 
+def queue_insert(device_id, items):
+    """Appends items to the end of the device's already-loaded native queue via
+    a raw QUEUE_INSERT cast message - unlike play_queue's QUEUE_LOAD, this does
+    NOT interrupt/restart what's currently playing. Used by playback_advancer
+    to keep the native queue topped up past CHROMECAST_QUEUE_WINDOW tracks
+    without a full reload."""
+    cast = _get_cast(device_id)
+    if cast is None or not items:
+        return False
+    try:
+        mc = cast.media_controller
+        queue_items = [
+            {'media': _build_media_info(item), 'autoplay': True, 'startTime': 0, 'preloadTime': 0}
+            for item in items
+        ]
+        mc.send_message({
+            'type': 'QUEUE_INSERT',
+            'items': queue_items,
+        }, inc_session_id=True)
+        logger.info("Chromecast %s: QUEUE_INSERT sent, %d item(s)", device_id, len(items))
+        return True
+    except Exception:
+        logger.exception("Chromecast %s: queue_insert (QUEUE_INSERT) failed", device_id)
+        _invalidate(device_id)
+        return False
+
+
 def queue_next(device_id):
     cast = _get_cast(device_id)
     if cast is None:
