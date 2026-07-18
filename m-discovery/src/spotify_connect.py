@@ -1,4 +1,5 @@
 import base64
+import logging
 import os
 import re
 import secrets
@@ -9,6 +10,8 @@ from urllib.parse import quote
 import requests
 
 from . import database
+
+logger = logging.getLogger(__name__)
 
 SPOTIFY_CLIENT_ID = os.environ.get('SPOTIFY_CLIENT_ID')
 SPOTIFY_CLIENT_SECRET = os.environ.get('SPOTIFY_CLIENT_SECRET')
@@ -398,13 +401,41 @@ def get_playlist_tracks(playlist_id):
     return tracks
 
 
+PLAY_URIS_MAX_ATTEMPTS = 3
+PLAY_URIS_CONFIRM_DELAY_SECONDS = 2
+
+
 def play_uris(device_id, uris):
     """Play an explicit ad-hoc list of Spotify track URIs (not a playlist
     context) - used for local-library tracks matched to their Spotify catalog
-    equivalent, since there's no existing Spotify playlist backing them."""
-    _transfer_to_device(device_id)
-    result = _api_request('PUT', '/me/player/play', params={'device_id': device_id}, json_body={'uris': uris})
-    return result is not None
+    equivalent, since there's no existing Spotify playlist backing them.
+
+    Confirmed live on this account's devices: the play command intermittently
+    "takes" (track loads, correct metadata) without actually starting
+    playback - device left paused at position ~0, sometimes needing more than
+    one retry to actually catch. Verified and retried up to
+    PLAY_URIS_MAX_ATTEMPTS times rather than trusting the 200 response alone,
+    since a caller with nobody watching (the background advancer transitioning
+    tracks unattended, which is the whole point of this app not depending on
+    a browser tab) would otherwise leave playback silently stuck paused with
+    no one to notice and press play again."""
+    for attempt in range(1, PLAY_URIS_MAX_ATTEMPTS + 1):
+        _transfer_to_device(device_id)
+        result = _api_request('PUT', '/me/player/play', params={'device_id': device_id}, json_body={'uris': uris})
+        if result is None:
+            logger.warning("play_uris %s: attempt %d/%d - request failed", device_id, attempt, PLAY_URIS_MAX_ATTEMPTS)
+            continue
+        time.sleep(PLAY_URIS_CONFIRM_DELAY_SECONDS)
+        confirm_status = get_status(device_id)
+        if confirm_status and confirm_status.get('status') == 'play':
+            if attempt > 1:
+                logger.info("play_uris %s: confirmed playing on attempt %d/%d", device_id, attempt, PLAY_URIS_MAX_ATTEMPTS)
+            return True
+        logger.warning(
+            "play_uris %s: attempt %d/%d loaded but didn't start (status=%r)",
+            device_id, attempt, PLAY_URIS_MAX_ATTEMPTS, confirm_status and confirm_status.get('status'),
+        )
+    return False
 
 
 def add_to_queue(device_id, uri):

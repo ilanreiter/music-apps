@@ -17,8 +17,15 @@ IDLE_POLL_INTERVAL_SECONDS = 5
 
 # How close to the end of a track counts as "about to finish" - matches the
 # frontend's old nearEnd heuristic (App.js, duration - position < 4000)
-# exactly, so behavior doesn't change, just where it runs.
+# exactly, so behavior doesn't change, just where it runs. Used for WiiM
+# (2s poll interval, comfortably smaller than this window).
 NEAR_END_MS = 4000
+# Spotify polls every 5s (POLL_INTERVAL_SECONDS['spotify']) - a 4000ms window
+# is narrower than that interval, so two consecutive polls could land
+# entirely on either side of it and never see "still playing, near end" at
+# all. Widened past the poll interval so at least one tick reliably lands
+# inside it before the track actually finishes.
+SPOTIFY_NEAR_END_MS = 7000
 
 # Same extension->MIME mapping as main.py's EXTENSION_MIME_TYPES, keyed by the
 # file_format string already present on every synced track object instead of
@@ -206,41 +213,64 @@ def _match_local_track_cached(track_id, track_name, artist_name):
 
 
 def _advance_spotify(save_session, destination_id, now_playing, queue, match_pool):
-    """Reconciles server-side now_playing/queue against Spotify's actual
-    polled track_uri (same shape as the frontend's old
-    reconcileFromSpotifyTrackUri - forward/backward-index match against the
-    tracked queue, or trust the polled metadata directly for anything
-    untracked, e.g. a context_uri playlist naturally advancing or a skip from
-    the real Spotify app). Then, for an ad-hoc (non-context_uri) session only,
-    keeps exactly one match buffered ahead via the paced lookahead search -
-    ported from the frontend's findNextSpotifyMatch/lookahead-refill effect,
-    now running here instead so it survives the tab sleeping. Stops
-    immediately on an 'unavailable' (rate-limited) result rather than trying
-    more candidates - same rule the interactive routes already follow."""
+    """For an ad-hoc (non-context_uri) session with a lookahead track already
+    queued, drives the transition explicitly near end-of-track via play_uris
+    rather than trusting Spotify's own native queue-stepping - confirmed live
+    that Spotify's account-level queue can retain stale entries from much
+    earlier add_to_queue calls that were never consumed (e.g. a session that
+    got interrupted before playing through its lookahead), and a natural
+    advance can jump to one of *those* instead of the track we actually just
+    queued. Same fix already applied to user-driven Next/Prev in the frontend
+    - Spotify's native next/queue-order just isn't trustworthy enough here to
+    rely on passively.
+
+    Falls back to passive reconciliation (matching polled track_uri against
+    the tracked queue, or trusting the polled metadata directly) for anything
+    this doesn't drive: a context_uri playlist naturally advancing, or a
+    genuine skip from the real Spotify app.
+
+    Then, for an ad-hoc session only, keeps exactly one match buffered ahead
+    via the paced lookahead search - ported from the frontend's
+    findNextSpotifyMatch/lookahead-refill effect, now running here instead so
+    it survives the tab sleeping. Stops immediately on an 'unavailable'
+    (rate-limited) result rather than trying more candidates - same rule the
+    interactive routes already follow."""
     result = spotify_connect.get_status(destination_id)
     if result is None:
         return match_pool
     save_session(last_status=result)
 
-    track_uri = result.get('track_uri')
-    current_uri = (now_playing or {}).get('uri')
-    if track_uri and track_uri != current_uri:
-        forward_index = next((i for i, t in enumerate(queue) if t.get('uri') == track_uri), None)
-        if forward_index is not None:
-            now_playing = queue[forward_index]
-            queue = queue[forward_index + 1:]
-        else:
-            now_playing = {
-                'id': track_uri, 'source': 'spotify', 'uri': track_uri,
-                'context_uri': (now_playing or {}).get('context_uri'),
-                'track_name': result.get('title'), 'artist_name': result.get('artist'),
-                'album_name': result.get('album'),
-                'duration_seconds': (result['duration_ms'] / 1000) if result.get('duration_ms') is not None else None,
-                'artwork_url': result.get('artwork_url'),
-            }
-        save_session(now_playing=now_playing, queue=queue)
-
     is_context = bool((now_playing or {}).get('context_uri'))
+    duration = result.get('duration_ms') or 0
+    position = result.get('position_ms') or 0
+    near_end = duration > 0 and (duration - position) < SPOTIFY_NEAR_END_MS
+
+    if not is_context and queue and near_end:
+        next_track = queue[0]
+        queue = queue[1:]
+        spotify_connect.play_uris(destination_id, [next_track['uri']])
+        now_playing = next_track
+        save_session(now_playing=now_playing, queue=queue)
+    else:
+        track_uri = result.get('track_uri')
+        current_uri = (now_playing or {}).get('uri')
+        if track_uri and track_uri != current_uri:
+            forward_index = next((i for i, t in enumerate(queue) if t.get('uri') == track_uri), None)
+            if forward_index is not None:
+                now_playing = queue[forward_index]
+                queue = queue[forward_index + 1:]
+            else:
+                now_playing = {
+                    'id': track_uri, 'source': 'spotify', 'uri': track_uri,
+                    'context_uri': (now_playing or {}).get('context_uri'),
+                    'track_name': result.get('title'), 'artist_name': result.get('artist'),
+                    'album_name': result.get('album'),
+                    'duration_seconds': (result['duration_ms'] / 1000) if result.get('duration_ms') is not None else None,
+                    'artwork_url': result.get('artwork_url'),
+                }
+            save_session(now_playing=now_playing, queue=queue)
+            is_context = bool((now_playing or {}).get('context_uri'))
+
     if is_context or queue or not match_pool:
         return match_pool
 
@@ -299,6 +329,18 @@ def run(get_session, save_session, progress):
             destination_type = session.get('destination_type') if session else None
 
             def _save(**fields):
+                # _advance_X can call this more than once per tick (e.g. a
+                # near-end transition setting now_playing+queue, immediately
+                # followed by the lookahead refill setting queue again on its
+                # own). Merging against the *original* session snapshot on
+                # every call would silently revert whichever fields the
+                # earlier call in this same tick just set but this call
+                # doesn't re-pass - confirmed live: a now_playing set by the
+                # transition got reverted back to the pre-tick track by the
+                # refill's queue-only save moments later, leaving now_playing
+                # and queue both pointing at the same already-consumed track.
+                # Updating `session` in place after every call keeps each
+                # subsequent merge working off the latest state instead.
                 merged = {
                     'destination_type': destination_type,
                     'destination_id': session['destination_id'],
@@ -311,6 +353,7 @@ def run(get_session, save_session, progress):
                 }
                 merged.update(fields)
                 save_session(**merged)
+                session.update(merged)
 
             if destination_type == 'wiim':
                 now_playing = session.get('now_playing') or {}

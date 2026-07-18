@@ -136,11 +136,16 @@ def _is_idle():
 
 @app.middleware("http")
 async def track_activity(request, call_next):
-    # Routine status polling happens every ~2s during any ongoing playback -
-    # counting it as "activity" would mean the pre-warm job could never run
+    # Routine status polling happens every ~2s-5s during any ongoing playback
+    # - counting it as "activity" would mean the pre-warm job could never run
     # during a long listening session, which isn't the intent of "idle".
+    # /api/playback-session is the same kind of routine poll for WiiM/Spotify
+    # sessions (added when advancement moved server-side - see
+    # playback_advancer.py) as the per-device /status routes are for
+    # Chromecast/interactive use, so it's excluded the same way.
     global _last_activity_at
-    if not request.url.path.endswith("/status"):
+    path = request.url.path
+    if not path.endswith("/status") and path != "/api/playback-session":
         _last_activity_at = time.time()
     return await call_next(request)
 
@@ -542,6 +547,38 @@ async def get_known_tracks(
         return {"total": total, "tracks": tracks}
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+class TrackIdsRequest(BaseModel):
+    ids: List[int]
+
+@app.post("/api/tracks/by-ids", response_model=List[Track])
+async def get_tracks_by_ids(params: TrackIdsRequest, db: psycopg2.extensions.connection = Depends(get_db)):
+    # Restores the exact shuffled order the library view persisted (see
+    # LIBRARY_VIEW_KEY in App.js) - a fresh "ORDER BY RANDOM()" fetch on every
+    # reload would roll a brand-new sequence every time, completely
+    # disconnected from whatever's actually still playing (confirmed live:
+    # refreshing mid-shuffle produced a different track list on every single
+    # refresh). POST + JSON body rather than a query string - a full shuffled
+    # library is 10k+ ids, well past URL length limits (confirmed live: a GET
+    # with that many ids 414'd). Response preserves the requested order
+    # (SQL's WHERE id = ANY() doesn't), dropping any that no longer exist
+    # rather than failing the whole request over one bad id.
+    id_list = params.ids
+    if not id_list:
+        return []
+    cur = db.cursor(cursor_factory=RealDictCursor)
+    cur.execute("""
+        SELECT id, track_name, artist_name, album_name, genre, year, duration_seconds,
+               bitrate, sample_rate, channels, file_size_bytes, file_path, artwork_source_url, is_favorite, last_played
+        FROM known_tracks WHERE id = ANY(%s)
+    """, (id_list,))
+    rows_by_id = {row['id']: row for row in cur.fetchall()}
+    cur.close()
+    tracks = [rows_by_id[i] for i in id_list if i in rows_by_id]
+    for track in tracks:
+        file_path = track.pop('file_path', None)
+        track['file_format'] = os.path.splitext(file_path)[1].lstrip('.').upper() if file_path else None
+    return tracks
 
 @app.get("/api/library/groups", response_model=List[GroupEntry])
 async def get_library_groups(

@@ -42,6 +42,8 @@ function mapSpotifyTrack(t) {
 
 const SESSION_KEY = 'md_playback_session_v1';
 const POSITION_KEY = 'md_playback_position_v1';
+const LIBRARY_VIEW_KEY = 'md_library_view_v1';
+const SHUFFLED_IDS_KEY = 'md_library_shuffle_order_v1';
 const QUEUE_PERSIST_CAP = 200;
 const HISTORY_PERSIST_CAP = 50;
 const CHROMECAST_QUEUE_WINDOW = 30;
@@ -159,6 +161,50 @@ function loadPosition() {
   }
 }
 
+// Same lazy-cached-once pattern as loadSession above, for the same reason -
+// several useState initializers below each need a piece of this.
+let _cachedLibraryView;
+function loadLibraryView() {
+  if (_cachedLibraryView !== undefined) return _cachedLibraryView;
+  try {
+    const raw = localStorage.getItem(LIBRARY_VIEW_KEY);
+    _cachedLibraryView = raw ? JSON.parse(raw) : null;
+  } catch {
+    _cachedLibraryView = null;
+  }
+  return _cachedLibraryView;
+}
+
+function saveLibraryView(view) {
+  try {
+    localStorage.setItem(LIBRARY_VIEW_KEY, JSON.stringify(view));
+  } catch {
+    /* localStorage unavailable - filters just won't survive a reload this time */
+  }
+}
+
+// Separate key from LIBRARY_VIEW_KEY (not folded into the same blob) since
+// this can hold thousands of ids for an unfiltered shuffle, while the view/
+// filters blob above should stay small and cheap to parse on every load.
+function loadShuffledIds() {
+  try {
+    const raw = localStorage.getItem(SHUFFLED_IDS_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch {
+    return null;
+  }
+}
+
+function saveShuffledIds(ids) {
+  try {
+    localStorage.setItem(SHUFFLED_IDS_KEY, JSON.stringify(ids));
+  } catch {
+    // Quota exceeded on a very large library - the next reload just falls
+    // back to a fresh shuffle instead of the exact prior order.
+    try { localStorage.removeItem(SHUFFLED_IDS_KEY); } catch { /* ignore */ }
+  }
+}
+
 function saveSession(session) {
   try {
     localStorage.setItem(SESSION_KEY, JSON.stringify(session));
@@ -192,7 +238,7 @@ function App() {
 
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
-  const [activeTab, setActiveTab] = useState('library');
+  const [activeTab, setActiveTab] = useState(() => loadLibraryView()?.activeTab ?? 'library');
   const [settingsOpen, setSettingsOpen] = useState(false);
 
   const [rootPath, setRootPath] = useState('');
@@ -204,8 +250,11 @@ function App() {
   const pollRef = useRef(null);
 
   // Library browsing: flat search/filter or grouped-by-album/genre/decade/... with drill-down
-  const [libraryMode, setLibraryMode] = useState('all');
-  const [drill, setDrill] = useState(null); // { by, key, label } once a group is opened
+  // - restored from localStorage so a reload or reopened tab returns to the
+  // same view/filters instead of resetting to the defaults every time
+  // (same "resume where you left off" treatment already given to playback).
+  const [libraryMode, setLibraryMode] = useState(() => loadLibraryView()?.libraryMode ?? 'all');
+  const [drill, setDrill] = useState(() => loadLibraryView()?.drill ?? null); // { by, key, label } once a group is opened
   // Briefly shown when a track's source (local vs. Spotify) doesn't match
   // the current output destination - null when hidden, a message when shown.
   const [spotifyPlayHint, setSpotifyPlayHint] = useState(null);
@@ -223,19 +272,19 @@ function App() {
   // persisted, not reset between queues.
   const [playedTrackIds, setPlayedTrackIds] = useState(() => new Set());
   const [skippedTrackIds, setSkippedTrackIds] = useState(() => new Set());
-  const [searchInput, setSearchInput] = useState('');
-  const [search, setSearch] = useState('');
-  const [filterGenre, setFilterGenre] = useState('');
-  const [filterDecade, setFilterDecade] = useState('');
+  const [searchInput, setSearchInput] = useState(() => loadLibraryView()?.search ?? '');
+  const [search, setSearch] = useState(() => loadLibraryView()?.search ?? '');
+  const [filterGenre, setFilterGenre] = useState(() => loadLibraryView()?.filterGenre ?? '');
+  const [filterDecade, setFilterDecade] = useState(() => loadLibraryView()?.filterDecade ?? '');
   // Defaults to deduping same-song duplicate rips down to the best copy - see
   // the "Best Quality Only" <option> below and the `quality=best` handling in
   // /api/tracks/known.
-  const [filterQuality, setFilterQuality] = useState('best');
-  const [filterFormat, setFilterFormat] = useState('');
+  const [filterQuality, setFilterQuality] = useState(() => loadLibraryView()?.filterQuality ?? 'best');
+  const [filterFormat, setFilterFormat] = useState(() => loadLibraryView()?.filterFormat ?? '');
   // Restricts to tracks that already have a cached Spotify match, so Shuffle
   // All/Play All can be tested without any live search - isolates playback
   // bugs from the currently-active Spotify search rate limit.
-  const [filterSpotifyAvailable, setFilterSpotifyAvailable] = useState(false);
+  const [filterSpotifyAvailable, setFilterSpotifyAvailable] = useState(() => loadLibraryView()?.filterSpotifyAvailable ?? false);
   const [genreOptions, setGenreOptions] = useState([]);
   const [decadeOptions, setDecadeOptions] = useState([]);
   const [qualityOptions, setQualityOptions] = useState([]);
@@ -248,7 +297,20 @@ function App() {
   // "Shuffle All" toggle: while on, the flat library list itself is fetched
   // and displayed in the same shuffled order that got queued for playback,
   // instead of the default alphabetical browse order.
-  const [libraryShuffleOn, setLibraryShuffleOn] = useState(false);
+  const [libraryShuffleOn, setLibraryShuffleOn] = useState(() => loadLibraryView()?.libraryShuffleOn ?? false);
+  // Tracks the last filter/mode/drill/search combo the library-fetch effect
+  // below actually fetched for, so it can tell "a filter genuinely changed"
+  // apart from "activeTab just flipped back to library" - see that effect.
+  const libraryFetchKeyRef = useRef(null);
+  // True only when libraryShuffleOn was restored from a prior session (not a
+  // fresh toggle click) - the very first fetch after a reload should show
+  // the deterministic list, not roll a brand-new random order that's
+  // immediately disconnected from whatever's actually still playing
+  // (confirmed live: refreshing mid-shuffle produced a completely different
+  // track list every single time, since "shuffle" always re-randomizes from
+  // scratch and only the on/off *preference* was ever persisted, never a
+  // specific order).
+  const skipInitialShuffleFetchRef = useRef(loadLibraryView()?.libraryShuffleOn === true);
   const [trackViewStyle, setTrackViewStyle] = useState(() => {
     try {
       return localStorage.getItem('md_track_view_style') || 'list';
@@ -553,10 +615,18 @@ function App() {
       // the whole point of running that search server-side. Without this,
       // Next/Prev stay disabled until the current track naturally ends, since
       // nothing else here reacts to the queue's *contents* changing on their
-      // own. Only adopt when ours is still empty, so a queue the user has
-      // since reordered/extended locally isn't stomped.
-      if (queue.length === 0 && (session.queue || []).length > 0) {
-        setQueue(session.queue);
+      // own. Compares by id rather than gating on "only when ours is empty" -
+      // that gate meant a queue that was non-empty but *stale* (e.g. this tab
+      // carrying forward corrupted state from before a backend fix landed)
+      // could never self-correct, since it's never empty. The backend fully
+      // owns ad-hoc Spotify/WiiM queue contents once a session is active, so
+      // trusting it whenever it actually differs is correct, not just when
+      // ours happens to be empty.
+      const sessionQueue = session.queue || [];
+      const queueMatches = queue.length === sessionQueue.length
+        && queue.every((t, i) => t.id === sessionQueue[i]?.id);
+      if (!queueMatches) {
+        setQueue(sessionQueue);
       }
     };
 
@@ -612,6 +682,24 @@ function App() {
     }
   }, [trackViewStyle]);
 
+  // Persist the active tab/library view/filters, same "resume where you left
+  // off" treatment as the playback session below - a reload or reopened tab
+  // returns to the same browsing state instead of resetting every time.
+  useEffect(() => {
+    saveLibraryView({
+      activeTab,
+      libraryMode,
+      drill,
+      search,
+      filterGenre,
+      filterDecade,
+      filterQuality,
+      filterFormat,
+      filterSpotifyAvailable,
+      libraryShuffleOn,
+    });
+  }, [activeTab, libraryMode, drill, search, filterGenre, filterDecade, filterQuality, filterFormat, filterSpotifyAvailable, libraryShuffleOn]);
+
   // Persist the playback session (queue/history capped, so a mutation never
   // costs a multi-MB localStorage write) so a reload or reopened tab returns
   // to what was playing.
@@ -636,15 +724,19 @@ function App() {
         queue: queue.slice(0, QUEUE_PERSIST_CAP),
         shuffle_enabled: shuffleEnabled,
       };
-      // Only for Spotify, and only the untried remainder - lets
-      // playback_advancer keep searching for a lookahead match after this
-      // tab sleeps, picking up exactly where the last click's search left
-      // off rather than restarting the whole pool.
-      if (outputDevice.type === 'spotify') {
+      // Only right after a fresh match attempt (matchAndPlayLocalTracksOnSpotify
+      // sets spotifyMatchPoolDirtyRef), and only the untried remainder - lets
+      // playback_advancer keep searching for a lookahead match after this tab
+      // sleeps, picking up where the last click's search left off. Gated on
+      // the dirty flag (not sent on every sync) so this tab's now-stale local
+      // snapshot can't keep overwriting the server's own further progress
+      // once the backend has moved the cursor on - see the ref's comment.
+      if (outputDevice.type === 'spotify' && spotifyMatchPoolDirtyRef.current) {
         const pool = spotifyLookaheadRef.current;
         if (pool && pool.cursor < pool.candidates.length) {
           payload.spotify_match_pool = { candidates: pool.candidates, cursor: pool.cursor };
         }
+        spotifyMatchPoolDirtyRef.current = false;
       }
       axios.post(`${API_BASE_URL}/playback-session`, payload)
         .catch((err) => console.error('Error syncing playback session:', err));
@@ -705,6 +797,19 @@ function App() {
 
   useEffect(() => {
     if (activeTab !== 'library') return;
+    // activeTab has to be a dependency so this runs on first arrival at the
+    // tab, but that means it *also* re-fires on every later re-arrival (e.g.
+    // Cleanup and back) even though nothing filter-related changed - which
+    // used to re-shuffle the displayed order every time, decoupling it from
+    // whatever's actually playing (confirmed live: navigating away and back
+    // reshuffled the list while playback stayed on the original order).
+    // Skip the refetch when only activeTab changed - re-entering the tab
+    // should show whatever was already there, not roll a new order.
+    const key = JSON.stringify([libraryMode, drill, search, filterGenre, filterDecade, filterQuality, filterFormat, filterSpotifyAvailable]);
+    if (key === libraryFetchKeyRef.current) return;
+    libraryFetchKeyRef.current = key;
+    const skipInitialShuffleFetch = skipInitialShuffleFetchRef.current;
+    skipInitialShuffleFetchRef.current = false;
     // Spotify playlists aren't in known_tracks - can't reuse the SQL-backed
     // /api/tracks/known / /api/library/groups fetches below at all.
     if (libraryMode === 'playlist') {
@@ -715,8 +820,19 @@ function App() {
       // If Shuffle All is already on, a filter change re-shuffles the new
       // matching set rather than silently reverting to alphabetical order.
       // The Shuffle All toggle itself is handled directly in its own click
-      // handler (not here), so it isn't a dependency of this effect.
-      if (libraryShuffleOn) fetchLibraryTracksShuffled(); else fetchLibraryTracks(0);
+      // handler (not here), so it isn't a dependency of this effect. Except
+      // right after a reload restored libraryShuffleOn=true - that first
+      // fetch restores the exact persisted shuffle order instead of rolling
+      // a fresh one, so it matches whatever's still playing.
+      if (libraryShuffleOn && skipInitialShuffleFetch) {
+        const persistedIds = loadShuffledIds();
+        if (persistedIds && persistedIds.length) fetchLibraryTracksByIds(persistedIds);
+        else fetchLibraryTracksShuffled();
+      } else if (libraryShuffleOn) {
+        fetchLibraryTracksShuffled();
+      } else {
+        fetchLibraryTracks(0);
+      }
     } else {
       fetchGroups();
     }
@@ -808,9 +924,32 @@ function App() {
       const tracks = await fetchAllMatchingShuffled(buildTrackFilterParams());
       setLibraryTotal(tracks.length);
       setLibraryTracks(tracks);
+      // So a reload can restore this exact order via fetchLibraryTracksByIds
+      // below instead of rolling a brand-new random sequence every time.
+      saveShuffledIds(tracks.map((t) => t.id));
       return tracks;
     } catch (err) {
       console.error('Error fetching shuffled tracks:', err);
+      return [];
+    } finally {
+      setLibraryLoading(false);
+    }
+  };
+
+  // Restores the exact shuffled order from a prior session (see
+  // saveShuffledIds above) rather than generating a fresh random one -
+  // confirmed live this was needed: refreshing mid-shuffle used to produce a
+  // completely different track list on every single reload, decoupled from
+  // whatever was actually still playing.
+  const fetchLibraryTracksByIds = async (ids) => {
+    setLibraryLoading(true);
+    try {
+      const response = await axios.post(`${API_BASE_URL}/tracks/by-ids`, { ids });
+      setLibraryTotal(response.data.length);
+      setLibraryTracks(response.data);
+      return response.data;
+    } catch (err) {
+      console.error('Error restoring shuffled tracks by id:', err);
       return [];
     } finally {
       setLibraryLoading(false);
@@ -1047,6 +1186,16 @@ function App() {
   // refill continues from wherever the initial search left off instead of
   // re-trying already-skipped candidates.
   const spotifyLookaheadRef = useRef({ candidates: [], cursor: 0 });
+  // Set right when a fresh match attempt starts, cleared right after the
+  // session-sync effect actually sends spotify_match_pool once. Without this,
+  // that effect (which fires on every nowPlaying/queue change - including
+  // ones the *backend* advancer causes, via the reconcile poll) would keep
+  // re-sending this tab's now-stale spotifyLookaheadRef snapshot on every
+  // routine sync, repeatedly stomping the server's own further-advanced
+  // cursor back down to wherever this tab's last click left it - confirmed
+  // live: the pool cursor kept resetting and the same already-played track
+  // got matched and queued again, looking like playback going "back" a track.
+  const spotifyMatchPoolDirtyRef = useRef(false);
 
   // Searches spotifyLookaheadRef's candidates one at a time (never a batch -
   // confirmed live that a burst of 50 searches up front is both slow and a
@@ -1102,6 +1251,7 @@ function App() {
     destNeedsInitialCastRef.current = false;
     const requestId = ++spotifyMatchRequestIdRef.current;
     spotifyLookaheadRef.current = { candidates: tracks, cursor: 0 };
+    spotifyMatchPoolDirtyRef.current = true;
     try {
       const { found, rateLimited } = await findNextSpotifyMatch(requestId);
       if (spotifyMatchRequestIdRef.current !== requestId) return; // superseded by a newer click
