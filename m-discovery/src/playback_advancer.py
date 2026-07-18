@@ -196,13 +196,13 @@ def _match_local_track_cached(track_id, track_name, artist_name):
 
         if match:
             spotify_id = match['uri'].split(':')[-1]
-            native_track_name = match.get('native_track_name')
-            native_artist_name = match.get('native_artist_name')
-            if native_track_name and native_artist_name:
-                # Matched via the YouTube Music bridge - correct the local
-                # tags to the native title/artist that actually worked, same
-                # reversible pattern as tag_cleanup.py (see main.py's
-                # _match_track_to_spotify for the fuller explanation).
+            spotify_track_name = match.get('track_name')
+            spotify_artist_name = match.get('artist_name')
+            if spotify_track_name and spotify_artist_name and (spotify_track_name != track_name or spotify_artist_name != artist_name):
+                # Spotify's own title/artist differs from the local tag -
+                # correct it, same reversible pattern as tag_cleanup.py (see
+                # main.py's _match_track_to_spotify for the fuller
+                # explanation).
                 cur.execute(
                     """UPDATE known_tracks SET
                         track_name = %s, artist_name = %s,
@@ -210,7 +210,7 @@ def _match_local_track_cached(track_id, track_name, artist_name):
                         original_artist_name = COALESCE(original_artist_name, artist_name),
                         spotify_track_id = %s, spotify_url = %s, spotify_album_art_url = %s, spotify_checked = TRUE
                     WHERE id = %s""",
-                    (native_track_name, native_artist_name, spotify_id,
+                    (spotify_track_name, spotify_artist_name, spotify_id,
                      f"https://open.spotify.com/track/{spotify_id}", match['artwork_url'], track_id),
                 )
             else:
@@ -300,6 +300,17 @@ def _advance_spotify(save_session, destination_id, now_playing, queue, match_poo
         cursor += 1
         match_result = _match_local_track_cached(candidate.get('id'), candidate.get('track_name'), candidate.get('artist_name'))
         if match_result.get('reason') == 'unavailable':
+            # Leave the cursor pointing at this same candidate rather than
+            # past it - confirmed live: a rate-limited stretch mid-session
+            # permanently orphaned whatever candidate was current at the
+            # time, since cursor had already advanced before the rate-limit
+            # was discovered, and cursor only ever moves forward. This
+            # candidate genuinely wasn't checked (spotify_checked stays
+            # False), so it should get a real retry once the block clears,
+            # not be skipped forever. Safe to retry every tick now that
+            # spotify_connect's cooldown makes a still-blocked retry free
+            # (no real API call) instead of hammering the same 429.
+            cursor -= 1
             break
         if match_result.get('matched'):
             found = {

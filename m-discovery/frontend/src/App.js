@@ -1248,6 +1248,12 @@ function App() {
           return { found: mapMatchedLocalTrack(candidate, { uri, artwork_url: artworkUrl }), rateLimited: false };
         }
         if (reason === 'unavailable') {
+          // Leave the cursor pointing at this same candidate rather than past
+          // it - it genuinely wasn't checked (a rate-limit, not a real
+          // no-match), so it should get a real retry next time instead of
+          // being silently skipped forever (same fix as
+          // playback_advancer._advance_spotify's identical loop).
+          pool.cursor -= 1;
           return { found: null, rateLimited: true };
         }
         setSkippedTrackIds((prev) => (prev.has(candidate.id) ? prev : new Set(prev).add(candidate.id)));

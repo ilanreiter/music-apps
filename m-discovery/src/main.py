@@ -1237,17 +1237,17 @@ def _match_track_to_spotify(db, track_id):
 
     if match:
         spotify_id = match['uri'].split(':')[-1]
-        native_track_name = match.get('native_track_name')
-        native_artist_name = match.get('native_artist_name')
-        if native_track_name and native_artist_name:
-            # Matched via the YouTube Music bridge - the local tags were an
-            # English transliteration that could never match Spotify's own
-            # native-script catalog entry on their own (see
-            # spotify_connect._bridge_via_ytmusic). Correct them to the
-            # title/artist that actually worked, same reversible pattern
-            # tag_cleanup.py uses - COALESCE so a track already corrected
-            # once (e.g. by tag_cleanup) keeps its true original tag rather
-            # than this overwriting it with an intermediate value.
+        spotify_track_name = match.get('track_name')
+        spotify_artist_name = match.get('artist_name')
+        if spotify_track_name and spotify_artist_name and (spotify_track_name != track_name or spotify_artist_name != artist_name):
+            # Spotify's own title/artist for the matched track differs from
+            # the local tag - could be a translated title recovered via the
+            # YouTube Music bridge, or just a "(Remastered)" suffix/
+            # capitalization difference on an otherwise-direct match. Correct
+            # the local tag to match, same reversible pattern tag_cleanup.py
+            # uses - COALESCE so a track already corrected once (e.g. by
+            # tag_cleanup) keeps its true original tag rather than this
+            # overwriting it with an intermediate value.
             cur.execute(
                 """UPDATE known_tracks SET
                     track_name = %s, artist_name = %s,
@@ -1255,7 +1255,7 @@ def _match_track_to_spotify(db, track_id):
                     original_artist_name = COALESCE(original_artist_name, artist_name),
                     spotify_track_id = %s, spotify_url = %s, spotify_album_art_url = %s, spotify_checked = TRUE
                 WHERE id = %s""",
-                (native_track_name, native_artist_name, spotify_id,
+                (spotify_track_name, spotify_artist_name, spotify_id,
                  f"https://open.spotify.com/track/{spotify_id}", match['artwork_url'], track_id),
             )
         else:

@@ -138,7 +138,18 @@ def disconnect():
     database.clear_spotify_tokens()
 
 
+# Set whenever /search comes back 429'd, to the real (uncapped) Retry-After -
+# confirmed live this can be ~56 minutes, not the few seconds the quick retry
+# below waits. _search_and_score checks this before making a call at all, so
+# a caller stuck retrying the same still-blocked candidate every poll tick
+# (see playback_advancer._advance_spotify) doesn't re-hit the API - and
+# re-poking Spotify during its own penalty window is a real risk of making
+# the block worse, not just wasted effort.
+_search_blocked_until = 0.0
+
+
 def _api_request(method, path, params=None, json_body=None, retried=False):
+    global _search_blocked_until
     token = _get_valid_access_token()
     if not token:
         return None
@@ -154,10 +165,15 @@ def _api_request(method, path, params=None, json_body=None, retried=False):
     except Exception:
         return None
 
-    if response.status_code == 429 and not retried:
-        wait = min(int(response.headers.get('Retry-After', 1)), RATE_LIMIT_RETRY_CAP_SECONDS)
-        time.sleep(wait)
-        return _api_request(method, path, params=params, json_body=json_body, retried=True)
+    if response.status_code == 429:
+        retry_after = int(response.headers.get('Retry-After', 1))
+        if path == '/search':
+            _search_blocked_until = time.time() + retry_after
+        if not retried:
+            wait = min(retry_after, RATE_LIMIT_RETRY_CAP_SECONDS)
+            time.sleep(wait)
+            return _api_request(method, path, params=params, json_body=json_body, retried=True)
+        return None
 
     if response.status_code == 204 or response.status_code == 202:
         return {}
@@ -487,7 +503,16 @@ def _search_and_score(track_name, artist_name):
     transaction search_track wraps, extracted so the YouTube Music bridge
     below can reuse it for a second attempt without duplicating the scoring
     logic. Returns ('ok', match_or_None) on a completed search, or
-    ('unavailable', None) if the API call itself failed (rate-limited etc)."""
+    ('unavailable', None) if the API call itself failed (rate-limited etc).
+
+    The match dict carries Spotify's own title/artist for the matched item
+    (as 'track_name'/'artist_name'), not just the uri - callers use this to
+    correct the local track's tags to what Spotify actually calls it, which
+    can differ from the local tag even on a successful match (capitalization,
+    "(Remastered ...)" suffixes, a translated title via the YouTube Music
+    bridge below, etc.)."""
+    if time.time() < _search_blocked_until:
+        return 'unavailable', None
     query = f'track:{track_name} artist:{artist_name}'
     data = _api_request('GET', '/search', params={'q': query, 'type': 'track', 'limit': 5})
     if data is None:
@@ -499,15 +524,20 @@ def _search_and_score(track_name, artist_name):
         item_artists = ', '.join(a['name'] for a in item.get('artists', []))
         score = (_similar(track_name, item['name']) + _similar(artist_name, item_artists)) / 2
         if score >= MATCH_THRESHOLD:
-            candidates.append(item)
+            candidates.append((item, item_artists))
 
     if not candidates:
         return 'ok', None
 
-    best = min(candidates, key=_release_date_key)
+    best, best_artists = min(candidates, key=lambda c: _release_date_key(c[0]))
     album = best.get('album') or {}
     images = album.get('images') or []
-    return 'ok', {'uri': best['uri'], 'artwork_url': images[0]['url'] if images else None}
+    return 'ok', {
+        'uri': best['uri'],
+        'artwork_url': images[0]['url'] if images else None,
+        'track_name': best['name'],
+        'artist_name': best_artists,
+    }
 
 
 # Unauthenticated instance - search-only usage needs no login. Cheap to
@@ -566,11 +596,10 @@ def search_track(track_name, artist_name):
     retry), so it only fires when the direct attempt actually completed with
     no result, never on top of an already-rate-limited response.
 
-    A match found via the bridge carries the native title/artist that
-    actually worked as 'native_track_name'/'native_artist_name' - callers use
-    this to correct the local track's own tags (it was an English
-    transliteration that could never have matched Spotify's native-script
-    catalog entry on its own), not just to cache the Spotify id."""
+    Every match (direct or bridged) carries Spotify's own title/artist as
+    'track_name'/'artist_name' - see _search_and_score. Callers use this to
+    correct the local track's own tags to what Spotify actually calls it,
+    not just to cache the Spotify id."""
     result, match = _search_and_score(track_name, artist_name)
     if result == 'unavailable' or match:
         return result, match
@@ -582,8 +611,4 @@ def search_track(track_name, artist_name):
     if _similar(artist_name, native_artist) < MATCH_THRESHOLD:
         return 'ok', None
 
-    result, match = _search_and_score(native_title, native_artist)
-    if match:
-        match['native_track_name'] = native_title
-        match['native_artist_name'] = native_artist
-    return result, match
+    return _search_and_score(native_title, native_artist)

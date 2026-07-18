@@ -80,14 +80,14 @@ def run(get_connection, progress, is_idle):
                 cur = conn.cursor()
                 if match:
                     spotify_id = match['uri'].split(':')[-1]
-                    native_track_name = match.get('native_track_name')
-                    native_artist_name = match.get('native_artist_name')
-                    if native_track_name and native_artist_name:
-                        # Matched via the YouTube Music bridge - correct the
-                        # local tags to the native title/artist that actually
-                        # worked, same reversible pattern as tag_cleanup.py
-                        # (see main.py's _match_track_to_spotify for the fuller
-                        # explanation - this mirrors it for the background job).
+                    spotify_track_name = match.get('track_name')
+                    spotify_artist_name = match.get('artist_name')
+                    if spotify_track_name and spotify_artist_name and (spotify_track_name != track_name or spotify_artist_name != artist_name):
+                        # Spotify's own title/artist differs from the local
+                        # tag - correct it, same reversible pattern as
+                        # tag_cleanup.py (see main.py's _match_track_to_spotify
+                        # for the fuller explanation - this mirrors it for the
+                        # background job).
                         cur.execute("""
                             UPDATE known_tracks SET
                                 track_name = %s, artist_name = %s,
@@ -95,7 +95,7 @@ def run(get_connection, progress, is_idle):
                                 original_artist_name = COALESCE(original_artist_name, artist_name),
                                 spotify_track_id = %s, spotify_url = %s, spotify_album_art_url = %s, spotify_checked = TRUE
                             WHERE id = %s
-                        """, (native_track_name, native_artist_name, spotify_id,
+                        """, (spotify_track_name, spotify_artist_name, spotify_id,
                               f"https://open.spotify.com/track/{spotify_id}", match['artwork_url'], track_id))
                     else:
                         cur.execute("""
