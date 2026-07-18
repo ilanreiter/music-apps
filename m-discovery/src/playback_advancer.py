@@ -196,10 +196,28 @@ def _match_local_track_cached(track_id, track_name, artist_name):
 
         if match:
             spotify_id = match['uri'].split(':')[-1]
-            cur.execute(
-                "UPDATE known_tracks SET spotify_track_id = %s, spotify_url = %s, spotify_album_art_url = %s, spotify_checked = TRUE WHERE id = %s",
-                (spotify_id, f"https://open.spotify.com/track/{spotify_id}", match['artwork_url'], track_id),
-            )
+            native_track_name = match.get('native_track_name')
+            native_artist_name = match.get('native_artist_name')
+            if native_track_name and native_artist_name:
+                # Matched via the YouTube Music bridge - correct the local
+                # tags to the native title/artist that actually worked, same
+                # reversible pattern as tag_cleanup.py (see main.py's
+                # _match_track_to_spotify for the fuller explanation).
+                cur.execute(
+                    """UPDATE known_tracks SET
+                        track_name = %s, artist_name = %s,
+                        original_track_name = COALESCE(original_track_name, track_name),
+                        original_artist_name = COALESCE(original_artist_name, artist_name),
+                        spotify_track_id = %s, spotify_url = %s, spotify_album_art_url = %s, spotify_checked = TRUE
+                    WHERE id = %s""",
+                    (native_track_name, native_artist_name, spotify_id,
+                     f"https://open.spotify.com/track/{spotify_id}", match['artwork_url'], track_id),
+                )
+            else:
+                cur.execute(
+                    "UPDATE known_tracks SET spotify_track_id = %s, spotify_url = %s, spotify_album_art_url = %s, spotify_checked = TRUE WHERE id = %s",
+                    (spotify_id, f"https://open.spotify.com/track/{spotify_id}", match['artwork_url'], track_id),
+                )
         else:
             cur.execute("UPDATE known_tracks SET spotify_checked = TRUE WHERE id = %s", (track_id,))
         conn.commit()

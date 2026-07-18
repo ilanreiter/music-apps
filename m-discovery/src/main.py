@@ -142,10 +142,22 @@ async def track_activity(request, call_next):
     # /api/playback-session is the same kind of routine poll for WiiM/Spotify
     # sessions (added when advancement moved server-side - see
     # playback_advancer.py) as the per-device /status routes are for
-    # Chromecast/interactive use, so it's excluded the same way.
+    # Chromecast/interactive use, so it's excluded the same way. The frontend
+    # also polls device-picker lists and library group counts every ~90-100s
+    # regardless of whether the user is actively doing anything - confirmed
+    # live: this alone kept resetting the idle clock just under the 120s
+    # threshold, so the prewarm job's idle window almost never opened
+    # (11 hours uptime, 1 track processed). Excluded the same way.
     global _last_activity_at
     path = request.url.path
-    if not path.endswith("/status") and path != "/api/playback-session":
+    routine_poll_paths = {
+        "/api/playback-session",
+        "/api/wiim/devices",
+        "/api/spotify/devices",
+        "/api/chromecast/devices",
+        "/api/library/groups",
+    }
+    if not path.endswith("/status") and path not in routine_poll_paths:
         _last_activity_at = time.time()
     return await call_next(request)
 
@@ -1225,10 +1237,32 @@ def _match_track_to_spotify(db, track_id):
 
     if match:
         spotify_id = match['uri'].split(':')[-1]
-        cur.execute(
-            "UPDATE known_tracks SET spotify_track_id = %s, spotify_url = %s, spotify_album_art_url = %s, spotify_checked = TRUE WHERE id = %s",
-            (spotify_id, f"https://open.spotify.com/track/{spotify_id}", match['artwork_url'], track_id),
-        )
+        native_track_name = match.get('native_track_name')
+        native_artist_name = match.get('native_artist_name')
+        if native_track_name and native_artist_name:
+            # Matched via the YouTube Music bridge - the local tags were an
+            # English transliteration that could never match Spotify's own
+            # native-script catalog entry on their own (see
+            # spotify_connect._bridge_via_ytmusic). Correct them to the
+            # title/artist that actually worked, same reversible pattern
+            # tag_cleanup.py uses - COALESCE so a track already corrected
+            # once (e.g. by tag_cleanup) keeps its true original tag rather
+            # than this overwriting it with an intermediate value.
+            cur.execute(
+                """UPDATE known_tracks SET
+                    track_name = %s, artist_name = %s,
+                    original_track_name = COALESCE(original_track_name, track_name),
+                    original_artist_name = COALESCE(original_artist_name, artist_name),
+                    spotify_track_id = %s, spotify_url = %s, spotify_album_art_url = %s, spotify_checked = TRUE
+                WHERE id = %s""",
+                (native_track_name, native_artist_name, spotify_id,
+                 f"https://open.spotify.com/track/{spotify_id}", match['artwork_url'], track_id),
+            )
+        else:
+            cur.execute(
+                "UPDATE known_tracks SET spotify_track_id = %s, spotify_url = %s, spotify_album_art_url = %s, spotify_checked = TRUE WHERE id = %s",
+                (spotify_id, f"https://open.spotify.com/track/{spotify_id}", match['artwork_url'], track_id),
+            )
     else:
         cur.execute("UPDATE known_tracks SET spotify_checked = TRUE WHERE id = %s", (track_id,))
     db.commit()

@@ -6,3 +6,4 @@ mutagen
 Pillow
 requests
 PyChromecast>=13.0.0,<14
+ytmusicapi

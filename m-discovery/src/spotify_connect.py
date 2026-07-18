@@ -8,6 +8,7 @@ from difflib import SequenceMatcher
 from urllib.parse import quote
 
 import requests
+from ytmusicapi import YTMusic
 
 from . import database
 
@@ -453,9 +454,16 @@ MATCH_THRESHOLD = 0.72
 
 
 def _normalize(text):
+    # [^a-z0-9]+ used to strip *any* non-ASCII character - not just
+    # punctuation, but every Hebrew/Cyrillic/CJK/accented-Latin letter too,
+    # collapsing e.g. a Hebrew title to an empty string. _similar() then
+    # short-circuits to 0.0 whenever either side is empty, so two identical
+    # Hebrew titles compared against each other still scored zero (confirmed
+    # live). \w is Unicode-aware by default in Python 3's re module, so this
+    # keeps letters from any script while still stripping real punctuation.
     if not text:
         return ''
-    return re.sub(r'[^a-z0-9]+', ' ', text.lower()).strip()
+    return re.sub(r'[^\w]+', ' ', text.lower()).strip()
 
 
 def _similar(a, b):
@@ -474,15 +482,12 @@ def _release_date_key(item):
     return release_date if len(release_date) == 10 else release_date + '~'
 
 
-def search_track(track_name, artist_name):
-    """Best-matching Spotify catalog track for a local (track_name, artist_name)
-    pair. Returns a ('ok', match_or_None) tuple when the search actually
-    completed (match is None if nothing cleared MATCH_THRESHOLD), or
-    ('unavailable', None) if the API call itself failed - e.g. rate-limited,
-    which this app hits hard (a single test call got a ~10h Retry-After).
-    Callers must not treat 'unavailable' as a real "no match" answer, since
-    that would permanently cache a wrong result for what was really just a
-    transient failure - only 'ok' should ever be persisted."""
+def _search_and_score(track_name, artist_name):
+    """One /search call plus local similarity scoring - the single Spotify
+    transaction search_track wraps, extracted so the YouTube Music bridge
+    below can reuse it for a second attempt without duplicating the scoring
+    logic. Returns ('ok', match_or_None) on a completed search, or
+    ('unavailable', None) if the API call itself failed (rate-limited etc)."""
     query = f'track:{track_name} artist:{artist_name}'
     data = _api_request('GET', '/search', params={'q': query, 'type': 'track', 'limit': 5})
     if data is None:
@@ -503,3 +508,82 @@ def search_track(track_name, artist_name):
     album = best.get('album') or {}
     images = album.get('images') or []
     return 'ok', {'uri': best['uri'], 'artwork_url': images[0]['url'] if images else None}
+
+
+# Unauthenticated instance - search-only usage needs no login. Cheap to
+# construct (no network/file I/O - confirmed live), so a module-level
+# singleton is fine.
+_ytmusic = YTMusic()
+
+
+def _bridge_via_ytmusic(track_name, artist_name):
+    """A local track tagged with an English transliteration of a non-Latin
+    original (confirmed live: several Hebrew tracks tagged in English never
+    matched Spotify's own Hebrew-script titles, even after fixing _normalize
+    to be Unicode-aware) will never match via a plain-text Spotify search,
+    since the catalog entry's title is in a different script entirely.
+    YouTube Music's own search reliably resolves the same English query to
+    the native-script title/artist - bridges the gap with no translation API
+    key needed. ytmusicapi is unofficial/reverse-engineered (no auth
+    required for search, but no stability guarantee either) - any failure
+    here is treated as "no bridge available", not a hard error, since this
+    is only ever an opportunistic second attempt, never a required step.
+
+    Returns (native_title, native_artist) or None. This is *not* validated
+    against the original query - ytmusicapi's top result isn't always the
+    right song (confirmed live: one query returned a same-titled cover by a
+    completely different artist) - search_track checks the returned artist
+    against the original before trusting the title."""
+    try:
+        results = _ytmusic.search(f'{track_name} {artist_name}', filter='songs')
+    except Exception:
+        return None
+    if not results:
+        return None
+    top = results[0]
+    native_title = top.get('title')
+    artists = top.get('artists') or []
+    native_artist = artists[0]['name'] if artists else None
+    if not native_title or not native_artist:
+        return None
+    return native_title, native_artist
+
+
+def search_track(track_name, artist_name):
+    """Best-matching Spotify catalog track for a local (track_name, artist_name)
+    pair. Returns a ('ok', match_or_None) tuple when the search actually
+    completed (match is None if nothing cleared MATCH_THRESHOLD, even after
+    the YouTube Music bridge below), or ('unavailable', None) if the direct
+    API call itself failed - e.g. rate-limited, which this app hits hard (a
+    single test call got a ~10h Retry-After). Callers must not treat
+    'unavailable' as a real "no match" answer, since that would permanently
+    cache a wrong result for what was really just a transient failure - only
+    'ok' should ever be persisted.
+
+    On a genuine no-match (not a rate-limit), tries the YouTube Music bridge
+    once before giving up - see _bridge_via_ytmusic. This doubles the worst
+    case Spotify call volume for a miss (one direct attempt, one bridged
+    retry), so it only fires when the direct attempt actually completed with
+    no result, never on top of an already-rate-limited response.
+
+    A match found via the bridge carries the native title/artist that
+    actually worked as 'native_track_name'/'native_artist_name' - callers use
+    this to correct the local track's own tags (it was an English
+    transliteration that could never have matched Spotify's native-script
+    catalog entry on its own), not just to cache the Spotify id."""
+    result, match = _search_and_score(track_name, artist_name)
+    if result == 'unavailable' or match:
+        return result, match
+
+    bridged = _bridge_via_ytmusic(track_name, artist_name)
+    if not bridged:
+        return 'ok', None
+    native_title, native_artist = bridged
+    if _similar(artist_name, native_artist) < MATCH_THRESHOLD:
+        return 'ok', None
+
+    result, match = _search_and_score(native_title, native_artist)
+    if match:
+        match['native_track_name'] = native_title
+        match['native_artist_name'] = native_artist
+    return result, match

@@ -878,16 +878,14 @@ function App() {
     return params;
   };
 
-  // 'best' is the default quality filter (dedup to the best copy of each
-  // track), not a user-applied filter, so it doesn't count as "active".
-  const hasActiveFilters = !!(filterGenre || filterDecade || (filterQuality && filterQuality !== 'best') || filterFormat || filterSpotifyAvailable);
-
-  const clearFilters = () => {
+  const clearAllFilters = () => {
     setFilterGenre('');
     setFilterDecade('');
     setFilterQuality('best');
     setFilterFormat('');
     setFilterSpotifyAvailable(false);
+    setSearchInput('');
+    setSearch('');
   };
 
   const buildTrackFilterParams = () => {
@@ -1828,9 +1826,7 @@ function App() {
                   />
                   Available on Spotify
                 </label>
-                {hasActiveFilters && (
-                  <button className="clear-filters-btn" onClick={clearFilters}>Clear Filters</button>
-                )}
+                <button className="clear-filters-btn" onClick={clearAllFilters}>Clear All</button>
               </div>
             </div>
 
