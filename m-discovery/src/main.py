@@ -1214,7 +1214,7 @@ def _match_track_to_spotify(db, track_id):
     SpotifyMatchResult, or None if track_id doesn't exist in known_tracks."""
     cur = db.cursor()
     cur.execute(
-        "SELECT track_name, artist_name, spotify_track_id, spotify_checked, spotify_album_art_url "
+        "SELECT track_name, artist_name, spotify_track_id, spotify_checked, spotify_album_art_url, file_path "
         "FROM known_tracks WHERE id = %s",
         (track_id,),
     )
@@ -1222,7 +1222,7 @@ def _match_track_to_spotify(db, track_id):
     if not row:
         cur.close()
         return None
-    track_name, artist_name, cached_id, checked, cached_art = row
+    track_name, artist_name, cached_id, checked, cached_art, file_path = row
 
     if checked:
         cur.close()
@@ -1230,7 +1230,24 @@ def _match_track_to_spotify(db, track_id):
             return {"matched": False, "reason": "no_match"}
         return {"matched": True, "uri": f"spotify:track:{cached_id}", "artwork_url": cached_art}
 
-    result, match = spotify_connect.search_track(track_name, artist_name)
+    result, match, identified = spotify_connect.search_track(track_name, artist_name, file_path=file_path)
+    if identified:
+        # Persist Shazam's identification independent of whatever Spotify's
+        # own outcome is - a correct name + ISRC is useful even when Spotify
+        # can't be checked right now (rate-limited) or doesn't have this
+        # recording in its catalog at all (confirmed live: both happen).
+        cur.execute(
+            """UPDATE known_tracks SET
+                track_name = %s, artist_name = %s,
+                original_track_name = COALESCE(original_track_name, track_name),
+                original_artist_name = COALESCE(original_artist_name, artist_name),
+                isrc = %s
+            WHERE id = %s""",
+            (identified['track_name'], identified['artist_name'], identified['isrc'], track_id),
+        )
+        db.commit()
+        track_name, artist_name = identified['track_name'], identified['artist_name']
+
     if result == 'unavailable':
         cur.close()
         return {"matched": False, "reason": "unavailable"}

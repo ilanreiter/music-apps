@@ -8,8 +8,14 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Install postgresql-client for pg_isready
-RUN apt-get update && apt-get install -y postgresql-client && rm -rf /var/lib/apt/lists/*
+# Install postgresql-client for pg_isready, ffmpeg for shazamio's audio decoding
+RUN apt-get update && apt-get install -y postgresql-client ffmpeg python3-venv && rm -rf /var/lib/apt/lists/*
+
+# shazamio hard-pins pydantic<2.0, which conflicts with FastAPI's pydantic>=2.7
+# requirement in the main app - isolated in its own venv and invoked via
+# subprocess (see spotify_connect.py's _recognize_via_shazam_audio) so it
+# can't destabilize every Pydantic-based request/response model here.
+RUN python3 -m venv /opt/shazam-venv && /opt/shazam-venv/bin/pip install --no-cache-dir shazamio
 
 # Copy the rest of the application code
 COPY . .

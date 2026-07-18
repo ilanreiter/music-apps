@@ -1,8 +1,10 @@
 import base64
+import json
 import logging
 import os
 import re
 import secrets
+import subprocess
 import time
 from difflib import SequenceMatcher
 from urllib.parse import quote
@@ -489,6 +491,36 @@ def _similar(a, b):
     return SequenceMatcher(None, a, b).ratio()
 
 
+def _tokens_contained(needle_tokens, haystack_tokens):
+    if not needle_tokens or not haystack_tokens or len(needle_tokens) > len(haystack_tokens):
+        return False
+    span = len(needle_tokens)
+    return any(
+        haystack_tokens[i:i + span] == needle_tokens
+        for i in range(len(haystack_tokens) - span + 1)
+    )
+
+
+def _artist_guard_passes(local_artist, bridged_artist):
+    """True if bridged_artist is a plausible match for local_artist - either
+    by overall similarity, or because one name is a contiguous run of words
+    inside the other. The word-containment check catches a duet/cover where
+    both performers got concatenated into one local tag (confirmed live:
+    "Arkadi Duchin Vladimir Visotsky" locally vs. the bridge naming just
+    "Arkadi Duchin" - clearly the right person, but scores low on straight
+    similarity since half the local string doesn't appear in it at all).
+    Whole-word containment (not a raw substring check) avoids a short name
+    spuriously matching inside an unrelated longer one (e.g. "Ari" inside
+    "Mariah") - a genuinely different artist won't share a word run either
+    way (confirmed live: "Guy Davidov & Izhar Cohen" vs "Ehud Manor" shares
+    nothing and correctly still fails this)."""
+    if _similar(local_artist, bridged_artist) >= MATCH_THRESHOLD:
+        return True
+    local_tokens = _normalize(local_artist).split()
+    bridged_tokens = _normalize(bridged_artist).split()
+    return _tokens_contained(bridged_tokens, local_tokens) or _tokens_contained(local_tokens, bridged_tokens)
+
+
 def _release_date_key(item):
     """Sort key that puts the earliest, most-precise release first. A missing
     or year-only date sorts last within its precision tier, since "1965"
@@ -579,36 +611,236 @@ def _bridge_via_ytmusic(track_name, artist_name):
     return native_title, native_artist
 
 
-def search_track(track_name, artist_name):
+SHAZAM_RAPIDAPI_KEY = os.environ.get('SHAZAM_RAPIDAPI_KEY')
+SHAZAM_RAPIDAPI_HOST = 'shazam-core.p.rapidapi.com'
+# The free tier of this RapidAPI-hosted service is genuinely flaky - confirmed
+# live: the identical query returned a real result, then a 404 "Object not
+# found" seconds later, then real data again on a third try. Not a rate limit
+# (no 429, no Retry-After) and not query-content-specific (plain ASCII queries
+# hit it too) - just has to be retried through.
+SHAZAM_CORE_MAX_ATTEMPTS = 4
+SHAZAM_CORE_RETRY_DELAY_SECONDS = 2
+
+
+def _search_shazam_core(query):
+    """Text search against Shazam's own catalog (Apple Music-backed) via the
+    Shazam Core RapidAPI listing - a maintained, paid-hosting-backed wrapper,
+    not a raw reverse-engineered scrape like the YouTube Music bridge above.
+    Confirmed live this finds tracks neither direct Spotify search nor the
+    YouTube Music bridge can (e.g. a track whose local tags are a bogus
+    placeholder like "Track 09" would never work as a query anyway, but for
+    tracks with real - if English-transliterated or slightly-off - tags, this
+    catalog has meaningfully broader coverage). Each result already carries
+    an ISRC directly, no separate track-detail lookup needed.
+
+    Returns a list of {'name', 'artist_name', 'isrc', 'duration_ms'} dicts
+    (possibly empty), or None if not configured / persistently failing."""
+    if not SHAZAM_RAPIDAPI_KEY:
+        return None
+    headers = {'X-RapidAPI-Key': SHAZAM_RAPIDAPI_KEY, 'X-RapidAPI-Host': SHAZAM_RAPIDAPI_HOST}
+    for attempt in range(1, SHAZAM_CORE_MAX_ATTEMPTS + 1):
+        try:
+            response = requests.get(
+                f'https://{SHAZAM_RAPIDAPI_HOST}/v1/search/multi',
+                headers=headers, params={'search_type': 'SONGS', 'query': query}, timeout=REQUEST_TIMEOUT,
+            )
+        except Exception:
+            response = None
+        if response is not None and response.ok:
+            items = response.json().get('data') or []
+            results = []
+            for item in items:
+                attrs = item.get('attributes') or {}
+                if not attrs.get('name') or not attrs.get('artistName') or not attrs.get('isrc'):
+                    continue
+                results.append({
+                    'name': attrs['name'], 'artist_name': attrs['artistName'],
+                    'isrc': attrs['isrc'], 'duration_ms': attrs.get('durationInMillis'),
+                })
+            return results
+        if attempt < SHAZAM_CORE_MAX_ATTEMPTS:
+            time.sleep(SHAZAM_CORE_RETRY_DELAY_SECONDS)
+    return None
+
+
+def _bridge_via_shazam_core(track_name, artist_name):
+    """Searches Shazam's catalog and picks the best-scoring candidate, same
+    title+artist averaged-similarity scoring _search_and_score uses - Shazam
+    Core can return several same-artist candidates for one query (confirmed
+    live: a search for one song returned 4 different tracks by the right
+    artist), so picking blindly by rank risks a right-artist-wrong-song match
+    the way a pure artist-only guard would.
+
+    Returns the winning candidate dict ({'name', 'artist_name', 'isrc',
+    'duration_ms'}), or None. The full candidate is returned (not just the
+    ISRC) so callers can persist Shazam's own title/artist even if Spotify
+    itself never confirms the match - a correct name and a real ISRC are
+    useful on their own, not just as an intermediate Spotify lookup key."""
+    results = _search_shazam_core(f'{track_name} {artist_name}')
+    if not results:
+        return None
+    scored = []
+    for r in results:
+        score = (_similar(track_name, r['name']) + _similar(artist_name, r['artist_name'])) / 2
+        if score >= MATCH_THRESHOLD:
+            scored.append((score, r))
+    if not scored:
+        return None
+    return max(scored, key=lambda s: s[0])[1]
+
+
+def _search_by_isrc(isrc):
+    """Exact Spotify lookup by ISRC - unlike a text search, this can't
+    silently pick a wrong-but-similar-looking track, so no similarity
+    threshold is applied to the result. Returns ('unavailable', None) if
+    blocked/rate-limited (this ISRC genuinely hasn't been checked - caller
+    must not treat that as a confirmed absence), or ('ok', match_or_None) -
+    match is None if this app's catalog access doesn't have it (confirmed
+    live: happens even for an ISRC Shazam correctly reports - not every
+    regional recording is available everywhere)."""
+    if time.time() < _search_blocked_until:
+        return 'unavailable', None
+    data = _api_request('GET', '/search', params={'q': f'isrc:{isrc}', 'type': 'track', 'limit': 1})
+    if data is None:
+        return 'unavailable', None
+    items = (data.get('tracks') or {}).get('items') or []
+    if not items:
+        return 'ok', None
+    best = items[0]
+    album = best.get('album') or {}
+    images = album.get('images') or []
+    return 'ok', {
+        'uri': best['uri'],
+        'artwork_url': images[0]['url'] if images else None,
+        'track_name': best['name'],
+        'artist_name': ', '.join(a['name'] for a in best.get('artists', [])),
+    }
+
+
+SHAZAM_AUDIO_VENV_PYTHON = '/opt/shazam-venv/bin/python3'
+SHAZAM_AUDIO_WORKER_PATH = '/app/shazam_worker.py'
+SHAZAM_AUDIO_TIMEOUT_SECONDS = 30
+
+
+def _recognize_via_shazam_audio(file_path):
+    """Identifies a local file from its actual audio content via Shazam's
+    fingerprint recognition, run in a dedicated subprocess/venv - shazamio
+    hard-pins pydantic<2.0, which directly conflicts with FastAPI's
+    pydantic>=2.7 requirement in this same app, so it can't be imported
+    in-process without breaking every Pydantic-based request/response model
+    here. Isolating it in its own venv (see Dockerfile) keeps this app's own
+    dependencies untouched.
+
+    Confirmed live this recognizes tracks no text-based method can even
+    attempt - a local tag of "Track 09" or a corrupted/garbled title has
+    nothing for a text search to work with, but audio recognition doesn't
+    need tag text at all. Also confirmed live: real coverage gaps exist even
+    for correctly-produced regional content (2 of 10 random Hebrew test
+    tracks came back unrecognized), so this is a genuine "maybe," not
+    "almost always" - and the most expensive fallback here, since it
+    requires actually decoding the audio, not just a text query.
+
+    Returns (title, artist) or None (no match, no worker/venv, or timeout -
+    treated as opportunistic, same as every other bridge above)."""
+    try:
+        result = subprocess.run(
+            [SHAZAM_AUDIO_VENV_PYTHON, SHAZAM_AUDIO_WORKER_PATH, file_path],
+            capture_output=True, text=True, timeout=SHAZAM_AUDIO_TIMEOUT_SECONDS,
+        )
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    try:
+        data = json.loads(result.stdout)
+    except ValueError:
+        return None
+    title, artist = data.get('title'), data.get('artist')
+    if not title or not artist:
+        return None
+    return title, artist
+
+
+def search_track(track_name, artist_name, file_path=None):
     """Best-matching Spotify catalog track for a local (track_name, artist_name)
     pair. Returns a ('ok', match_or_None) tuple when the search actually
     completed (match is None if nothing cleared MATCH_THRESHOLD, even after
-    the YouTube Music bridge below), or ('unavailable', None) if the direct
-    API call itself failed - e.g. rate-limited, which this app hits hard (a
-    single test call got a ~10h Retry-After). Callers must not treat
-    'unavailable' as a real "no match" answer, since that would permanently
-    cache a wrong result for what was really just a transient failure - only
-    'ok' should ever be persisted.
+    every fallback below), or ('unavailable', None) if the direct API call
+    itself failed - e.g. rate-limited, which this app hits hard (a single
+    test call got a ~10h Retry-After, another got ~20h). Callers must not
+    treat 'unavailable' as a real "no match" answer, since that would
+    permanently cache a wrong result for what was really just a transient
+    failure - only 'ok' should ever be persisted.
 
-    On a genuine no-match (not a rate-limit), tries the YouTube Music bridge
-    once before giving up - see _bridge_via_ytmusic. This doubles the worst
-    case Spotify call volume for a miss (one direct attempt, one bridged
-    retry), so it only fires when the direct attempt actually completed with
-    no result, never on top of an already-rate-limited response.
+    On a genuine no-match (not a rate-limit), tries progressively more
+    expensive fallbacks before giving up: the YouTube Music bridge, then
+    Shazam's text-search catalog, then (only if file_path is given) Shazam's
+    audio-fingerprint recognition on the actual local file - confirmed live
+    these last two catch real cases the first two miss (a badly garbled or
+    placeholder-only local tag has nothing for a text search to work with at
+    all, but audio recognition doesn't need tag text). Each extra fallback
+    costs more (an extra search call, or real audio decoding for the last
+    one), so they're only ever tried after the cheaper ones actually miss,
+    never stacked on top of an already-rate-limited response.
 
     Every match (direct or bridged) carries Spotify's own title/artist as
     'track_name'/'artist_name' - see _search_and_score. Callers use this to
     correct the local track's own tags to what Spotify actually calls it,
-    not just to cache the Spotify id."""
+    not just to cache the Spotify id.
+
+    Returns a third value, identified: a {'track_name', 'artist_name',
+    'isrc'} dict whenever Shazam (text search or audio recognition)
+    confidently identified the track, regardless of whether the Spotify step
+    that follows actually found or could even check a match - Spotify's own
+    catalog gaps and this app's own rate-limit history (a ~20h lockout, live
+    this session) mean a real identification is often the best information
+    available even when Spotify never confirms it. None when no Shazam
+    fallback ran or none of them found a confident candidate. Callers should
+    persist this independently of whatever the Spotify match/result says.
+
+    Crucially, a blocked Spotify search does NOT stop the non-Spotify
+    fallbacks (YouTube Music, Shazam) from running - they don't share
+    Spotify's rate limit at all, so an identification is still worth finding
+    and persisting even while Spotify itself can't be checked right now.
+    'unavailable' is only returned at the very end, and only if no match was
+    found anywhere AND at least one Spotify-facing call was actually
+    blocked - a real "not on Spotify" answer (every Spotify call completed,
+    just found nothing) still returns 'ok' so callers can cache it."""
+    identified = None
+    blocked = False
+
     result, match = _search_and_score(track_name, artist_name)
-    if result == 'unavailable' or match:
-        return result, match
+    if match:
+        return 'ok', match, identified
+    blocked = blocked or result == 'unavailable'
 
     bridged = _bridge_via_ytmusic(track_name, artist_name)
-    if not bridged:
-        return 'ok', None
-    native_title, native_artist = bridged
-    if _similar(artist_name, native_artist) < MATCH_THRESHOLD:
-        return 'ok', None
+    if bridged:
+        native_title, native_artist = bridged
+        if _artist_guard_passes(artist_name, native_artist):
+            result, match = _search_and_score(native_title, native_artist)
+            if match:
+                return 'ok', match, identified
+            blocked = blocked or result == 'unavailable'
 
-    return _search_and_score(native_title, native_artist)
+    shazam_hit = _bridge_via_shazam_core(track_name, artist_name)
+    if shazam_hit:
+        identified = {'track_name': shazam_hit['name'], 'artist_name': shazam_hit['artist_name'], 'isrc': shazam_hit['isrc']}
+        result, match = _search_by_isrc(shazam_hit['isrc'])
+        if match:
+            return 'ok', match, identified
+        blocked = blocked or result == 'unavailable'
+
+    if file_path and not identified:
+        recognized = _recognize_via_shazam_audio(file_path)
+        if recognized:
+            audio_title, audio_artist = recognized
+            shazam_hit = _bridge_via_shazam_core(audio_title, audio_artist)
+            if shazam_hit:
+                identified = {'track_name': shazam_hit['name'], 'artist_name': shazam_hit['artist_name'], 'isrc': shazam_hit['isrc']}
+                result, match = _search_by_isrc(shazam_hit['isrc'])
+                if match:
+                    return 'ok', match, identified
+                blocked = blocked or result == 'unavailable'
+
+    return ('unavailable' if blocked else 'ok'), None, identified

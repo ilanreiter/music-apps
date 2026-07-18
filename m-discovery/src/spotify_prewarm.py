@@ -61,15 +61,32 @@ def run(get_connection, progress, is_idle):
         try:
             for _ in range(BATCH_SIZE):
                 cur = conn.cursor()
-                cur.execute("SELECT id, track_name, artist_name FROM known_tracks WHERE spotify_checked IS NOT TRUE LIMIT 1")
+                cur.execute("SELECT id, track_name, artist_name, file_path FROM known_tracks WHERE spotify_checked IS NOT TRUE LIMIT 1")
                 row = cur.fetchone()
                 cur.close()
                 if row is None:
                     done = True
                     break
 
-                track_id, track_name, artist_name = row
-                result, match = spotify_connect.search_track(track_name, artist_name)
+                track_id, track_name, artist_name, file_path = row
+                result, match, identified = spotify_connect.search_track(track_name, artist_name, file_path=file_path)
+                if identified:
+                    # Persist Shazam's identification independent of whatever
+                    # Spotify's own outcome is - see main.py's
+                    # _match_track_to_spotify for the fuller explanation.
+                    cur = conn.cursor()
+                    cur.execute("""
+                        UPDATE known_tracks SET
+                            track_name = %s, artist_name = %s,
+                            original_track_name = COALESCE(original_track_name, track_name),
+                            original_artist_name = COALESCE(original_artist_name, artist_name),
+                            isrc = %s
+                        WHERE id = %s
+                    """, (identified['track_name'], identified['artist_name'], identified['isrc'], track_id))
+                    conn.commit()
+                    cur.close()
+                    track_name, artist_name = identified['track_name'], identified['artist_name']
+
                 if result == 'unavailable':
                     # Genuinely rate-limited (not just "no match") - stop this
                     # batch early rather than burning through the rest of it
