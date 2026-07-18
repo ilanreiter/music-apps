@@ -513,38 +513,51 @@ function App() {
     const reconcileFromServerSession = (session) => {
       const sessionTrack = session.now_playing;
       const sessionId = sessionTrack?.id;
-      if (sessionId == null || sessionId === lastContentIdRef.current) return;
-      lastContentIdRef.current = sessionId;
-      if (nowPlaying && sessionId === nowPlaying.id) return;
+      const trackChanged = sessionId != null && sessionId !== lastContentIdRef.current;
+      if (trackChanged) lastContentIdRef.current = sessionId;
 
-      const forwardIndex = queue.findIndex((t) => t.id === sessionId);
-      if (forwardIndex !== -1) {
+      if (trackChanged && !(nowPlaying && sessionId === nowPlaying.id)) {
+        const forwardIndex = queue.findIndex((t) => t.id === sessionId);
+        if (forwardIndex !== -1) {
+          skipNextCastPushRef.current = true;
+          setHistory((h) => [...h, ...(nowPlaying ? [nowPlaying] : []), ...queue.slice(0, forwardIndex)]);
+          setNowPlaying(queue[forwardIndex]);
+          setIsPlaying(true);
+          setQueue((q) => q.slice(forwardIndex + 1));
+          return;
+        }
+
+        const reverseIndex = [...history].reverse().findIndex((t) => t.id === sessionId);
+        if (reverseIndex !== -1) {
+          const historyIndex = history.length - 1 - reverseIndex;
+          skipNextCastPushRef.current = true;
+          setQueue((q) => [...history.slice(historyIndex + 1), ...(nowPlaying ? [nowPlaying] : []), ...q]);
+          setNowPlaying(history[historyIndex]);
+          setIsPlaying(true);
+          setHistory((h) => h.slice(0, historyIndex));
+          return;
+        }
+
+        // Not in our tracked queue/history - e.g. this tab just reloaded and
+        // lost its in-memory queue, or the backend advanced further than we'd
+        // tracked. Trust the session's own track + remaining queue wholesale.
         skipNextCastPushRef.current = true;
-        setHistory((h) => [...h, ...(nowPlaying ? [nowPlaying] : []), ...queue.slice(0, forwardIndex)]);
-        setNowPlaying(queue[forwardIndex]);
+        setNowPlaying(sessionTrack);
+        setQueue(session.queue || []);
         setIsPlaying(true);
-        setQueue((q) => q.slice(forwardIndex + 1));
         return;
       }
 
-      const reverseIndex = [...history].reverse().findIndex((t) => t.id === sessionId);
-      if (reverseIndex !== -1) {
-        const historyIndex = history.length - 1 - reverseIndex;
-        skipNextCastPushRef.current = true;
-        setQueue((q) => [...history.slice(historyIndex + 1), ...(nowPlaying ? [nowPlaying] : []), ...q]);
-        setNowPlaying(history[historyIndex]);
-        setIsPlaying(true);
-        setHistory((h) => h.slice(0, historyIndex));
-        return;
+      // now_playing itself hasn't changed, but the backend may have found and
+      // queued a lookahead match *while the current track is still playing* -
+      // the whole point of running that search server-side. Without this,
+      // Next/Prev stay disabled until the current track naturally ends, since
+      // nothing else here reacts to the queue's *contents* changing on their
+      // own. Only adopt when ours is still empty, so a queue the user has
+      // since reordered/extended locally isn't stomped.
+      if (queue.length === 0 && (session.queue || []).length > 0) {
+        setQueue(session.queue);
       }
-
-      // Not in our tracked queue/history - e.g. this tab just reloaded and
-      // lost its in-memory queue, or the backend advanced further than what
-      // we'd tracked. Trust the session's own track + remaining queue wholesale.
-      skipNextCastPushRef.current = true;
-      setNowPlaying(sessionTrack);
-      setQueue(session.queue || []);
-      setIsPlaying(true);
     };
 
     const interval = setInterval(async () => {
