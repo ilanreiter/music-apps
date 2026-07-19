@@ -33,8 +33,13 @@ API_BASE_URL = 'https://api.spotify.com/v1'
 REQUEST_TIMEOUT = 10
 
 # Connect (device discovery/control) + currently-playing polling + reading
-# the user's own playlists - nothing that touches library modification.
-SCOPES = 'user-read-playback-state user-modify-playback-state user-read-currently-playing playlist-read-private playlist-read-collaborative'
+# the user's own playlists, plus creating/editing playlists this app itself
+# creates (playlist-modify-private - see create_playlist/add_tracks_to_playlist,
+# used for "push this shuffled list to Spotify"). Existing connections were
+# authorized before this scope was added, so they won't have it - Spotify
+# scopes are fixed at authorization time, so a reconnect (disconnect then
+# connect again in Settings) is required to pick up the new permission.
+SCOPES = 'user-read-playback-state user-modify-playback-state user-read-currently-playing playlist-read-private playlist-read-collaborative playlist-modify-private'
 
 # A short Retry-After is a normal transient burst limit worth one retry; this
 # runs inline within a web request (unlike the old bulk-enrichment job), so a
@@ -418,6 +423,47 @@ def get_playlist_tracks(playlist_id):
             'artwork_url': images[0]['url'] if images else None,
         })
     return tracks
+
+
+PLAYLIST_ADD_BATCH_SIZE = 100  # Spotify's own per-request cap on POST .../tracks
+
+
+def create_playlist(name, description=None):
+    """Creates a new private playlist in the connected account. Private
+    (not public) by default - this app has no reason to publish anything to
+    the account's public profile on its own. Returns {'id', 'url'}, or None
+    if not connected, this scope isn't authorized yet (see SCOPES above), or
+    the call otherwise fails.
+
+    POST /me/playlists, not POST /users/{user_id}/playlists - confirmed live
+    the latter now returns a bare 403 for every caller regardless of scope
+    or app configuration (this app's registration was fine; the endpoint
+    itself moved). /me/playlists needs no separate /me lookup first either,
+    since it creates directly under the authenticated account."""
+    body = {'name': name, 'public': False}
+    if description:
+        body['description'] = description
+    data = _api_request('POST', '/me/playlists', json_body=body)
+    if data is None or not data.get('id'):
+        return None
+    return {'id': data['id'], 'url': (data.get('external_urls') or {}).get('spotify')}
+
+
+def add_tracks_to_playlist(playlist_id, uris):
+    """Adds uris to playlist_id, batched to Spotify's 100-per-request limit.
+    Returns True only if every batch succeeded - on a partial failure the
+    playlist is left as whatever got added before the failing batch (not
+    rolled back; a personal single-user tool has no need for transactional
+    cleanup here, and the playlist is still usable with what did land).
+
+    POST /playlists/{id}/items, not .../tracks - same endpoint rename
+    get_playlist_tracks above already works around for reads (.../tracks
+    now 403s unconditionally for the write side too, confirmed live)."""
+    for i in range(0, len(uris), PLAYLIST_ADD_BATCH_SIZE):
+        batch = uris[i:i + PLAYLIST_ADD_BATCH_SIZE]
+        if _api_request('POST', f'/playlists/{playlist_id}/items', json_body={'uris': batch}) is None:
+            return False
+    return True
 
 
 PLAY_URIS_MAX_ATTEMPTS = 3

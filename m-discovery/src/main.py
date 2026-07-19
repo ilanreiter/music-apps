@@ -1225,6 +1225,42 @@ def get_spotify_playlist_tracks(playlist_id: str):
         )
     return tracks
 
+class CreatePlaylistFromLibraryRequest(BaseModel):
+    name: str
+    track_ids: List[int]
+
+@app.post("/api/spotify/playlists/from-library")
+async def create_spotify_playlist_from_library(
+    params: CreatePlaylistFromLibraryRequest, db: psycopg2.extensions.connection = Depends(get_db),
+):
+    if not spotify_connect.is_connected():
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Spotify not connected")
+    if not params.track_ids:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No tracks to push")
+
+    cur = db.cursor()
+    cur.execute("SELECT id, spotify_track_id FROM known_tracks WHERE id = ANY(%s)", (params.track_ids,))
+    spotify_ids_by_track = dict(cur.fetchall())
+    cur.close()
+    # Preserve the caller's (shuffled) order - dict lookups above don't, a
+    # plain WHERE id = ANY() doesn't either.
+    uris = [f"spotify:track:{spotify_ids_by_track[tid]}" for tid in params.track_ids if spotify_ids_by_track.get(tid)]
+    skipped = len(params.track_ids) - len(uris)
+    if not uris:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="None of these tracks are matched to Spotify yet")
+
+    playlist = spotify_connect.create_playlist(params.name)
+    if playlist is None:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Could not create the playlist - if this account was connected before playlist-modify-private was "
+                   "added, disconnect and reconnect Spotify in Settings to grant it",
+        )
+    if not spotify_connect.add_tracks_to_playlist(playlist['id'], uris):
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Playlist created but adding tracks failed partway through")
+
+    return {"playlist_url": playlist['url'], "added": len(uris), "skipped": skipped}
+
 def _match_track_to_spotify(db, track_id):
     """Looks up (or performs and caches) a local track's Spotify match. Shared
     by the single-track and batch match routes. Returns a dict shaped like

@@ -258,6 +258,7 @@ function App() {
   // Briefly shown when a track's source (local vs. Spotify) doesn't match
   // the current output destination - null when hidden, a message when shown.
   const [spotifyPlayHint, setSpotifyPlayHint] = useState(null);
+  const [pushingToSpotify, setPushingToSpotify] = useState(false);
   // True when the currently-drilled Spotify playlist's tracks came back 403 -
   // Spotify blocks reading the track listing of a playlist you don't own,
   // even public/followed ones, though playing it via context_uri still works.
@@ -1658,6 +1659,36 @@ function App() {
     }
   };
 
+  // Pushes the currently-shown library list (whatever order it's in -
+  // shuffled or not) to a new private Spotify playlist. Only tracks already
+  // matched to a Spotify id can go in - resolving unmatched ones on the spot
+  // could mean a slow or rate-limited request for a large list, so those are
+  // just skipped and reported rather than attempted.
+  const pushLibraryToSpotifyPlaylist = async () => {
+    if (libraryTracks.length === 0) return;
+    const defaultName = `Library — ${new Date().toLocaleDateString()}`;
+    const name = window.prompt('Name for the new Spotify playlist:', defaultName);
+    if (!name) return;
+    setPushingToSpotify(true);
+    try {
+      const response = await axios.post(`${API_BASE_URL}/spotify/playlists/from-library`, {
+        name,
+        track_ids: libraryTracks.map((t) => t.id),
+      });
+      const { added, skipped, playlist_url: playlistUrl } = response.data;
+      setSpotifyPlayHint(
+        `Created "${name}" on Spotify with ${added.toLocaleString()} track${added === 1 ? '' : 's'}` +
+        (skipped > 0 ? ` (${skipped.toLocaleString()} skipped - not yet matched to Spotify)` : '') +
+        (playlistUrl ? '.' : ' (no link returned).')
+      );
+    } catch (err) {
+      console.error('Error pushing playlist to Spotify:', err);
+      setSpotifyPlayHint(err.response?.data?.detail || 'Failed to create the Spotify playlist.');
+    } finally {
+      setPushingToSpotify(false);
+    }
+  };
+
   const viewLabel = (mode) => {
     if (mode === 'all') return 'All Tracks';
     if (mode === 'playlist') return 'Playlists';
@@ -1915,6 +1946,16 @@ function App() {
                       >
                         &#128256; Shuffle All
                       </button>
+                      {spotifyConnected && (
+                        <button
+                          className="group-action-btn"
+                          onClick={pushLibraryToSpotifyPlaylist}
+                          disabled={pushingToSpotify}
+                          title="Create a private Spotify playlist from the tracks currently shown (already-matched ones only)"
+                        >
+                          {pushingToSpotify ? 'Pushing…' : '⬆ Push to Spotify'}
+                        </button>
+                      )}
                     </div>
                   )}
                   <span className="library-count">{libraryTotal.toLocaleString()} tracks</span>
