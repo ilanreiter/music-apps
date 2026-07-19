@@ -285,6 +285,11 @@ function App() {
   // All/Play All can be tested without any live search - isolates playback
   // bugs from the currently-active Spotify search rate limit.
   const [filterSpotifyAvailable, setFilterSpotifyAvailable] = useState(() => loadLibraryView()?.filterSpotifyAvailable ?? false);
+  // Caps how many matching tracks actually get fetched/shown - '' means no
+  // cap. Applied client-side (clamping libraryTotal/the shuffled fetch size)
+  // rather than as a server-side WHERE filter, since it's about how many
+  // results to display, not which tracks match.
+  const [filterTrackLimit, setFilterTrackLimit] = useState(() => loadLibraryView()?.filterTrackLimit ?? '');
   const [genreOptions, setGenreOptions] = useState([]);
   const [decadeOptions, setDecadeOptions] = useState([]);
   const [qualityOptions, setQualityOptions] = useState([]);
@@ -727,9 +732,10 @@ function App() {
       filterQuality,
       filterFormat,
       filterSpotifyAvailable,
+      filterTrackLimit,
       libraryShuffleOn,
     });
-  }, [activeTab, libraryMode, drill, search, filterGenre, filterDecade, filterQuality, filterFormat, filterSpotifyAvailable, libraryShuffleOn]);
+  }, [activeTab, libraryMode, drill, search, filterGenre, filterDecade, filterQuality, filterFormat, filterSpotifyAvailable, filterTrackLimit, libraryShuffleOn]);
 
   // Persist the playback session (queue/history capped, so a mutation never
   // costs a multi-MB localStorage write) so a reload or reopened tab returns
@@ -836,7 +842,7 @@ function App() {
     // reshuffled the list while playback stayed on the original order).
     // Skip the refetch when only activeTab changed - re-entering the tab
     // should show whatever was already there, not roll a new order.
-    const key = JSON.stringify([libraryMode, drill, search, filterGenre, filterDecade, filterQuality, filterFormat, filterSpotifyAvailable]);
+    const key = JSON.stringify([libraryMode, drill, search, filterGenre, filterDecade, filterQuality, filterFormat, filterSpotifyAvailable, filterTrackLimit]);
     if (key === libraryFetchKeyRef.current) return;
     libraryFetchKeyRef.current = key;
     const skipInitialShuffleFetch = skipInitialShuffleFetchRef.current;
@@ -868,7 +874,7 @@ function App() {
       fetchGroups();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeTab, libraryMode, drill, search, filterGenre, filterDecade, filterQuality, filterFormat, filterSpotifyAvailable]);
+  }, [activeTab, libraryMode, drill, search, filterGenre, filterDecade, filterQuality, filterFormat, filterSpotifyAvailable, filterTrackLimit]);
 
   useEffect(() => {
     if (activeTab !== 'library') return;
@@ -915,6 +921,7 @@ function App() {
     setFilterQuality('best');
     setFilterFormat('');
     setFilterSpotifyAvailable(false);
+    setFilterTrackLimit('');
     setSearchInput('');
     setSearch('');
   };
@@ -932,9 +939,12 @@ function App() {
   const fetchLibraryTracks = async (offset) => {
     setLibraryLoading(true);
     try {
-      const params = { ...buildTrackFilterParams(), limit: LIBRARY_PAGE_SIZE, offset };
+      const maxCount = filterTrackLimit ? Number(filterTrackLimit) : null;
+      if (maxCount && offset >= maxCount) return;
+      const pageLimit = maxCount ? Math.min(LIBRARY_PAGE_SIZE, maxCount - offset) : LIBRARY_PAGE_SIZE;
+      const params = { ...buildTrackFilterParams(), limit: pageLimit, offset };
       const response = await axios.get(`${API_BASE_URL}/tracks/known`, { params });
-      setLibraryTotal(response.data.total);
+      setLibraryTotal(maxCount ? Math.min(response.data.total, maxCount) : response.data.total);
       setLibraryTracks((prev) => (offset === 0 ? response.data.tracks : [...prev, ...response.data.tracks]));
     } catch (err) {
       console.error('Error fetching tracks:', err);
@@ -950,7 +960,8 @@ function App() {
   const fetchLibraryTracksShuffled = async () => {
     setLibraryLoading(true);
     try {
-      const tracks = await fetchAllMatchingShuffled(buildTrackFilterParams());
+      const maxCount = filterTrackLimit ? Number(filterTrackLimit) : undefined;
+      const tracks = await fetchAllMatchingShuffled(buildTrackFilterParams(), maxCount);
       setLibraryTotal(tracks.length);
       setLibraryTracks(tracks);
       // So a reload can restore this exact order via fetchLibraryTracksByIds
@@ -1566,12 +1577,13 @@ function App() {
   // only ever draw from whatever happened to sort first alphabetically. The count
   // query is cheap, so look up the true total first, then fetch everything in one
   // truly-randomized (server-side ORDER BY RANDOM(), no repeats) request.
-  const fetchAllMatchingShuffled = async (params) => {
+  const fetchAllMatchingShuffled = async (params, maxCount) => {
     const countResponse = await axios.get(`${API_BASE_URL}/tracks/known`, { params: { ...params, limit: 1, offset: 0 } });
     const total = countResponse.data.total;
     if (total === 0) return [];
+    const fetchLimit = maxCount ? Math.min(total, maxCount) : total;
     const fullResponse = await axios.get(`${API_BASE_URL}/tracks/known`, {
-      params: { ...params, limit: total, offset: 0, shuffle: true },
+      params: { ...params, limit: fetchLimit, offset: 0, shuffle: true },
     });
     return fullResponse.data.tracks;
   };
@@ -1863,6 +1875,18 @@ function App() {
                   />
                   Available on Spotify
                 </label>
+                <select
+                  value={filterTrackLimit}
+                  onChange={(e) => setFilterTrackLimit(e.target.value)}
+                  title="Cap how many matching tracks are fetched/shown"
+                >
+                  <option value="">No Limit</option>
+                  <option value="50">Max 50</option>
+                  <option value="100">Max 100</option>
+                  <option value="250">Max 250</option>
+                  <option value="500">Max 500</option>
+                  <option value="1000">Max 1,000</option>
+                </select>
                 <button className="clear-filters-btn" onClick={clearAllFilters}>Clear All</button>
               </div>
             </div>
