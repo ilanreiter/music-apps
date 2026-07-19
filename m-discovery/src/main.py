@@ -24,6 +24,7 @@ from . import external_artwork
 from . import spotify_prewarm
 from . import tag_cleanup
 from . import playback_advancer
+from . import shazam_identify
 import google.generativeai as genai
 import logging
 import os
@@ -124,6 +125,11 @@ tag_cleanup_progress = {"status": "idle"}
 # Not a one-shot backfill like the jobs above (no lock/trigger-route needed -
 # there's nothing to "start" on demand) - see playback_advancer.run for why.
 playback_advancer_progress = {"status": "idle"}
+
+# Same "runs continuously, nothing to start on demand" shape as
+# playback_advancer above - see shazam_identify.run for why this one isn't
+# gated on app idleness the way spotify_prewarm is.
+shazam_identify_progress = {"status": "idle"}
 
 # Timestamp of the last non-polling request, used by the Spotify pre-warm
 # background job to tell "actively using the app" apart from "idle" so it
@@ -442,6 +448,17 @@ async def startup_event():
     threading.Thread(
         target=playback_advancer.run,
         args=(get_playback_session, save_playback_session, playback_advancer_progress),
+        daemon=True,
+    ).start()
+
+    # Also unconditional - makes zero Spotify calls (see
+    # spotify_connect.identify_via_shazam), so unlike spotify_prewarm it
+    # doesn't need to wait for app idleness to avoid competing with
+    # interactive Spotify use for Spotify's rate limit.
+    print("Starting Shazam track identification in the background.")
+    threading.Thread(
+        target=shazam_identify.run,
+        args=(get_db_connection, shazam_identify_progress),
         daemon=True,
     ).start()
 
@@ -1214,7 +1231,7 @@ def _match_track_to_spotify(db, track_id):
     SpotifyMatchResult, or None if track_id doesn't exist in known_tracks."""
     cur = db.cursor()
     cur.execute(
-        "SELECT track_name, artist_name, spotify_track_id, spotify_checked, spotify_album_art_url, file_path "
+        "SELECT track_name, artist_name, spotify_track_id, spotify_checked, spotify_album_art_url, file_path, isrc "
         "FROM known_tracks WHERE id = %s",
         (track_id,),
     )
@@ -1222,7 +1239,7 @@ def _match_track_to_spotify(db, track_id):
     if not row:
         cur.close()
         return None
-    track_name, artist_name, cached_id, checked, cached_art, file_path = row
+    track_name, artist_name, cached_id, checked, cached_art, file_path, isrc = row
 
     if checked:
         cur.close()
@@ -1230,7 +1247,7 @@ def _match_track_to_spotify(db, track_id):
             return {"matched": False, "reason": "no_match"}
         return {"matched": True, "uri": f"spotify:track:{cached_id}", "artwork_url": cached_art}
 
-    result, match, identified = spotify_connect.search_track(track_name, artist_name, file_path=file_path)
+    result, match, identified = spotify_connect.search_track(track_name, artist_name, file_path=file_path, known_isrc=isrc)
     if identified:
         # Persist Shazam's identification independent of whatever Spotify's
         # own outcome is - a correct name + ISRC is useful even when Spotify
@@ -1341,6 +1358,47 @@ async def get_spotify_prewarm_stats(db: psycopg2.extensions.connection = Depends
     matched = cur.fetchone()[0]
     cur.close()
     return {"total": total, "checked": checked, "matched": matched}
+
+@app.get("/api/library/track-identification/status")
+async def get_track_identification_status():
+    return shazam_identify_progress
+
+@app.get("/api/library/track-identification/stats")
+async def get_track_identification_stats(db: psycopg2.extensions.connection = Depends(get_db)):
+    # isrc is only ever set by the Shazam-based fallbacks in
+    # spotify_connect.search_track (text search or audio recognition) -
+    # unlike original_track_name/original_artist_name (also touched by
+    # tag_cleanup.py), a non-null isrc unambiguously means this specific
+    # pipeline identified the row, whether or not Spotify itself has since
+    # confirmed a match for it.
+    cur = db.cursor()
+    cur.execute("SELECT COUNT(*) FROM known_tracks")
+    total = cur.fetchone()[0]
+    cur.execute("SELECT COUNT(*) FROM known_tracks WHERE isrc IS NOT NULL")
+    identified = cur.fetchone()[0]
+    cur.close()
+    return {"total": total, "identified": identified}
+
+@app.get("/api/library/track-identification/tracks")
+async def get_track_identification_tracks(
+    limit: int = Query(100, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+    db: psycopg2.extensions.connection = Depends(get_db),
+):
+    cur = db.cursor(cursor_factory=RealDictCursor)
+    cur.execute("SELECT COUNT(*) AS count FROM known_tracks WHERE isrc IS NOT NULL")
+    total = cur.fetchone()['count']
+    cur.execute("""
+        SELECT id, original_track_name, original_artist_name, track_name, artist_name, isrc,
+               spotify_checked, spotify_track_id
+        FROM known_tracks
+        WHERE isrc IS NOT NULL
+        ORDER BY id
+        LIMIT %(limit)s OFFSET %(offset)s
+    """, {'limit': limit, 'offset': offset})
+    tracks = cur.fetchall()
+    cur.close()
+    return {"total": total, "tracks": tracks}
 
 class PlaybackSessionUpdate(BaseModel):
     # Loosely typed on purpose - track objects already vary by source

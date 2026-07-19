@@ -2563,6 +2563,11 @@ function CleanupTab({ apiBase, activeTab, nowPlaying, isPlaying, onTrackPlayClic
   const [spotifyPrewarmStats, setSpotifyPrewarmStats] = useState(null);
   const spotifyPrewarmPollRef = useRef(null);
 
+  const [trackIdStats, setTrackIdStats] = useState(null);
+  const [trackIdTracks, setTrackIdTracks] = useState([]);
+  const [trackIdTotal, setTrackIdTotal] = useState(0);
+  const trackIdPollRef = useRef(null);
+
   const fetchDuplicates = async () => {
     setDuplicatesLoading(true);
     try {
@@ -2732,6 +2737,30 @@ function CleanupTab({ apiBase, activeTab, nowPlaying, isPlaying, onTrackPlayClic
     spotifyPrewarmPollRef.current = setInterval(fetchSpotifyPrewarmInfo, 5000);
   };
 
+  const fetchTrackIdTracks = async (offset) => {
+    try {
+      const response = await axios.get(`${apiBase}/library/track-identification/tracks`, { params: { limit: 100, offset } });
+      setTrackIdTotal(response.data.total);
+      setTrackIdTracks((prev) => (offset === 0 ? response.data.tracks : [...prev, ...response.data.tracks]));
+    } catch (err) {
+      console.error('Error fetching identified tracks:', err);
+    }
+  };
+
+  const fetchTrackIdInfo = async () => {
+    try {
+      const response = await axios.get(`${apiBase}/library/track-identification/stats`);
+      setTrackIdStats(response.data);
+    } catch (err) {
+      console.error('Error fetching track identification stats:', err);
+    }
+  };
+
+  const pollTrackId = () => {
+    if (trackIdPollRef.current) clearInterval(trackIdPollRef.current);
+    trackIdPollRef.current = setInterval(fetchTrackIdInfo, 5000);
+  };
+
   useEffect(() => {
     if (activeTab !== 'cleanup') return;
     if (subTab === 'duplicates' && duplicateGroups === null) fetchDuplicates();
@@ -2773,6 +2802,18 @@ function CleanupTab({ apiBase, activeTab, nowPlaying, isPlaying, onTrackPlayClic
       clearInterval(spotifyPrewarmPollRef.current);
       spotifyPrewarmPollRef.current = null;
     }
+    if (subTab === 'track-id') {
+      // Same "runs continuously regardless" shape as spotify-matching above -
+      // isrc gets set by search_track's Shazam fallbacks, which run as part
+      // of the same background pre-warm job (and any interactive match), not
+      // a separately start/stoppable job of their own.
+      fetchTrackIdInfo();
+      if (trackIdTracks.length === 0) fetchTrackIdTracks(0);
+      pollTrackId();
+    } else if (trackIdPollRef.current) {
+      clearInterval(trackIdPollRef.current);
+      trackIdPollRef.current = null;
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeTab, subTab]);
 
@@ -2781,6 +2822,7 @@ function CleanupTab({ apiBase, activeTab, nowPlaying, isPlaying, onTrackPlayClic
     if (externalArtworkPollRef.current) clearInterval(externalArtworkPollRef.current);
     if (tagCleanupPollRef.current) clearInterval(tagCleanupPollRef.current);
     if (spotifyPrewarmPollRef.current) clearInterval(spotifyPrewarmPollRef.current);
+    if (trackIdPollRef.current) clearInterval(trackIdPollRef.current);
   }, []);
 
   const bestTrack = (tracks) => tracks.reduce((best, t) => ((t.bitrate || 0) > (best.bitrate || 0) ? t : best), tracks[0]);
@@ -2793,6 +2835,7 @@ function CleanupTab({ apiBase, activeTab, nowPlaying, isPlaying, onTrackPlayClic
         <button className={subTab === 'missing-artwork' ? 'active' : ''} onClick={() => setSubTab('missing-artwork')}>Missing Artwork</button>
         <button className={subTab === 'bad-tags' ? 'active' : ''} onClick={() => setSubTab('bad-tags')}>Bad Tags</button>
         <button className={subTab === 'spotify-matching' ? 'active' : ''} onClick={() => setSubTab('spotify-matching')}>Spotify Matching</button>
+        <button className={subTab === 'track-id' ? 'active' : ''} onClick={() => setSubTab('track-id')}>Track ID</button>
       </div>
 
       {subTab === 'duplicates' && (
@@ -3092,7 +3135,7 @@ function CleanupTab({ apiBase, activeTab, nowPlaying, isPlaying, onTrackPlayClic
         <div className="cleanup-panel">
           <p className="hint">
             A background job slowly searches the library against Spotify's catalog while the app is
-            idle (about one track every 5 minutes, so it never bursts into Spotify's search rate
+            idle (a small batch every 90 seconds, so it never bursts into Spotify's search rate
             limit) - this just shows how far it's gotten. No button here since it just runs on its
             own; see the "Available on Spotify" filter in the Library tab to browse what's matched
             so far.
@@ -3121,6 +3164,79 @@ function CleanupTab({ apiBase, activeTab, nowPlaying, isPlaying, onTrackPlayClic
                         ? `error: ${spotifyPrewarmStatus.error}`
                         : spotifyPrewarmStatus.status}
             </p>
+          )}
+        </div>
+      )}
+
+      {subTab === 'track-id' && (
+        <div className="cleanup-panel">
+          <p className="hint">
+            Some tracks never match Spotify's search directly - a translated title, a garbled tag, or
+            a bare placeholder like "Track 09" with nothing real to search for. As a fallback, the
+            same background job also tries Shazam's own catalog (text search) and, for files with no
+            usable tag text at all, its audio-fingerprint recognition on the actual file. Whenever
+            Shazam identifies a track with confidence, the correct title/artist and a real ISRC get
+            saved here - independent of whether Spotify itself ever confirms a match, since a correct
+            name and ISRC are useful on their own. No button here either; it rides along on the same
+            background job as Spotify Matching.
+          </p>
+          {trackIdStats && (
+            <p className="scan-summary">
+              {(trackIdStats.identified || 0).toLocaleString()} identified via Shazam of{' '}
+              {(trackIdStats.total || 0).toLocaleString()} tracks
+              {trackIdStats.total > 0
+                ? ` (${Math.round((trackIdStats.identified / trackIdStats.total) * 100)}%)`
+                : ''}
+            </p>
+          )}
+          {trackIdTracks.length > 0 && (
+            <>
+              <div className="library-header">
+                <h2>Identified Tracks</h2>
+                <span className="library-count">{trackIdTotal.toLocaleString()} tracks</span>
+              </div>
+              {trackIdTracks.map((track) => (
+                <div key={track.id} className="dup-track">
+                  <div className="track-thumb-wrap">
+                    <span className="track-thumb-fallback">{track.track_name.charAt(0).toUpperCase()}</span>
+                    <img
+                      className="track-thumb"
+                      src={`${apiBase}/tracks/${track.id}/artwork`}
+                      alt=""
+                      loading="lazy"
+                      onError={(e) => { e.target.style.display = 'none'; }}
+                    />
+                  </div>
+                  <div className="dup-track-info">
+                    <span className="dup-track-title">
+                      {track.original_track_name && track.original_track_name !== track.track_name && (
+                        <span className="tag-cleanup-before">{track.original_track_name}</span>
+                      )}
+                      {track.track_name}
+                    </span>
+                    <span className="dup-track-artist">
+                      {track.original_artist_name && track.original_artist_name !== track.artist_name && (
+                        <span className="tag-cleanup-before">{track.original_artist_name}</span>
+                      )}
+                      {track.artist_name}
+                    </span>
+                    <span className="dup-track-artist">
+                      ISRC {track.isrc}
+                      {track.spotify_track_id
+                        ? ' · matched on Spotify'
+                        : track.spotify_checked
+                          ? ' · not on Spotify'
+                          : ' · Spotify not checked yet'}
+                    </span>
+                  </div>
+                </div>
+              ))}
+              {trackIdTracks.length < trackIdTotal && (
+                <button className="load-more-btn" onClick={() => fetchTrackIdTracks(trackIdTracks.length)}>
+                  Load more ({trackIdTracks.length.toLocaleString()} of {trackIdTotal.toLocaleString()})
+                </button>
+              )}
+            </>
           )}
         </div>
       )}

@@ -174,14 +174,14 @@ def _match_local_track_cached(track_id, track_name, artist_name):
     try:
         cur = conn.cursor()
         cur.execute(
-            "SELECT spotify_track_id, spotify_checked, spotify_album_art_url, file_path FROM known_tracks WHERE id = %s",
+            "SELECT spotify_track_id, spotify_checked, spotify_album_art_url, file_path, isrc FROM known_tracks WHERE id = %s",
             (track_id,),
         )
         row = cur.fetchone()
         if not row:
             cur.close()
             return {"matched": False, "reason": "no_match"}
-        cached_id, checked, cached_art, file_path = row
+        cached_id, checked, cached_art, file_path, isrc = row
 
         if checked:
             cur.close()
@@ -189,7 +189,7 @@ def _match_local_track_cached(track_id, track_name, artist_name):
                 return {"matched": False, "reason": "no_match"}
             return {"matched": True, "uri": f"spotify:track:{cached_id}", "artwork_url": cached_art}
 
-        result, match, identified = spotify_connect.search_track(track_name, artist_name, file_path=file_path)
+        result, match, identified = spotify_connect.search_track(track_name, artist_name, file_path=file_path, known_isrc=isrc)
         if identified:
             # Persist Shazam's identification independent of whatever
             # Spotify's own outcome is - see main.py's _match_track_to_spotify

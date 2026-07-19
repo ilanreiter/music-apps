@@ -61,15 +61,15 @@ def run(get_connection, progress, is_idle):
         try:
             for _ in range(BATCH_SIZE):
                 cur = conn.cursor()
-                cur.execute("SELECT id, track_name, artist_name, file_path FROM known_tracks WHERE spotify_checked IS NOT TRUE LIMIT 1")
+                cur.execute("SELECT id, track_name, artist_name, file_path, isrc FROM known_tracks WHERE spotify_checked IS NOT TRUE LIMIT 1")
                 row = cur.fetchone()
                 cur.close()
                 if row is None:
                     done = True
                     break
 
-                track_id, track_name, artist_name, file_path = row
-                result, match, identified = spotify_connect.search_track(track_name, artist_name, file_path=file_path)
+                track_id, track_name, artist_name, file_path, isrc = row
+                result, match, identified = spotify_connect.search_track(track_name, artist_name, file_path=file_path, known_isrc=isrc)
                 if identified:
                     # Persist Shazam's identification independent of whatever
                     # Spotify's own outcome is - see main.py's

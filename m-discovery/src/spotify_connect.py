@@ -740,8 +740,11 @@ def _recognize_via_shazam_audio(file_path):
     "almost always" - and the most expensive fallback here, since it
     requires actually decoding the audio, not just a text query.
 
-    Returns (title, artist) or None (no match, no worker/venv, or timeout -
-    treated as opportunistic, same as every other bridge above)."""
+    Returns (title, artist, isrc) - isrc is None if the second lookup
+    (shazam_worker.py's track_about call, same direct-to-Shazam servers, no
+    RapidAPI) didn't succeed for some reason, or None entirely (no match, no
+    worker/venv, or timeout - treated as opportunistic, same as every other
+    bridge above)."""
     try:
         result = subprocess.run(
             [SHAZAM_AUDIO_VENV_PYTHON, SHAZAM_AUDIO_WORKER_PATH, file_path],
@@ -758,10 +761,53 @@ def _recognize_via_shazam_audio(file_path):
     title, artist = data.get('title'), data.get('artist')
     if not title or not artist:
         return None
-    return title, artist
+    return title, artist, data.get('isrc')
 
 
-def search_track(track_name, artist_name, file_path=None):
+def identify_via_shazam(track_name, artist_name, file_path=None):
+    """Identifies a track via Shazam alone - text search first, then audio
+    recognition as a last resort for files with no usable tag text at all.
+    Makes zero Spotify API calls, by construction: every call this function
+    reaches (_bridge_via_shazam_core -> _search_shazam_core, and
+    _recognize_via_shazam_audio) talks to Shazam/RapidAPI only, never
+    spotify_connect._api_request. This is what makes it safe to run on its
+    own schedule, completely decoupled from Spotify's rate limit and this
+    app's idle-detection (which exists purely to avoid the *Spotify-facing*
+    background job competing with interactive Spotify use for the same
+    quota - see spotify_prewarm.py's is_idle gate. A job that never touches
+    Spotify at all can't compete with it, so gating this one the same way
+    would just be needless delay).
+
+    The audio-recognition branch prefers the ISRC shazam_worker.py's own
+    track_about call already found (talks to Shazam's servers directly, not
+    RapidAPI) over re-deriving it through Shazam Core - confirmed live that
+    _bridge_via_shazam_core alone can be fully blocked (RapidAPI's free tier
+    hit its *monthly* quota from testing this session) while audio
+    recognition itself keeps working fine, since it's a separate service
+    with its own limits entirely.
+
+    Returns a {'track_name', 'artist_name', 'isrc'} dict, or None if Shazam
+    has nothing confident to offer either way."""
+    shazam_hit = _bridge_via_shazam_core(track_name, artist_name)
+    if shazam_hit:
+        return {'track_name': shazam_hit['name'], 'artist_name': shazam_hit['artist_name'], 'isrc': shazam_hit['isrc']}
+
+    if file_path:
+        recognized = _recognize_via_shazam_audio(file_path)
+        if recognized:
+            audio_title, audio_artist, audio_isrc = recognized
+            if audio_isrc:
+                return {'track_name': audio_title, 'artist_name': audio_artist, 'isrc': audio_isrc}
+            # track_about's own isrc lookup didn't come through for some
+            # reason - fall back to resolving it via Shazam Core instead.
+            shazam_hit = _bridge_via_shazam_core(audio_title, audio_artist)
+            if shazam_hit:
+                return {'track_name': shazam_hit['name'], 'artist_name': shazam_hit['artist_name'], 'isrc': shazam_hit['isrc']}
+
+    return None
+
+
+def search_track(track_name, artist_name, file_path=None, known_isrc=None):
     """Best-matching Spotify catalog track for a local (track_name, artist_name)
     pair. Returns a ('ok', match_or_None) tuple when the search actually
     completed (match is None if nothing cleared MATCH_THRESHOLD, even after
@@ -805,7 +851,14 @@ def search_track(track_name, artist_name, file_path=None):
     'unavailable' is only returned at the very end, and only if no match was
     found anywhere AND at least one Spotify-facing call was actually
     blocked - a real "not on Spotify" answer (every Spotify call completed,
-    just found nothing) still returns 'ok' so callers can cache it."""
+    just found nothing) still returns 'ok' so callers can cache it.
+
+    known_isrc: pass known_tracks.isrc when the caller already has one (the
+    decoupled shazam_identify job - see identify_via_shazam - may have found
+    it independently, on its own schedule, before this function ever ran for
+    this row). Skips re-deriving it via Shazam Core/audio recognition and
+    goes straight to the Spotify ISRC lookup - avoids redoing already-done
+    identification work every time this function retries a row."""
     identified = None
     blocked = False
 
@@ -823,6 +876,12 @@ def search_track(track_name, artist_name, file_path=None):
                 return 'ok', match, identified
             blocked = blocked or result == 'unavailable'
 
+    if known_isrc:
+        result, match = _search_by_isrc(known_isrc)
+        if match:
+            return 'ok', match, identified
+        return ('unavailable' if (blocked or result == 'unavailable') else 'ok'), None, identified
+
     shazam_hit = _bridge_via_shazam_core(track_name, artist_name)
     if shazam_hit:
         identified = {'track_name': shazam_hit['name'], 'artist_name': shazam_hit['artist_name'], 'isrc': shazam_hit['isrc']}
@@ -834,11 +893,20 @@ def search_track(track_name, artist_name, file_path=None):
     if file_path and not identified:
         recognized = _recognize_via_shazam_audio(file_path)
         if recognized:
-            audio_title, audio_artist = recognized
-            shazam_hit = _bridge_via_shazam_core(audio_title, audio_artist)
-            if shazam_hit:
-                identified = {'track_name': shazam_hit['name'], 'artist_name': shazam_hit['artist_name'], 'isrc': shazam_hit['isrc']}
-                result, match = _search_by_isrc(shazam_hit['isrc'])
+            audio_title, audio_artist, audio_isrc = recognized
+            # Prefer the ISRC shazam_worker.py's own track_about call already
+            # found (direct to Shazam, no RapidAPI) over re-deriving it
+            # through Shazam Core - see identify_via_shazam for why this
+            # matters (RapidAPI's free tier can be fully exhausted while
+            # audio recognition itself keeps working fine).
+            if audio_isrc:
+                identified = {'track_name': audio_title, 'artist_name': audio_artist, 'isrc': audio_isrc}
+            else:
+                shazam_hit = _bridge_via_shazam_core(audio_title, audio_artist)
+                if shazam_hit:
+                    identified = {'track_name': shazam_hit['name'], 'artist_name': shazam_hit['artist_name'], 'isrc': shazam_hit['isrc']}
+            if identified:
+                result, match = _search_by_isrc(identified['isrc'])
                 if match:
                     return 'ok', match, identified
                 blocked = blocked or result == 'unavailable'
