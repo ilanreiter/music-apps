@@ -668,6 +668,19 @@ SHAZAM_CORE_MAX_ATTEMPTS = 4
 SHAZAM_CORE_RETRY_DELAY_SECONDS = 2
 
 
+def _parse_year(value):
+    """Pulls a plausible 4-digit year out of whatever format a source hands
+    back - Shazam Core's releaseDate is an ISO-ish "2012-06-08", while
+    track_about's "Released" section is often just plain text like "1991".
+    Grabs the first 19xx/20xx run rather than requiring a specific format, so
+    both shapes (and anything else vaguely date-like) work the same way.
+    Returns an int, or None if nothing plausible is found."""
+    if not value:
+        return None
+    match = re.search(r'(19|20)\d{2}', str(value))
+    return int(match.group(0)) if match else None
+
+
 def _search_shazam_core(query):
     """Text search against Shazam's own catalog (Apple Music-backed) via the
     Shazam Core RapidAPI listing - a maintained, paid-hosting-backed wrapper,
@@ -679,8 +692,10 @@ def _search_shazam_core(query):
     catalog has meaningfully broader coverage). Each result already carries
     an ISRC directly, no separate track-detail lookup needed.
 
-    Returns a list of {'name', 'artist_name', 'isrc', 'duration_ms'} dicts
-    (possibly empty), or None if not configured / persistently failing."""
+    Returns a list of {'name', 'artist_name', 'isrc', 'duration_ms',
+    'album_name', 'year'} dicts (possibly empty; album_name/year are None
+    when Shazam Core doesn't have them for a given result), or None if not
+    configured / persistently failing."""
     if not SHAZAM_RAPIDAPI_KEY:
         return None
     headers = {'X-RapidAPI-Key': SHAZAM_RAPIDAPI_KEY, 'X-RapidAPI-Host': SHAZAM_RAPIDAPI_HOST}
@@ -702,6 +717,7 @@ def _search_shazam_core(query):
                 results.append({
                     'name': attrs['name'], 'artist_name': attrs['artistName'],
                     'isrc': attrs['isrc'], 'duration_ms': attrs.get('durationInMillis'),
+                    'album_name': attrs.get('albumName'), 'year': _parse_year(attrs.get('releaseDate')),
                 })
             return results
         if attempt < SHAZAM_CORE_MAX_ATTEMPTS:
@@ -786,11 +802,11 @@ def _recognize_via_shazam_audio(file_path):
     "almost always" - and the most expensive fallback here, since it
     requires actually decoding the audio, not just a text query.
 
-    Returns (title, artist, isrc) - isrc is None if the second lookup
-    (shazam_worker.py's track_about call, same direct-to-Shazam servers, no
-    RapidAPI) didn't succeed for some reason, or None entirely (no match, no
-    worker/venv, or timeout - treated as opportunistic, same as every other
-    bridge above)."""
+    Returns (title, artist, isrc, album_name, year) - isrc/album_name/year
+    are None if the second lookup (shazam_worker.py's track_about call, same
+    direct-to-Shazam servers, no RapidAPI) didn't succeed or didn't have
+    them, or the whole tuple is None (no match, no worker/venv, or timeout -
+    treated as opportunistic, same as every other bridge above)."""
     try:
         result = subprocess.run(
             [SHAZAM_AUDIO_VENV_PYTHON, SHAZAM_AUDIO_WORKER_PATH, file_path],
@@ -807,7 +823,7 @@ def _recognize_via_shazam_audio(file_path):
     title, artist = data.get('title'), data.get('artist')
     if not title or not artist:
         return None
-    return title, artist, data.get('isrc')
+    return title, artist, data.get('isrc'), data.get('album'), _parse_year(data.get('released'))
 
 
 def identify_via_shazam(track_name, artist_name, file_path=None):
@@ -832,23 +848,34 @@ def identify_via_shazam(track_name, artist_name, file_path=None):
     recognition itself keeps working fine, since it's a separate service
     with its own limits entirely.
 
-    Returns a {'track_name', 'artist_name', 'isrc'} dict, or None if Shazam
-    has nothing confident to offer either way."""
+    Returns a {'track_name', 'artist_name', 'isrc', 'album_name', 'year'}
+    dict, or None if Shazam has nothing confident to offer either way.
+    album_name/year are None when the source that identified the track
+    didn't have them."""
     shazam_hit = _bridge_via_shazam_core(track_name, artist_name)
     if shazam_hit:
-        return {'track_name': shazam_hit['name'], 'artist_name': shazam_hit['artist_name'], 'isrc': shazam_hit['isrc']}
+        return {
+            'track_name': shazam_hit['name'], 'artist_name': shazam_hit['artist_name'], 'isrc': shazam_hit['isrc'],
+            'album_name': shazam_hit.get('album_name'), 'year': shazam_hit.get('year'),
+        }
 
     if file_path:
         recognized = _recognize_via_shazam_audio(file_path)
         if recognized:
-            audio_title, audio_artist, audio_isrc = recognized
+            audio_title, audio_artist, audio_isrc, audio_album, audio_year = recognized
             if audio_isrc:
-                return {'track_name': audio_title, 'artist_name': audio_artist, 'isrc': audio_isrc}
+                return {
+                    'track_name': audio_title, 'artist_name': audio_artist, 'isrc': audio_isrc,
+                    'album_name': audio_album, 'year': audio_year,
+                }
             # track_about's own isrc lookup didn't come through for some
             # reason - fall back to resolving it via Shazam Core instead.
             shazam_hit = _bridge_via_shazam_core(audio_title, audio_artist)
             if shazam_hit:
-                return {'track_name': shazam_hit['name'], 'artist_name': shazam_hit['artist_name'], 'isrc': shazam_hit['isrc']}
+                return {
+                    'track_name': shazam_hit['name'], 'artist_name': shazam_hit['artist_name'], 'isrc': shazam_hit['isrc'],
+                    'album_name': shazam_hit.get('album_name') or audio_album, 'year': shazam_hit.get('year') or audio_year,
+                }
 
     return None
 
@@ -881,7 +908,9 @@ def search_track(track_name, artist_name, file_path=None, known_isrc=None):
     not just to cache the Spotify id.
 
     Returns a third value, identified: a {'track_name', 'artist_name',
-    'isrc'} dict whenever Shazam (text search or audio recognition)
+    'isrc', 'album_name', 'year'} dict (album_name/year may be None even
+    when identified is not, if the source that identified the track didn't
+    have them) whenever Shazam (text search or audio recognition)
     confidently identified the track, regardless of whether the Spotify step
     that follows actually found or could even check a match - Spotify's own
     catalog gaps and this app's own rate-limit history (a ~20h lockout, live
@@ -930,7 +959,10 @@ def search_track(track_name, artist_name, file_path=None, known_isrc=None):
 
     shazam_hit = _bridge_via_shazam_core(track_name, artist_name)
     if shazam_hit:
-        identified = {'track_name': shazam_hit['name'], 'artist_name': shazam_hit['artist_name'], 'isrc': shazam_hit['isrc']}
+        identified = {
+            'track_name': shazam_hit['name'], 'artist_name': shazam_hit['artist_name'], 'isrc': shazam_hit['isrc'],
+            'album_name': shazam_hit.get('album_name'), 'year': shazam_hit.get('year'),
+        }
         result, match = _search_by_isrc(shazam_hit['isrc'])
         if match:
             return 'ok', match, identified
@@ -939,18 +971,24 @@ def search_track(track_name, artist_name, file_path=None, known_isrc=None):
     if file_path and not identified:
         recognized = _recognize_via_shazam_audio(file_path)
         if recognized:
-            audio_title, audio_artist, audio_isrc = recognized
+            audio_title, audio_artist, audio_isrc, audio_album, audio_year = recognized
             # Prefer the ISRC shazam_worker.py's own track_about call already
             # found (direct to Shazam, no RapidAPI) over re-deriving it
             # through Shazam Core - see identify_via_shazam for why this
             # matters (RapidAPI's free tier can be fully exhausted while
             # audio recognition itself keeps working fine).
             if audio_isrc:
-                identified = {'track_name': audio_title, 'artist_name': audio_artist, 'isrc': audio_isrc}
+                identified = {
+                    'track_name': audio_title, 'artist_name': audio_artist, 'isrc': audio_isrc,
+                    'album_name': audio_album, 'year': audio_year,
+                }
             else:
                 shazam_hit = _bridge_via_shazam_core(audio_title, audio_artist)
                 if shazam_hit:
-                    identified = {'track_name': shazam_hit['name'], 'artist_name': shazam_hit['artist_name'], 'isrc': shazam_hit['isrc']}
+                    identified = {
+                        'track_name': shazam_hit['name'], 'artist_name': shazam_hit['artist_name'], 'isrc': shazam_hit['isrc'],
+                        'album_name': shazam_hit.get('album_name') or audio_album, 'year': shazam_hit.get('year') or audio_year,
+                    }
             if identified:
                 result, match = _search_by_isrc(identified['isrc'])
                 if match:

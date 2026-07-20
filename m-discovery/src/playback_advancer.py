@@ -199,9 +199,12 @@ def _match_local_track_cached(track_id, track_name, artist_name):
                     track_name = %s, artist_name = %s,
                     original_track_name = COALESCE(original_track_name, track_name),
                     original_artist_name = COALESCE(original_artist_name, artist_name),
-                    isrc = %s
+                    isrc = %s,
+                    album_name = COALESCE(album_name, %s),
+                    year = COALESCE(year, %s)
                 WHERE id = %s""",
-                (identified['track_name'], identified['artist_name'], identified['isrc'], track_id),
+                (identified['track_name'], identified['artist_name'], identified['isrc'],
+                 identified.get('album_name'), identified.get('year'), track_id),
             )
             conn.commit()
             track_name, artist_name = identified['track_name'], identified['artist_name']

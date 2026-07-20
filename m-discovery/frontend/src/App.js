@@ -3235,6 +3235,29 @@ function CleanupTab({ apiBase, activeTab, nowPlaying, isPlaying, onTrackPlayClic
 
       {subTab === 'track-id' && (
         <div className="cleanup-panel">
+          {trackIdStats && trackIdStats.identified > 0 && (() => {
+            const renamed = trackIdStats.renamed || 0;
+            const alreadyCorrect = trackIdStats.already_correct || 0;
+            const maxVal = Math.max(renamed, alreadyCorrect, 1);
+            return (
+              <div className="stat-bar-chart">
+                <div className="stat-bar-row">
+                  <span className="stat-bar-label">Names Corrected</span>
+                  <div className="stat-bar-track">
+                    <div className="stat-bar-fill series-1" style={{ width: `${(renamed / maxVal) * 100}%` }} />
+                  </div>
+                  <span className="stat-bar-value">{renamed.toLocaleString()}</span>
+                </div>
+                <div className="stat-bar-row">
+                  <span className="stat-bar-label">Already Correct</span>
+                  <div className="stat-bar-track">
+                    <div className="stat-bar-fill series-2" style={{ width: `${(alreadyCorrect / maxVal) * 100}%` }} />
+                  </div>
+                  <span className="stat-bar-value">{alreadyCorrect.toLocaleString()}</span>
+                </div>
+              </div>
+            );
+          })()}
           <p className="hint">
             Some tracks never match Spotify's search directly - a translated title, a garbled tag, or
             a bare placeholder like "Track 09" with nothing real to search for. As a fallback, the
@@ -3243,7 +3266,8 @@ function CleanupTab({ apiBase, activeTab, nowPlaying, isPlaying, onTrackPlayClic
             Shazam identifies a track with confidence, the correct title/artist and a real ISRC get
             saved here - independent of whether Spotify itself ever confirms a match, since a correct
             name and ISRC are useful on their own. No button here either; it rides along on the same
-            background job as Spotify Matching.
+            background job as Spotify Matching. The chart above breaks down how many identified
+            tracks actually needed a name/artist fix vs. were already tagged correctly.
           </p>
           {trackIdStats && (
             <p className="scan-summary">

@@ -16,6 +16,10 @@
   --accent-soft: rgba(99, 102, 241, 0.15);
   --error: #ef4444;
   --border: #2a2a33;
+  /* Categorical slots 1/2 from the dataviz skill's validated dark palette -
+     passes CVD/contrast checks against a dark surface close to --bg-card. */
+  --series-1: #3987e5;
+  --series-2: #008300;
 }
 
 body {
@@ -1828,6 +1832,54 @@ main.with-player {
   display: flex;
   flex-direction: column;
   gap: 10px;
+}
+
+.stat-bar-chart {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin: 2px 0 6px;
+}
+
+.stat-bar-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.stat-bar-label {
+  width: 140px;
+  flex-shrink: 0;
+  font-size: 0.85rem;
+  color: var(--text-muted);
+}
+
+.stat-bar-track {
+  flex: 1;
+  height: 20px;
+  background: var(--bg-input);
+  border-radius: 4px;
+}
+
+.stat-bar-fill {
+  height: 100%;
+  /* 4px rounded data-end, square at the baseline (left edge, where the bar
+     is anchored) - only the tip (right edge) rounds. */
+  border-radius: 0 4px 4px 0;
+  transition: width 0.4s ease;
+}
+
+.stat-bar-fill.series-1 { background: var(--series-1); }
+.stat-bar-fill.series-2 { background: var(--series-2); }
+
+.stat-bar-value {
+  width: 70px;
+  flex-shrink: 0;
+  text-align: right;
+  font-size: 0.85rem;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-main);
+  font-weight: 600;
 }
 
 .cleanup-summary {

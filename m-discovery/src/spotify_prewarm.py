@@ -80,9 +80,12 @@ def run(get_connection, progress, is_idle):
                             track_name = %s, artist_name = %s,
                             original_track_name = COALESCE(original_track_name, track_name),
                             original_artist_name = COALESCE(original_artist_name, artist_name),
-                            isrc = %s
+                            isrc = %s,
+                            album_name = COALESCE(album_name, %s),
+                            year = COALESCE(year, %s)
                         WHERE id = %s
-                    """, (identified['track_name'], identified['artist_name'], identified['isrc'], track_id))
+                    """, (identified['track_name'], identified['artist_name'], identified['isrc'],
+                          identified.get('album_name'), identified.get('year'), track_id))
                     conn.commit()
                     cur.close()
                     track_name, artist_name = identified['track_name'], identified['artist_name']
@@ -126,7 +129,15 @@ def run(get_connection, progress, is_idle):
                 conn.commit()
                 cur.close()
                 progress['processed'] += 1
-            progress['status'] = 'done' if done else 'running'
+            progress.update(status=('done' if done else 'running'), error=None)
+        except Exception as e:
+            # Confirmed live this is a real risk, not theoretical - a
+            # transient "server closed the connection unexpectedly" hit the
+            # sibling shazam_identify job, and this loop had no except at
+            # all (only finally) - an uncaught exception here would have
+            # silently killed this entire background thread forever, with
+            # no error ever recorded for anyone to notice.
+            progress.update(status='error', error=str(e))
         finally:
             conn.close()
         if done:

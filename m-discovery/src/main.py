@@ -1289,14 +1289,23 @@ def _match_track_to_spotify(db, track_id):
         # own outcome is - a correct name + ISRC is useful even when Spotify
         # can't be checked right now (rate-limited) or doesn't have this
         # recording in its catalog at all (confirmed live: both happen).
+        # album_name/year use COALESCE (fill only if currently unset) rather
+        # than an unconditional overwrite like track_name/artist_name get -
+        # Shazam's album field can be a reissue/remaster title (e.g. "Metallica
+        # (Remastered)") that isn't necessarily an improvement on a local tag
+        # that's already correct, unlike a garbled/placeholder title which
+        # never is.
         cur.execute(
             """UPDATE known_tracks SET
                 track_name = %s, artist_name = %s,
                 original_track_name = COALESCE(original_track_name, track_name),
                 original_artist_name = COALESCE(original_artist_name, artist_name),
-                isrc = %s
+                isrc = %s,
+                album_name = COALESCE(album_name, %s),
+                year = COALESCE(year, %s)
             WHERE id = %s""",
-            (identified['track_name'], identified['artist_name'], identified['isrc'], track_id),
+            (identified['track_name'], identified['artist_name'], identified['isrc'],
+             identified.get('album_name'), identified.get('year'), track_id),
         )
         db.commit()
         track_name, artist_name = identified['track_name'], identified['artist_name']
@@ -1412,8 +1421,18 @@ async def get_track_identification_stats(db: psycopg2.extensions.connection = De
     total = cur.fetchone()[0]
     cur.execute("SELECT COUNT(*) FROM known_tracks WHERE isrc IS NOT NULL")
     identified = cur.fetchone()[0]
+    # Every identified row always has original_track_name/original_artist_name
+    # set (the UPDATE in shazam_identify.py/spotify_connect.py sets them
+    # unconditionally via COALESCE), but they only *differ* from the current
+    # tag when Shazam's title/artist actually corrected something - the rest
+    # were already tagged correctly and just needed the ISRC confirmed.
+    cur.execute("""
+        SELECT COUNT(*) FROM known_tracks
+        WHERE isrc IS NOT NULL AND (original_track_name != track_name OR original_artist_name != artist_name)
+    """)
+    renamed = cur.fetchone()[0]
     cur.close()
-    return {"total": total, "identified": identified}
+    return {"total": total, "identified": identified, "renamed": renamed, "already_correct": identified - renamed}
 
 @app.get("/api/library/track-identification/tracks")
 async def get_track_identification_tracks(
