@@ -617,6 +617,7 @@ async def get_library_groups(
     decade: Optional[int] = None,
     quality: Optional[str] = None,
     format: Optional[str] = None,
+    spotify_available: Optional[bool] = None,
     db: psycopg2.extensions.connection = Depends(get_db),
 ):
     valid_by = ("album", "genre", "decade", "quality", "format", "favorite", "length")
@@ -643,6 +644,9 @@ async def get_library_groups(
         if format:
             extra_clauses.append(f"({FORMAT_SQL}) = %(format)s")
             params['format'] = format.upper()
+        if spotify_available is not None:
+            extra_clauses.append("(spotify_track_id IS NOT NULL) = %(spotify_available)s")
+            params['spotify_available'] = spotify_available
         extra_sql = ("AND " + " AND ".join(extra_clauses)) if extra_clauses else ""
 
         cur = db.cursor()
