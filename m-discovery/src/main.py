@@ -340,9 +340,11 @@ class SpotifyDevice(BaseModel):
 class SpotifyPlayRequest(BaseModel):
     context_uri: str
     track_uri: Optional[str] = None
+    clear_queue: bool = False
 
 class SpotifyPlayUrisRequest(BaseModel):
     uris: List[str]
+    clear_queue: bool = False
 
 class SpotifyQueueRequest(BaseModel):
     uri: str
@@ -1136,14 +1138,14 @@ def list_spotify_devices():
 @app.post("/api/spotify/devices/{device_id}/play")
 def spotify_play(device_id: str, params: SpotifyPlayRequest):
     _get_spotify_device_or_404(device_id)
-    if not spotify_connect.play(device_id, params.context_uri, params.track_uri):
+    if not spotify_connect.play(device_id, params.context_uri, params.track_uri, drain_queue=params.clear_queue):
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Could not reach Spotify")
     return {"status": "playing"}
 
 @app.post("/api/spotify/devices/{device_id}/play-uris")
 def spotify_play_uris(device_id: str, params: SpotifyPlayUrisRequest):
     _get_spotify_device_or_404(device_id)
-    if not spotify_connect.play_uris(device_id, params.uris):
+    if not spotify_connect.play_uris(device_id, params.uris, drain_queue=params.clear_queue):
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Could not reach Spotify")
     return {"status": "playing"}
 

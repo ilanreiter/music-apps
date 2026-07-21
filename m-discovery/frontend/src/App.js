@@ -458,9 +458,20 @@ function App() {
       // queue in this one call, not just the current track - that's what
       // gives Spotify a real queue to advance through, so Next/Prev work
       // both via our /next//previous proxy and natively in the Spotify app.
+      // This is a genuinely new session starting (as opposed to an in-app
+      // Next/Prev, which skip this effect via skipNextCastPushRef) -
+      // clear_queue: true drains any queue residue from a previous session
+      // first, so it can't splice in and surface later as a jump to
+      // unrelated older music (Spotify has no "clear queue" endpoint, only
+      // skip-past - see clear_queue's docstring in spotify_connect.py). Sent
+      // as part of this same play call (not a separate request first) so the
+      // backend can do transfer-drain-play as one uninterrupted sequence -
+      // splitting it across two round trips let the device settle into a
+      // stale "now playing" between them, which the second call's own
+      // status-only confirm check then mistook for success.
       const payload = nowPlaying.context_uri
-        ? { context_uri: nowPlaying.context_uri, track_uri: nowPlaying.uri }
-        : { uris: [nowPlaying.uri, ...queue.slice(0, SPOTIFY_PLAY_QUEUE_LIMIT).map((t) => t.uri)] };
+        ? { context_uri: nowPlaying.context_uri, track_uri: nowPlaying.uri, clear_queue: true }
+        : { uris: [nowPlaying.uri, ...queue.slice(0, SPOTIFY_PLAY_QUEUE_LIMIT).map((t) => t.uri)], clear_queue: true };
       axios.post(`${deviceEndpoint(outputDevice)}/${endpoint}`, payload)
         .catch((err) => console.error('Error casting to Spotify device:', err));
       return;
@@ -1362,9 +1373,12 @@ function App() {
             return;
           }
           const endpoint = nowPlaying.context_uri ? 'play' : 'play-uris';
+          // Same "drain stale queue residue as part of this same play call"
+          // reasoning as the cast-on-change effect above - this is the first
+          // real cast of a restored session, not an in-app Next/Prev.
           const spotifyPayload = nowPlaying.context_uri
-            ? { context_uri: nowPlaying.context_uri, track_uri: nowPlaying.uri }
-            : { uris: [nowPlaying.uri, ...queue.slice(0, SPOTIFY_PLAY_QUEUE_LIMIT).map((t) => t.uri)] };
+            ? { context_uri: nowPlaying.context_uri, track_uri: nowPlaying.uri, clear_queue: true }
+            : { uris: [nowPlaying.uri, ...queue.slice(0, SPOTIFY_PLAY_QUEUE_LIMIT).map((t) => t.uri)], clear_queue: true };
           axios.post(`${deviceEndpoint(outputDevice)}/${endpoint}`, spotifyPayload)
             .catch((err) => console.error('Error casting to Spotify device:', err));
           return;

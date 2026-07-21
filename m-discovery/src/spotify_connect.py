@@ -5,6 +5,7 @@ import os
 import re
 import secrets
 import subprocess
+import threading
 import time
 from difflib import SequenceMatcher
 from urllib.parse import quote
@@ -212,6 +213,38 @@ def get_device(device_id):
     return None
 
 
+_intent_lock = threading.Lock()
+_intent_counter = 0
+_latest_intent = {}  # device_id -> int, the most recent play()/play_uris() call for that device
+
+
+def _start_intent(device_id):
+    """Claims this call as the newest thing that should be playing on
+    device_id, superseding any earlier play()/play_uris() call still
+    mid-retry for the same device. Needed because the frontend can
+    legitimately fire two casts to the same device close together -
+    confirmed live: switching the output device (which re-casts whatever
+    was already nowPlaying) landing at nearly the same moment as a fresh
+    Shuffle All match finishing sent two concurrent play_uris calls for the
+    same device, each with several seconds of its own retry loop. Without
+    this, the two loops interleaved and fought over the device's real state,
+    and the *older* call (retrying against its own now-stale target track)
+    could win the last word, leaving the wrong (previous) track playing even
+    though the newer, correct call had already succeeded moments earlier.
+    Callers must bail out via _is_current_intent rather than keep retrying
+    once superseded - continuing would just resume the same fight."""
+    global _intent_counter
+    with _intent_lock:
+        _intent_counter += 1
+        token = _intent_counter
+        _latest_intent[device_id] = token
+    return token
+
+
+def _is_current_intent(device_id, token):
+    return _latest_intent.get(device_id) == token
+
+
 def _transfer_to_device(device_id):
     """Explicitly hands playback control to device_id before telling it to
     play something new. Needed because sending `play` straight to a device
@@ -232,7 +265,19 @@ def _transfer_to_device(device_id):
     time.sleep(0.3)
 
 
-def play(device_id, context_uri, track_uri=None):
+def play(device_id, context_uri, track_uri=None, drain_queue=False):
+    token = _start_intent(device_id)
+    if drain_queue:
+        # Must transfer first - clear_queue's GET /me/player/queue and the
+        # `next` calls it drains with both act on whatever device is
+        # *currently* active account-wide, not device_id, unless this device
+        # is already it (same reason play/play_uris always transfer before
+        # playing - see _transfer_to_device).
+        _transfer_to_device(device_id)
+        clear_queue(device_id)
+    if not _is_current_intent(device_id, token):
+        logger.info("play %s: superseded by a newer call, bailing out", device_id)
+        return False
     _transfer_to_device(device_id)
     body = {'context_uri': context_uri}
     if track_uri:
@@ -470,7 +515,7 @@ PLAY_URIS_MAX_ATTEMPTS = 3
 PLAY_URIS_CONFIRM_DELAY_SECONDS = 2
 
 
-def play_uris(device_id, uris):
+def play_uris(device_id, uris, drain_queue=False):
     """Play an explicit ad-hoc list of Spotify track URIs (not a playlist
     context) - used for local-library tracks matched to their Spotify catalog
     equivalent, since there's no existing Spotify playlist backing them.
@@ -483,22 +528,78 @@ def play_uris(device_id, uris):
     since a caller with nobody watching (the background advancer transitioning
     tracks unattended, which is the whole point of this app not depending on
     a browser tab) would otherwise leave playback silently stuck paused with
-    no one to notice and press play again."""
+    no one to notice and press play again.
+
+    The confirm check verifies track_uri, not just status=='play' - confirmed
+    live this matters: with drain_queue=True, the confirm poll can land while
+    the device is still finishing settling from the drain's own `next` calls
+    (a *different* track playing, just not the one this call asked for), and
+    checking status alone let that false-positive as success - the reported
+    symptom was "plays something from the old queue instead of the new
+    list's first track" even though clear_queue had genuinely skipped past
+    the stale entries. Retrying (which re-sends the same play call) corrects
+    it once Spotify's backend actually catches up.
+
+    drain_queue: see clear_queue - drains any queue residue from an earlier
+    session before playing, only appropriate for a genuinely new ad-hoc
+    session (never for the driven Next/Prev or lookahead-handoff callers of
+    this function, which rely on the queue's own lookahead entry).
+
+    Bails out early (returns False, sends no further requests) if superseded
+    by a newer play()/play_uris() call for the same device - see
+    _start_intent. Confirmed live this matters: switching the output device
+    (which re-casts whatever was already nowPlaying) landing at nearly the
+    same moment as a fresh Shuffle All match finishing fired two concurrent
+    play_uris calls for the same device; without this guard, the older
+    call's retry loop kept fighting the newer one for the device's state and
+    could win the last word, leaving the previous (wrong) track playing."""
+    token = _start_intent(device_id)
+    if drain_queue:
+        # Must transfer first - see the matching comment in play().
+        _transfer_to_device(device_id)
+        clear_queue(device_id)
     for attempt in range(1, PLAY_URIS_MAX_ATTEMPTS + 1):
+        if not _is_current_intent(device_id, token):
+            logger.info("play_uris %s: superseded by a newer call before attempt %d, bailing out", device_id, attempt)
+            return False
         _transfer_to_device(device_id)
         result = _api_request('PUT', '/me/player/play', params={'device_id': device_id}, json_body={'uris': uris})
         if result is None:
             logger.warning("play_uris %s: attempt %d/%d - request failed", device_id, attempt, PLAY_URIS_MAX_ATTEMPTS)
             continue
         time.sleep(PLAY_URIS_CONFIRM_DELAY_SECONDS)
+        if not _is_current_intent(device_id, token):
+            logger.info("play_uris %s: superseded by a newer call after attempt %d's play, bailing out", device_id, attempt)
+            return False
         confirm_status = get_status(device_id)
-        if confirm_status and confirm_status.get('status') == 'play':
+        if confirm_status and confirm_status.get('status') == 'play' and confirm_status.get('track_uri') == uris[0]:
             if attempt > 1:
                 logger.info("play_uris %s: confirmed playing on attempt %d/%d", device_id, attempt, PLAY_URIS_MAX_ATTEMPTS)
             return True
+        # The right track loaded but is sitting paused rather than playing -
+        # a different failure mode than "wrong/no track loaded" (the retry
+        # loop above already handles that by re-sending the whole play call).
+        # Confirmed live this specific case needed the same explicit
+        # position_ms reissue resume() already uses to un-stick a paused
+        # device - a bare re-send of {'uris': uris} with no position can
+        # itself land as another silent no-op. Doesn't count against
+        # PLAY_URIS_MAX_ATTEMPTS - it's a same-attempt recovery, not a fresh
+        # attempt at loading the track.
+        if confirm_status and confirm_status.get('track_uri') == uris[0] and confirm_status.get('status') == 'pause' \
+                and _is_current_intent(device_id, token):
+            unstick = _api_request('PUT', '/me/player/play', params={'device_id': device_id}, json_body={
+                'uris': uris, 'position_ms': confirm_status.get('position_ms') or 0,
+            })
+            if unstick is not None:
+                time.sleep(PLAY_URIS_CONFIRM_DELAY_SECONDS)
+                confirm_status = get_status(device_id)
+                if confirm_status and confirm_status.get('status') == 'play' and confirm_status.get('track_uri') == uris[0]:
+                    logger.info("play_uris %s: right track was stuck paused, un-stuck via explicit position_ms reissue", device_id)
+                    return True
         logger.warning(
-            "play_uris %s: attempt %d/%d loaded but didn't start (status=%r)",
-            device_id, attempt, PLAY_URIS_MAX_ATTEMPTS, confirm_status and confirm_status.get('status'),
+            "play_uris %s: attempt %d/%d loaded but didn't start on the right track (status=%r, track_uri=%r, expected=%r)",
+            device_id, attempt, PLAY_URIS_MAX_ATTEMPTS,
+            confirm_status and confirm_status.get('status'), confirm_status and confirm_status.get('track_uri'), uris[0],
         )
     return False
 
@@ -509,6 +610,48 @@ def add_to_queue(device_id, uri):
     lookahead match at a time instead of front-loading a whole batch."""
     result = _api_request('POST', '/me/player/queue', params={'uri': uri, 'device_id': device_id})
     return result is not None
+
+
+CLEAR_QUEUE_MAX_DRAIN = 20
+
+
+def clear_queue(device_id, max_drain=CLEAR_QUEUE_MAX_DRAIN):
+    """Spotify's Web API has no endpoint to remove a track from the queue -
+    once something lands there it can only be consumed by skipping past it.
+    A manually-queued track (via add_to_queue above - this app's own
+    lookahead buffer, or anything queued from another Spotify client)
+    survives a later play()/play_uris() call untouched, confirmed live: it
+    gets spliced in after whatever that call starts, and surfaces later as
+    an unexplained jump to unrelated older music. GET /me/player/queue's
+    `queue` array mixes those in with the *current* context's own upcoming
+    tracks (no way to tell them apart), so this only drains up to
+    max_drain items rather than the whole thing - enough to clear the
+    handful of orphaned single-track entries this app's own lookahead can
+    leave behind (at most one at a time, per session), without turning into
+    a slow walk through an entire playlist's remaining tracks if the prior
+    session was a context (e.g. a Spotify-owned playlist) with a long queue.
+
+    Called via play()/play_uris()'s drain_queue=True, itself only passed for
+    a genuinely new ad-hoc session (a fresh track/Shuffle All/Play All click,
+    switching the destination to Spotify, or restoring a session on Play) -
+    not for in-session Next/Prev or the near-end lookahead handoff
+    (playback_advancer._advance_spotify), which intentionally rely on the
+    single lookahead track add_to_queue just placed there. Best-effort: any
+    failure just leaves the residue for next time rather than blocking
+    playback.
+
+    Caller must already have transferred to device_id (see play()/play_uris())
+    before calling this - GET /me/player/queue and the `next` calls this
+    drains with both act on whatever device is *currently* active
+    account-wide, not necessarily device_id, so calling this against a device
+    that isn't already active drains (or reads) the wrong device's queue."""
+    data = _api_request('GET', '/me/player/queue')
+    if not data:
+        return
+    pending = len(data.get('queue') or [])
+    for _ in range(min(pending, max_drain)):
+        if not next_track(device_id):
+            break
 
 
 # How close a search result's own title/artist must be to what we searched for
