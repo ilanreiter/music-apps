@@ -5,6 +5,7 @@ from difflib import SequenceMatcher
 
 import requests
 
+from . import spotify_connect
 from .artist_info import AUDIODB_BASE_URL
 from .artwork import cache_key_for, normalize_album_name, normalized_album_sql, save_thumbnail
 
@@ -317,16 +318,112 @@ def find_via_audiodb(artist_name, album_name):
     return None
 
 
+def find_via_shazam(artist_name, album_name):
+    """{'raw', 'year', 'source_url'} via Shazam Core's Apple-Music-backed
+    catalog search - the same RapidAPI source shazam_identify.py's Track ID
+    background job already uses for isrc/album/year (see
+    spotify_connect.search_shazam_core). Tried last, after even TheAudioDB:
+    unlike MusicBrainz/Discogs/Deezer/iTunes this shares a single paid-hosting
+    RapidAPI account with that other, continuously-running job, so its quota
+    is both unknown and already partly spent elsewhere - only worth spending
+    here on tracks nothing else (including AudioDB) could find. source_url is
+    always None - Shazam Core has no public browsable page for a search hit,
+    only the catalog attributes themselves.
+
+    Shazam Core has no "search by album" mode (only by song), so unlike
+    find_via_itunes/find_via_deezer above, candidates are scored purely on
+    album_name+artist_name similarity against whatever song each search hit
+    happens to be, then sorted earliest-first same as every other source."""
+    if not spotify_connect.SHAZAM_RAPIDAPI_KEY:
+        return None
+    results = spotify_connect.search_shazam_core(f'{artist_name} {album_name}')
+    if not results:
+        return None
+
+    candidates = []
+    for result in results:
+        if not result.get('album_name') or not result.get('artwork_url'):
+            continue
+        score = (_similar(album_name, result['album_name']) + _similar(artist_name, result['artist_name'])) / 2
+        if score >= MATCH_THRESHOLD:
+            candidates.append(result)
+    candidates.sort(key=lambda r: r.get('year') or 9999)
+
+    for result in candidates:
+        raw = download_bytes(result['artwork_url'])
+        if raw:
+            return {'raw': raw, 'year': result.get('year'), 'source_url': None}
+    return None
+
+
 SEARCH_PACING_SECONDS = 0.5
+
+
+def apply_artwork_result(conn, track_id, artist_name, album_name, existing_year, result, mark_checked_on_miss):
+    """Persists a found-artwork result (or a miss) for track_id: downloads
+    and caches the image under the shared per-album cache_key so every
+    track on that album picks it up, not just this one row (an album is
+    typically many rows in known_tracks, one per track); sets has_artwork
+    accordingly; fills year only where it was blank; and records
+    artwork_source_url. Shared by backfill_external_artwork (which has
+    genuinely exhausted every source in its own chain by the time it calls
+    this) and shazam_identify.run (which only ever tries Shazam,
+    opportunistically, as a side effect of identifying a track) - that's
+    why mark_checked_on_miss is a parameter rather than always True: a miss
+    from a single-source opportunistic attempt must NOT flip
+    external_artwork_checked, or the row would silently drop out of the
+    dedicated backfill job's queue before the rest of its chain
+    (MusicBrainz/Discogs/Deezer/iTunes/AudioDB) ever got a turn on it.
+
+    Returns whether artwork was actually found/saved. A no-op (no DB write
+    at all, not even a commit) when nothing was found and
+    mark_checked_on_miss is False - the row is left exactly as it was for
+    the dedicated job to still pick up."""
+    found = bool(result and save_thumbnail(cache_key_for(track_id, artist_name, album_name), result['raw']))
+    if not found and not mark_checked_on_miss:
+        return False
+
+    new_year = (result.get('year') if result else None) if not existing_year else None
+    source_url = result.get('source_url') if result else None
+
+    # WHERE ... has_artwork = FALSE restricts this to rows that were
+    # actually part of the "still missing" set - every matched row is a
+    # definite FALSE already, so setting it to `found` directly is
+    # unambiguous (no NULL/never-checked rows get touched or reinterpreted
+    # here). year only ever fills a blank (COALESCE keeps any
+    # locally-tagged year untouched).
+    cur = conn.cursor()
+    if album_name:
+        cur.execute(f"""
+            UPDATE known_tracks SET external_artwork_checked = TRUE, has_artwork = %(found)s,
+                year = COALESCE(year, %(new_year)s), artwork_source_url = COALESCE(artwork_source_url, %(source_url)s)
+            WHERE artist_name = %(artist)s AND {normalized_album_sql()} = %(normalized_album)s
+              AND has_artwork = FALSE
+        """, {
+            'found': found, 'new_year': new_year, 'source_url': source_url,
+            'artist': artist_name, 'normalized_album': normalize_album_name(album_name),
+        })
+    else:
+        cur.execute(
+            "UPDATE known_tracks SET external_artwork_checked = TRUE, has_artwork = %s, "
+            "year = COALESCE(year, %s), artwork_source_url = COALESCE(artwork_source_url, %s) "
+            "WHERE id = %s AND has_artwork = FALSE",
+            (found, new_year, source_url, track_id),
+        )
+    conn.commit()
+    cur.close()
+    return found
 
 
 def backfill_external_artwork(get_connection, progress):
     """For tracks with no artwork found locally (has_artwork = FALSE, set by
-    the Check Artwork job), tries free external sources in order: MusicBrainz
+    the Check Artwork job), tries external sources in order: MusicBrainz
     + Cover Art Archive, then Discogs (particularly strong for regional/vinyl
     releases), then Deezer, then the iTunes Search API, then TheAudioDB's
-    album endpoint (last, since it shares artist_info.py's community
-    rate-limited key). Alongside artwork, also backfills release year
+    album endpoint (since it shares artist_info.py's community rate-limited
+    key), then finally Shazam Core (see find_via_shazam - shares its RapidAPI
+    quota with the separate, continuously-running Track ID job, so it's the
+    very last resort). Alongside artwork, also backfills release year
     (only where the local tag left it blank) and a link to whichever source
     matched, from the same lookup - no extra API calls needed for that.
 
@@ -381,6 +478,8 @@ def backfill_external_artwork(get_connection, progress):
                     result = find_via_itunes(artist_name, album_name or '')
                 if not result and album_name:
                     result = find_via_audiodb(artist_name, album_name)
+                if not result and album_name:
+                    result = find_via_shazam(artist_name, album_name)
             except RateLimited as e:
                 resume_at = time.time() + e.retry_after_seconds
                 progress.update(status='waiting', resume_at=resume_at)
@@ -388,36 +487,9 @@ def backfill_external_artwork(get_connection, progress):
                 progress.update(status='running', resume_at=None)
                 continue
 
-            found = bool(result and save_thumbnail(cache_key_for(track_id, artist_name, album_name), result['raw']))
-            new_year = (result.get('year') if result else None) if not existing_year else None
-            source_url = result.get('source_url') if result else None
-
-            # WHERE ... has_artwork = FALSE restricts this to rows that were
-            # actually part of the "still missing" set this job targets -
-            # every matched row is a definite FALSE already, so setting it to
-            # `found` directly is unambiguous (no NULL/never-checked rows
-            # get touched or reinterpreted here). year only ever fills a
-            # blank (COALESCE keeps any locally-tagged year untouched).
-            cur = conn.cursor()
-            if album_name:
-                cur.execute(f"""
-                    UPDATE known_tracks SET external_artwork_checked = TRUE, has_artwork = %(found)s,
-                        year = COALESCE(year, %(new_year)s), artwork_source_url = COALESCE(artwork_source_url, %(source_url)s)
-                    WHERE artist_name = %(artist)s AND {normalized_album_sql()} = %(normalized_album)s
-                      AND has_artwork = FALSE
-                """, {
-                    'found': found, 'new_year': new_year, 'source_url': source_url,
-                    'artist': artist_name, 'normalized_album': normalize_album_name(album_name),
-                })
-            else:
-                cur.execute(
-                    "UPDATE known_tracks SET external_artwork_checked = TRUE, has_artwork = %s, "
-                    "year = COALESCE(year, %s), artwork_source_url = COALESCE(artwork_source_url, %s) "
-                    "WHERE id = %s AND has_artwork = FALSE",
-                    (found, new_year, source_url, track_id),
-                )
-            conn.commit()
-            cur.close()
+            found = apply_artwork_result(
+                conn, track_id, artist_name, album_name, existing_year, result, mark_checked_on_miss=True,
+            )
 
             progress['found' if found else 'still_missing'] += 1
             progress['processed'] += 1

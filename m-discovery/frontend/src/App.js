@@ -2820,6 +2820,11 @@ function CleanupTab({ apiBase, activeTab, nowPlaying, isPlaying, onTrackPlayClic
   const [trackIdTotal, setTrackIdTotal] = useState(0);
   const trackIdPollRef = useRef(null);
 
+  // Album-level artwork coverage - shared between the Missing Artwork and
+  // Track ID tabs (both jobs can find artwork now, see
+  // shazam_identify.run's opportunistic Shazam artwork save).
+  const [albumArtworkStats, setAlbumArtworkStats] = useState(null);
+
   const fetchDuplicates = async () => {
     setDuplicatesLoading(true);
     try {
@@ -2863,7 +2868,10 @@ function CleanupTab({ apiBase, activeTab, nowPlaying, isPlaying, onTrackPlayClic
         if (response.data.status === 'done' || response.data.status === 'error') {
           clearInterval(artworkPollRef.current);
           artworkPollRef.current = null;
-          if (response.data.status === 'done') fetchMissingArtwork(0);
+          if (response.data.status === 'done') {
+            fetchMissingArtwork(0);
+            fetchAlbumArtworkStats();
+          }
         }
       } catch (err) {
         clearInterval(artworkPollRef.current);
@@ -2907,6 +2915,7 @@ function CleanupTab({ apiBase, activeTab, nowPlaying, isPlaying, onTrackPlayClic
         if (response.data.status === 'running' || response.data.status === 'done') {
           fetchMissingArtwork(0);
           fetchExternalArtworkFound(0);
+          fetchAlbumArtworkStats();
         }
         if (response.data.status === 'done' || response.data.status === 'error') {
           clearInterval(externalArtworkPollRef.current);
@@ -3010,13 +3019,26 @@ function CleanupTab({ apiBase, activeTab, nowPlaying, isPlaying, onTrackPlayClic
 
   const pollTrackId = () => {
     if (trackIdPollRef.current) clearInterval(trackIdPollRef.current);
-    trackIdPollRef.current = setInterval(fetchTrackIdInfo, 5000);
+    trackIdPollRef.current = setInterval(() => {
+      fetchTrackIdInfo();
+      fetchAlbumArtworkStats();
+    }, 5000);
+  };
+
+  const fetchAlbumArtworkStats = async () => {
+    try {
+      const response = await axios.get(`${apiBase}/library/artwork/album-stats`);
+      setAlbumArtworkStats(response.data);
+    } catch (err) {
+      console.error('Error fetching album artwork stats:', err);
+    }
   };
 
   useEffect(() => {
     if (activeTab !== 'cleanup') return;
     if (subTab === 'duplicates' && duplicateGroups === null) fetchDuplicates();
     if (subTab === 'missing-tracks' && missingTracksAlbums === null) fetchMissingTracks();
+    if (subTab === 'missing-artwork' || subTab === 'track-id') fetchAlbumArtworkStats();
     if (subTab === 'missing-artwork' && artworkCheckStatus === null) {
       axios.get(`${apiBase}/library/check-artwork/status`).then((response) => {
         setArtworkCheckStatus(response.data);
@@ -3196,6 +3218,15 @@ function CleanupTab({ apiBase, activeTab, nowPlaying, isPlaying, onTrackPlayClic
 
       {subTab === 'missing-artwork' && (
         <div className="cleanup-panel">
+          {albumArtworkStats && (
+            <p className="scan-summary">
+              {albumArtworkStats.albums_with_artwork.toLocaleString()} of{' '}
+              {albumArtworkStats.total_albums.toLocaleString()} albums have artwork
+              {albumArtworkStats.total_albums > 0
+                ? ` (${Math.round((albumArtworkStats.albums_with_artwork / albumArtworkStats.total_albums) * 100)}%)`
+                : ''}
+            </p>
+          )}
           <button
             className="scan-btn"
             onClick={startArtworkCheck}
@@ -3422,6 +3453,15 @@ function CleanupTab({ apiBase, activeTab, nowPlaying, isPlaying, onTrackPlayClic
 
       {subTab === 'track-id' && (
         <div className="cleanup-panel">
+          {albumArtworkStats && (
+            <p className="scan-summary">
+              {albumArtworkStats.albums_with_artwork.toLocaleString()} of{' '}
+              {albumArtworkStats.total_albums.toLocaleString()} albums have artwork
+              {albumArtworkStats.total_albums > 0
+                ? ` (${Math.round((albumArtworkStats.albums_with_artwork / albumArtworkStats.total_albums) * 100)}%)`
+                : ''}
+            </p>
+          )}
           {trackIdStats && trackIdStats.identified > 0 && (() => {
             const renamed = trackIdStats.renamed || 0;
             const alreadyCorrect = trackIdStats.already_correct || 0;

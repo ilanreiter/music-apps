@@ -263,6 +263,10 @@ class TrackListResponse(BaseModel):
     artist_count: int
     tracks: List[Track]
 
+class AlbumArtworkStats(BaseModel):
+    total_albums: int
+    albums_with_artwork: int
+
 class TrackAlbumPosition(BaseModel):
     track_number: Optional[int] = None
     track_total: Optional[int] = None
@@ -1766,6 +1770,33 @@ async def start_external_artwork():
 @app.get("/api/library/external-artwork/status", response_model=ExternalArtworkStatus)
 async def get_external_artwork_status():
     return external_artwork_progress
+
+@app.get("/api/library/artwork/album-stats", response_model=AlbumArtworkStats)
+async def get_album_artwork_stats(db: psycopg2.extensions.connection = Depends(get_db)):
+    # Album-level coverage, not track-level - shown on both the Missing
+    # Artwork and Track ID tabs (the latter can now find artwork too, via
+    # the Shazam integration in shazam_identify.run). Grouped the same way
+    # artwork itself is cached/shared (artist_name + normalized album, see
+    # artwork.cache_key_for) - has_artwork is kept consistent across every
+    # track in a group by the jobs that set it (check_artwork_presence's own
+    # sibling broadcast, external_artwork.apply_artwork_result), so
+    # bool_or(has_artwork) per group reflects the album's real state even if
+    # a run is still mid-progress and hasn't touched every row in the group
+    # yet. Tracks with no album tag at all aren't really "an album" to count
+    # here, so they're excluded rather than each becoming a singleton group.
+    cur = db.cursor()
+    cur.execute(f"""
+        SELECT COUNT(*), COUNT(*) FILTER (WHERE has_art)
+        FROM (
+            SELECT bool_or(has_artwork) AS has_art
+            FROM known_tracks
+            WHERE album_name IS NOT NULL AND album_name <> ''
+            GROUP BY artist_name, {normalized_album_sql('album_name')}
+        ) albums
+    """)
+    total_albums, albums_with_artwork = cur.fetchone()
+    cur.close()
+    return {"total_albums": total_albums, "albums_with_artwork": albums_with_artwork}
 
 @app.get("/api/history", response_model=List[DiscoveryHistoryEntry])
 async def get_discovery_history(db: psycopg2.extensions.connection = Depends(get_db)):

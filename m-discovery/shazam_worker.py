@@ -13,6 +13,13 @@ async def _recognize(file_path):
     if not title or not artist:
         return {}
     data = {'title': title, 'artist': artist}
+    # Cover art straight off the same recognize() response - no extra call,
+    # so worth grabbing even though most callers only want isrc/album/year
+    # from here. coverarthq is the larger of the two Shazam normally serves.
+    images = track.get('images') or {}
+    artwork_url = images.get('coverarthq') or images.get('coverart')
+    if artwork_url:
+        data['artwork_url'] = artwork_url
     # track_about is a second call to Shazam's own servers (same as
     # recognize, no RapidAPI involved) that includes an ISRC directly as a
     # top-level field - getting it here means the caller never needs
