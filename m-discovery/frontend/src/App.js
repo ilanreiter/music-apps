@@ -2077,7 +2077,14 @@ function App() {
             {drill || libraryMode === 'all' ? (
               <>
                 <div className="library-header">
-                  <h2>{drill ? '' : `Playing on: ${outputDevice ? outputDevice.name : 'This Browser'}`}</h2>
+                  {!drill && (
+                    <h2>
+                      Playing on:{' '}
+                      <span style={{ color: isPlaying ? '#16a34a' : 'var(--text-main)' }}>
+                        {outputDevice ? outputDevice.name : 'This Browser'}
+                      </span>
+                    </h2>
+                  )}
                   {!drill && libraryTracks.length > 0 && (
                     <div className="group-actions">
                       <button className="group-action-btn" onClick={() => playCurrentFilter()}>&#9654; Play All</button>

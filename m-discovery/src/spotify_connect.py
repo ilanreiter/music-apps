@@ -211,12 +211,25 @@ def _api_request(method, path, params=None, json_body=None, retried=False):
 _device_last_outcome = {}  # device_id -> 'ok' | 'failed'
 
 
+def _device_display_name(d):
+    # Some Spotify Connect implementations (confirmed live on two real AVR
+    # receivers on this account) never send a real device name during
+    # registration - Spotify's own servers then fall back to the raw device
+    # id as "name" verbatim, which every client reading this list (this app,
+    # the official Spotify app, etc.) sees as-is. Swap in the device's own
+    # `type` (Spotify's own coarse category - "AVR", "Speaker", "TV", ...)
+    # as a far more legible fallback than a 40-character hex string.
+    if d['name'] != d['id']:
+        return d['name']
+    return f"{d.get('type') or 'Spotify'} (unnamed)"
+
+
 def list_devices():
     data = _api_request('GET', '/me/player/devices')
     if data is None:
         return []
     return [
-        {'id': d['id'], 'name': d['name'], 'status': _device_last_outcome.get(d['id'], 'unknown')}
+        {'id': d['id'], 'name': _device_display_name(d), 'status': _device_last_outcome.get(d['id'], 'unknown')}
         for d in data.get('devices', [])
     ]
 
