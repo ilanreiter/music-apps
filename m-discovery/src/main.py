@@ -259,6 +259,8 @@ class LibraryStats(BaseModel):
 
 class TrackListResponse(BaseModel):
     total: int
+    album_count: int
+    artist_count: int
     tracks: List[Track]
 
 class TrackAlbumPosition(BaseModel):
@@ -336,6 +338,7 @@ class ChromecastStatus(BaseModel):
 class SpotifyDevice(BaseModel):
     id: str
     name: str
+    status: str = 'unknown'  # 'ok' | 'failed' | 'unknown' - see spotify_connect._device_last_outcome
 
 class SpotifyPlayRequest(BaseModel):
     context_uri: str
@@ -556,8 +559,22 @@ async def get_known_tracks(
             from_sql = f"known_tracks {where_sql}"
 
         cur = db.cursor(cursor_factory=RealDictCursor)
-        cur.execute(f"SELECT COUNT(*) AS count FROM {from_sql}", params)
-        total = cur.fetchone()['count']
+        # album_count matches the frontend's own "artist||album" grouping key
+        # (see albumGroupKey in App.js) rather than a plain DISTINCT album_name,
+        # so a compilation-style empty-artist album and same-titled albums by
+        # different artists count the same way here as they do in the Shuffle
+        # Albums grouping itself. artist_name is a required (NOT NULL) column,
+        # so no null-coalescing is needed for the artist half.
+        cur.execute(f"""
+            SELECT COUNT(*) AS count,
+                   COUNT(DISTINCT artist_name || '||' || COALESCE(album_name, '')) AS album_count,
+                   COUNT(DISTINCT artist_name) AS artist_count
+            FROM {from_sql}
+        """, params)
+        counts = cur.fetchone()
+        total = counts['count']
+        album_count = counts['album_count']
+        artist_count = counts['artist_count']
 
         # RANDOM() genuinely reshuffles the matching rows before truncating, so a
         # shuffled fetch is a true uniform sample of the whole filtered set (not
@@ -575,7 +592,7 @@ async def get_known_tracks(
         for track in tracks:
             file_path = track.pop('file_path', None)
             track['file_format'] = os.path.splitext(file_path)[1].lstrip('.').upper() if file_path else None
-        return {"total": total, "tracks": tracks}
+        return {"total": total, "album_count": album_count, "artist_count": artist_count, "tracks": tracks}
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
 

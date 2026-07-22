@@ -199,11 +199,26 @@ def _api_request(method, path, params=None, json_body=None, retried=False):
         return {}
 
 
+# Outcome of the most recent play()/play_uris() call per device - in-memory
+# only, reset on restart. Spotify's own /me/player/devices listing has no
+# reliability signal of its own (a device can be listed as available and
+# still fail to actually sustain playback - confirmed live on this account's
+# "Office Streamer onn", which accepts commands and briefly plays before
+# silently dropping back to paused every time). Recorded by play()/play_uris()
+# below and surfaced through list_devices() so the destination picker can
+# flag a device that's been failing, purely as a heads-up - a 'failed' device
+# can still be selected and tried.
+_device_last_outcome = {}  # device_id -> 'ok' | 'failed'
+
+
 def list_devices():
     data = _api_request('GET', '/me/player/devices')
     if data is None:
         return []
-    return [{'id': d['id'], 'name': d['name']} for d in data.get('devices', [])]
+    return [
+        {'id': d['id'], 'name': d['name'], 'status': _device_last_outcome.get(d['id'], 'unknown')}
+        for d in data.get('devices', [])
+    ]
 
 
 def get_device(device_id):
@@ -283,6 +298,7 @@ def play(device_id, context_uri, track_uri=None, drain_queue=False):
     if track_uri:
         body['offset'] = {'uri': track_uri}
     result = _api_request('PUT', '/me/player/play', params={'device_id': device_id}, json_body=body)
+    _device_last_outcome[device_id] = 'ok' if result is not None else 'failed'
     return result is not None
 
 
@@ -513,6 +529,31 @@ def add_tracks_to_playlist(playlist_id, uris):
 
 PLAY_URIS_MAX_ATTEMPTS = 3
 PLAY_URIS_CONFIRM_DELAY_SECONDS = 2
+SUSTAIN_CHECK_DELAY_SECONDS = 5
+
+
+def _schedule_sustain_check(device_id, expected_uri):
+    """The 2-second confirm check above isn't enough to catch every failure
+    mode - confirmed live on this account's "Office Streamer onn": it
+    genuinely starts playing and satisfies that check, then silently drops
+    back to paused a few seconds later on its own (real device/network
+    flakiness, not anything a repeated play command fixes). That looked like
+    a healthy device to _device_last_outcome even though it wasn't.
+
+    Runs in a background thread rather than blocking the caller for another
+    several seconds on top of the confirm delay already paid above - callers
+    (interactive Next/Prev clicks especially) already return once the initial
+    confirm passes; this only refines the *reliability signal* a moment
+    later, not whether playback started. Deliberately overwrites whatever
+    _device_last_outcome already holds for this device - a good result here
+    should still win over a stale 'failed' from an earlier attempt, and vice
+    versa."""
+    def _check():
+        time.sleep(SUSTAIN_CHECK_DELAY_SECONDS)
+        status = get_status(device_id)
+        sustained = bool(status and status.get('status') == 'play' and status.get('track_uri') == expected_uri)
+        _device_last_outcome[device_id] = 'ok' if sustained else 'failed'
+    threading.Thread(target=_check, daemon=True).start()
 
 
 def play_uris(device_id, uris, drain_queue=False):
@@ -575,6 +616,7 @@ def play_uris(device_id, uris, drain_queue=False):
         if confirm_status and confirm_status.get('status') == 'play' and confirm_status.get('track_uri') == uris[0]:
             if attempt > 1:
                 logger.info("play_uris %s: confirmed playing on attempt %d/%d", device_id, attempt, PLAY_URIS_MAX_ATTEMPTS)
+            _schedule_sustain_check(device_id, uris[0])
             return True
         # The right track loaded but is sitting paused rather than playing -
         # a different failure mode than "wrong/no track loaded" (the retry
@@ -595,12 +637,14 @@ def play_uris(device_id, uris, drain_queue=False):
                 confirm_status = get_status(device_id)
                 if confirm_status and confirm_status.get('status') == 'play' and confirm_status.get('track_uri') == uris[0]:
                     logger.info("play_uris %s: right track was stuck paused, un-stuck via explicit position_ms reissue", device_id)
+                    _schedule_sustain_check(device_id, uris[0])
                     return True
         logger.warning(
             "play_uris %s: attempt %d/%d loaded but didn't start on the right track (status=%r, track_uri=%r, expected=%r)",
             device_id, attempt, PLAY_URIS_MAX_ATTEMPTS,
             confirm_status and confirm_status.get('status'), confirm_status and confirm_status.get('track_uri'), uris[0],
         )
+    _device_last_outcome[device_id] = 'failed'
     return False
 
 

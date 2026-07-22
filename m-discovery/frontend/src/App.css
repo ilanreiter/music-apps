@@ -239,6 +239,31 @@ main.with-player {
   opacity: 0.7;
 }
 
+/* Flags a Spotify Connect device whose most recent play attempt failed to
+   actually start/sustain playback (see spotify_connect._device_last_outcome)
+   - Spotify's own device list has no such signal, a device can be listed as
+   available and still be unreliable (e.g. a budget streamer that loads a
+   track then silently drops back to paused). Purely informational - a
+   flagged device can still be selected and tried. */
+.device-status-dot {
+  flex-shrink: 0;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--text-muted);
+  opacity: 0.4;
+}
+
+.device-status-dot.ok {
+  background: var(--series-2);
+  opacity: 1;
+}
+
+.device-status-dot.failed {
+  background: var(--error);
+  opacity: 1;
+}
+
 .discovery-form {
   background: var(--bg-card);
   padding: 24px;
@@ -777,6 +802,7 @@ main.with-player {
 
 .group-actions {
   display: flex;
+  flex-wrap: wrap;
   gap: 8px;
 }
 

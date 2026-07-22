@@ -76,6 +76,48 @@ function shuffleArray(arr) {
   return copy;
 }
 
+// Group keys for the album/artist shuffle modes below - matches the "artist||
+// album" identity paramsForGroupKey/the album browse view already use, so an
+// album shuffle treats same-titled albums by different artists as distinct,
+// and only folds them together for the empty-artist "compilation" case.
+const albumGroupKey = (t) => `${t.artist_name || ''}||${t.album_name || ''}`;
+const artistGroupKey = (t) => t.artist_name || '';
+
+function countDistinct(tracks, groupKeyFn) {
+  return new Set(tracks.map(groupKeyFn)).size;
+}
+
+// Round-robin-by-group shuffle: each "round" is a randomized pass over every
+// group that still has unplayed tracks, contributing exactly one random track
+// per group per round (so no group repeats within a round), until either
+// maxCount tracks have been picked or every track has been used. Groups are
+// pre-shuffled once up front so "pick a random track from the group" is just
+// an O(1) pop instead of re-randomizing the remaining pool on every draw.
+function groupedShuffle(tracks, groupKeyFn, maxCount) {
+  const groups = new Map();
+  for (const t of tracks) {
+    const key = groupKeyFn(t);
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(t);
+  }
+  for (const pool of groups.values()) {
+    const shuffledPool = shuffleArray(pool);
+    pool.length = 0;
+    pool.push(...shuffledPool);
+  }
+  const limit = maxCount ?? Infinity;
+  const result = [];
+  while (result.length < limit) {
+    const roundKeys = shuffleArray([...groups.keys()].filter((k) => groups.get(k).length > 0));
+    if (roundKeys.length === 0) break;
+    for (const key of roundKeys) {
+      if (result.length >= limit) break;
+      result.push(groups.get(key).pop());
+    }
+  }
+  return result;
+}
+
 // Player-bar icons as SVGs (currentColor) rather than emoji - a color emoji
 // glyph (the old 🔊/📡/📺 destination icons) renders with its own built-in
 // color regardless of CSS `color`, which is why the destination button could
@@ -299,24 +341,35 @@ function App() {
   const [groupsLoading, setGroupsLoading] = useState(false);
   const [libraryTracks, setLibraryTracks] = useState([]);
   const [libraryTotal, setLibraryTotal] = useState(0);
+  // Distinct album/artist counts for whatever's behind libraryTotal above -
+  // the paginated default browse view gets these straight from the server
+  // (a true count over the whole filtered set, unaffected by how many pages
+  // have actually loaded), while every shuffle-fetch path below computes them
+  // client-side from the actual (possibly maxCount-capped) track list, since
+  // a random sample's album/artist diversity can't be derived from the full
+  // filtered set's totals alone.
+  const [libraryAlbumCount, setLibraryAlbumCount] = useState(0);
+  const [libraryArtistCount, setLibraryArtistCount] = useState(0);
   const [libraryLoading, setLibraryLoading] = useState(false);
-  // "Shuffle All" toggle: while on, the flat library list itself is fetched
-  // and displayed in the same shuffled order that got queued for playback,
-  // instead of the default alphabetical browse order.
-  const [libraryShuffleOn, setLibraryShuffleOn] = useState(() => loadLibraryView()?.libraryShuffleOn ?? false);
+  // Flat-library shuffle mode: '' (off), 'track' (plain "Shuffle All"),
+  // 'album' (random album order, one random track per album per round), or
+  // 'artist' (same, grouped by artist). While set, the flat library list
+  // itself is fetched and displayed in the matching shuffled order that got
+  // queued for playback, instead of the default alphabetical browse order.
+  const [libraryShuffleMode, setLibraryShuffleMode] = useState(() => loadLibraryView()?.libraryShuffleMode ?? '');
   // Tracks the last filter/mode/drill/search combo the library-fetch effect
   // below actually fetched for, so it can tell "a filter genuinely changed"
   // apart from "activeTab just flipped back to library" - see that effect.
   const libraryFetchKeyRef = useRef(null);
-  // True only when libraryShuffleOn was restored from a prior session (not a
-  // fresh toggle click) - the very first fetch after a reload should show
+  // True only when libraryShuffleMode was restored from a prior session (not
+  // a fresh toggle click) - the very first fetch after a reload should show
   // the deterministic list, not roll a brand-new random order that's
   // immediately disconnected from whatever's actually still playing
   // (confirmed live: refreshing mid-shuffle produced a completely different
   // track list every single time, since "shuffle" always re-randomizes from
-  // scratch and only the on/off *preference* was ever persisted, never a
+  // scratch and only the mode *preference* was ever persisted, never a
   // specific order).
-  const skipInitialShuffleFetchRef = useRef(loadLibraryView()?.libraryShuffleOn === true);
+  const skipInitialShuffleFetchRef = useRef(!!loadLibraryView()?.libraryShuffleMode);
   const [trackViewStyle, setTrackViewStyle] = useState(() => {
     try {
       return localStorage.getItem('md_track_view_style') || 'list';
@@ -381,14 +434,22 @@ function App() {
   const API_BASE_URL = process.env.REACT_APP_API_URL || '/api';
   const deviceEndpoint = (device) => `${API_BASE_URL}/${device.type}/devices/${device.id}`;
 
+  // Just the device list (not the auth-status round trip) - cheap enough to
+  // call every time the destination picker opens, so its status dots (see
+  // spotify_connect._device_last_outcome) reflect the latest known
+  // reliability rather than whatever was fetched once at page load.
+  const refreshSpotifyDevices = () => {
+    axios.get(`${API_BASE_URL}/spotify/devices`)
+      .then((dr) => setSpotifyDevices(dr.data.map((d) => ({ ...d, type: 'spotify' }))))
+      .catch((err) => console.error('Error fetching Spotify devices:', err));
+  };
+
   const refreshSpotifyStatus = () => {
     axios.get(`${API_BASE_URL}/spotify/auth/status`)
       .then((r) => {
         setSpotifyConnected(r.data.connected);
         if (r.data.connected) {
-          axios.get(`${API_BASE_URL}/spotify/devices`)
-            .then((dr) => setSpotifyDevices(dr.data.map((d) => ({ ...d, type: 'spotify' }))))
-            .catch((err) => console.error('Error fetching Spotify devices:', err));
+          refreshSpotifyDevices();
         } else {
           setSpotifyDevices([]);
         }
@@ -473,7 +534,16 @@ function App() {
         ? { context_uri: nowPlaying.context_uri, track_uri: nowPlaying.uri, clear_queue: true }
         : { uris: [nowPlaying.uri, ...queue.slice(0, SPOTIFY_PLAY_QUEUE_LIMIT).map((t) => t.uri)], clear_queue: true };
       axios.post(`${deviceEndpoint(outputDevice)}/${endpoint}`, payload)
-        .catch((err) => console.error('Error casting to Spotify device:', err));
+        .catch((err) => console.error('Error casting to Spotify device:', err))
+        // The destination picker's status dot (see spotify_connect
+        // ._device_last_outcome) only refreshes when the picker itself is
+        // opened - without this, a device that fails or drops out *after*
+        // the picker was last opened (including the backend's own delayed
+        // sustain check, up to ~5s after this call resolves) never gets
+        // reflected until the user happens to reopen the picker again.
+        // Confirmed live: this is exactly what made a genuinely-failed
+        // device still show its stale green dot.
+        .finally(() => setTimeout(refreshSpotifyDevices, 7000));
       return;
     }
     if (outputDevice.type === 'spotify') {
@@ -745,9 +815,9 @@ function App() {
       filterFormat,
       filterSpotifyAvailable,
       filterTrackLimit,
-      libraryShuffleOn,
+      libraryShuffleMode,
     });
-  }, [activeTab, libraryMode, drill, search, filterGenre, filterDecade, filterQuality, filterFormat, filterSpotifyAvailable, filterTrackLimit, libraryShuffleOn]);
+  }, [activeTab, libraryMode, drill, search, filterGenre, filterDecade, filterQuality, filterFormat, filterSpotifyAvailable, filterTrackLimit, libraryShuffleMode]);
 
   // Persist the playback session (queue/history capped, so a mutation never
   // costs a multi-MB localStorage write) so a reload or reopened tab returns
@@ -866,19 +936,20 @@ function App() {
       return;
     }
     if (drill || libraryMode === 'all') {
-      // If Shuffle All is already on, a filter change re-shuffles the new
-      // matching set rather than silently reverting to alphabetical order.
-      // The Shuffle All toggle itself is handled directly in its own click
-      // handler (not here), so it isn't a dependency of this effect. Except
-      // right after a reload restored libraryShuffleOn=true - that first
-      // fetch restores the exact persisted shuffle order instead of rolling
-      // a fresh one, so it matches whatever's still playing.
-      if (libraryShuffleOn && skipInitialShuffleFetch) {
+      // If a shuffle mode is already active, a filter change re-shuffles the
+      // new matching set rather than silently reverting to alphabetical
+      // order. The shuffle buttons themselves are handled directly in their
+      // own click handler (not here), so libraryShuffleMode isn't a
+      // dependency of this effect. Except right after a reload restored a
+      // non-'' libraryShuffleMode - that first fetch restores the exact
+      // persisted shuffle order instead of rolling a fresh one, so it
+      // matches whatever's still playing.
+      if (libraryShuffleMode && skipInitialShuffleFetch) {
         const persistedIds = loadShuffledIds();
         if (persistedIds && persistedIds.length) fetchLibraryTracksByIds(persistedIds);
-        else fetchLibraryTracksShuffled();
-      } else if (libraryShuffleOn) {
-        fetchLibraryTracksShuffled();
+        else fetchLibraryTracksForShuffleMode(libraryShuffleMode);
+      } else if (libraryShuffleMode) {
+        fetchLibraryTracksForShuffleMode(libraryShuffleMode);
       } else {
         fetchLibraryTracks(0);
       }
@@ -957,6 +1028,8 @@ function App() {
       const params = { ...buildTrackFilterParams(), limit: pageLimit, offset };
       const response = await axios.get(`${API_BASE_URL}/tracks/known`, { params });
       setLibraryTotal(maxCount ? Math.min(response.data.total, maxCount) : response.data.total);
+      setLibraryAlbumCount(response.data.album_count);
+      setLibraryArtistCount(response.data.artist_count);
       setLibraryTracks((prev) => (offset === 0 ? response.data.tracks : [...prev, ...response.data.tracks]));
     } catch (err) {
       console.error('Error fetching tracks:', err);
@@ -975,6 +1048,8 @@ function App() {
       const maxCount = filterTrackLimit ? Number(filterTrackLimit) : undefined;
       const tracks = await fetchAllMatchingShuffled(buildTrackFilterParams(), maxCount);
       setLibraryTotal(tracks.length);
+      setLibraryAlbumCount(countDistinct(tracks, albumGroupKey));
+      setLibraryArtistCount(countDistinct(tracks, artistGroupKey));
       setLibraryTracks(tracks);
       // So a reload can restore this exact order via fetchLibraryTracksByIds
       // below instead of rolling a brand-new random sequence every time.
@@ -988,6 +1063,49 @@ function App() {
     }
   };
 
+  // Album/artist shuffle: unlike plain track shuffle (server-side ORDER BY
+  // RANDOM()), grouping has to happen client-side since it needs every
+  // matching track's album/artist in hand before it can decide an order - so
+  // this fetches the whole matching set in whatever order the server returns
+  // it (no server shuffle needed, groupedShuffle randomizes it), then applies
+  // groupedShuffle. maxCount is applied *after* grouping, not as the fetch
+  // limit, otherwise it'd only ever draw from whichever albums/artists
+  // happened to sort first - the same reason fetchAllMatchingShuffled above
+  // fetches everything before capping.
+  const fetchLibraryTracksGroupedShuffled = async (mode) => {
+    setLibraryLoading(true);
+    try {
+      const params = buildTrackFilterParams();
+      const maxCount = filterTrackLimit ? Number(filterTrackLimit) : undefined;
+      const countResponse = await axios.get(`${API_BASE_URL}/tracks/known`, { params: { ...params, limit: 1, offset: 0 } });
+      const total = countResponse.data.total;
+      let allTracks = [];
+      if (total > 0) {
+        const fullResponse = await axios.get(`${API_BASE_URL}/tracks/known`, { params: { ...params, limit: total, offset: 0 } });
+        allTracks = fullResponse.data.tracks;
+      }
+      const groupKeyFn = mode === 'artist' ? artistGroupKey : albumGroupKey;
+      const tracks = groupedShuffle(allTracks, groupKeyFn, maxCount);
+      setLibraryTotal(tracks.length);
+      setLibraryAlbumCount(countDistinct(tracks, albumGroupKey));
+      setLibraryArtistCount(countDistinct(tracks, artistGroupKey));
+      setLibraryTracks(tracks);
+      saveShuffledIds(tracks.map((t) => t.id));
+      return tracks;
+    } catch (err) {
+      console.error('Error fetching grouped-shuffled tracks:', err);
+      return [];
+    } finally {
+      setLibraryLoading(false);
+    }
+  };
+
+  const fetchLibraryTracksForShuffleMode = (mode) => (
+    mode === 'album' || mode === 'artist'
+      ? fetchLibraryTracksGroupedShuffled(mode)
+      : fetchLibraryTracksShuffled()
+  );
+
   // Restores the exact shuffled order from a prior session (see
   // saveShuffledIds above) rather than generating a fresh random one -
   // confirmed live this was needed: refreshing mid-shuffle used to produce a
@@ -998,6 +1116,8 @@ function App() {
     try {
       const response = await axios.post(`${API_BASE_URL}/tracks/by-ids`, { ids });
       setLibraryTotal(response.data.length);
+      setLibraryAlbumCount(countDistinct(response.data, albumGroupKey));
+      setLibraryArtistCount(countDistinct(response.data, artistGroupKey));
       setLibraryTracks(response.data);
       return response.data;
     } catch (err) {
@@ -1045,6 +1165,8 @@ function App() {
       const tracks = response.data.map((t) => mapSpotifyTrack(t));
       setLibraryTracks(tracks);
       setLibraryTotal(tracks.length);
+      setLibraryAlbumCount(countDistinct(tracks, albumGroupKey));
+      setLibraryArtistCount(countDistinct(tracks, artistGroupKey));
     } catch (err) {
       if (err.response?.status === 403) {
         setPlaylistTracksRestricted(true);
@@ -1053,6 +1175,8 @@ function App() {
       }
       setLibraryTracks([]);
       setLibraryTotal(0);
+      setLibraryAlbumCount(0);
+      setLibraryArtistCount(0);
     } finally {
       setLibraryLoading(false);
     }
@@ -1380,7 +1504,8 @@ function App() {
             ? { context_uri: nowPlaying.context_uri, track_uri: nowPlaying.uri, clear_queue: true }
             : { uris: [nowPlaying.uri, ...queue.slice(0, SPOTIFY_PLAY_QUEUE_LIMIT).map((t) => t.uri)], clear_queue: true };
           axios.post(`${deviceEndpoint(outputDevice)}/${endpoint}`, spotifyPayload)
-            .catch((err) => console.error('Error casting to Spotify device:', err));
+            .catch((err) => console.error('Error casting to Spotify device:', err))
+            .finally(() => setTimeout(refreshSpotifyDevices, 7000));
           return;
         }
         if (outputDevice.type === 'spotify') {
@@ -1653,18 +1778,20 @@ function App() {
     }
   };
 
-  // Shuffle All toggle for the flat library list: turning it on both re-shows
-  // the list in the same shuffled order that gets queued and starts playing
-  // it; turning it off just reverts the list to its default alphabetical
-  // order (doesn't touch whatever's already playing).
-  const toggleLibraryShuffle = async () => {
-    if (libraryShuffleOn) {
-      setLibraryShuffleOn(false);
+  // Shuffle mode buttons for the flat library list ("Shuffle All" = 'track',
+  // "Shuffle Albums" = 'album', "Shuffle Artists" = 'artist'): clicking the
+  // already-active mode turns it off and reverts to the default alphabetical
+  // order (doesn't touch whatever's already playing); clicking a different
+  // mode switches straight to it, re-showing the list in that shuffled order
+  // and starting playback from it.
+  const setLibraryShuffle = async (mode) => {
+    if (libraryShuffleMode === mode) {
+      setLibraryShuffleMode('');
       fetchLibraryTracks(0);
       return;
     }
-    setLibraryShuffleOn(true);
-    const tracks = await fetchLibraryTracksShuffled();
+    setLibraryShuffleMode(mode);
+    const tracks = await fetchLibraryTracksForShuffleMode(mode);
     if (tracks.length === 0) return;
     if (outputDevice?.type === 'spotify') {
       matchAndPlayLocalTracksOnSpotify(tracks);
@@ -1955,10 +2082,24 @@ function App() {
                     <div className="group-actions">
                       <button className="group-action-btn" onClick={() => playCurrentFilter()}>&#9654; Play All</button>
                       <button
-                        className={`group-action-btn${libraryShuffleOn ? ' active' : ''}`}
-                        onClick={toggleLibraryShuffle}
+                        className={`group-action-btn${libraryShuffleMode === 'track' ? ' active' : ''}`}
+                        onClick={() => setLibraryShuffle('track')}
                       >
                         &#128256; Shuffle All
+                      </button>
+                      <button
+                        className={`group-action-btn${libraryShuffleMode === 'album' ? ' active' : ''}`}
+                        onClick={() => setLibraryShuffle('album')}
+                        title="Randomize album order, one random track per album per round, until every album has been played"
+                      >
+                        &#128256; Shuffle Albums
+                      </button>
+                      <button
+                        className={`group-action-btn${libraryShuffleMode === 'artist' ? ' active' : ''}`}
+                        onClick={() => setLibraryShuffle('artist')}
+                        title="Randomize artist order, one random track per artist per round, until every artist has been played"
+                      >
+                        &#128256; Shuffle Artists
                       </button>
                       {spotifyConnected && (
                         <button
@@ -1972,7 +2113,11 @@ function App() {
                       )}
                     </div>
                   )}
-                  <span className="library-count">{libraryTotal.toLocaleString()} tracks</span>
+                  <span className="library-count">
+                    {libraryTotal.toLocaleString()} tracks
+                    {' · '}{libraryAlbumCount.toLocaleString()} albums
+                    {' · '}{libraryArtistCount.toLocaleString()} artists
+                  </span>
                 </div>
                 {libraryTracks.length === 0 ? (
                   <p className="empty-state">
@@ -2112,6 +2257,7 @@ function App() {
         outputDevices={outputDevices}
         outputDevice={outputDevice}
         setOutputDevice={setOutputDevice}
+        onRefreshSpotifyDevices={refreshSpotifyDevices}
         destStatus={destStatus}
         shuffleEnabled={shuffleEnabled}
         onToggleShuffle={toggleShuffle}
@@ -2206,6 +2352,12 @@ function SettingsPanel({ onClose, rootPath, setRootPath, scanning, scanResult, s
                   <span className="device-row-name">{d.name}</span>
                   <span className="device-row-ip">{d.ip || ''}</span>
                   <span className="device-row-type">{d.type === 'chromecast' ? 'Chromecast' : d.type === 'spotify' ? 'Spotify Connect' : 'WiiM'}</span>
+                  {d.type === 'spotify' && d.status && d.status !== 'unknown' && (
+                    <span
+                      className={`device-status-dot ${d.status}`}
+                      title={d.status === 'failed' ? 'Last playback attempt on this device failed' : 'Last playback attempt on this device succeeded'}
+                    />
+                  )}
                 </div>
               ))}
             </div>
@@ -2250,7 +2402,7 @@ function SettingsPanel({ onClose, rootPath, setRootPath, scanning, scanResult, s
 
 function PlayerBar({
   track, queue, isPlaying, hasNext, hasPrev, onNext, onPrev, onTogglePlay, setIsPlaying, audioRef, apiBase,
-  outputDevices, outputDevice, setOutputDevice, destStatus,
+  outputDevices, outputDevice, setOutputDevice, onRefreshSpotifyDevices, destStatus,
   shuffleEnabled, onToggleShuffle, onSeek, onJumpToQueueItem,
   userHasInteracted, initialSeekMs, onInitialSeekApplied,
 }) {
@@ -2258,6 +2410,15 @@ function PlayerBar({
   const [artistInfo, setArtistInfo] = useState(null);
   const [bioExpanded, setBioExpanded] = useState(false);
   const [destMenuOpen, setDestMenuOpen] = useState(false);
+  const toggleDestMenu = () => {
+    setDestMenuOpen((o) => {
+      // Refresh right as it opens (not on every render) so a Spotify
+      // device's status dot reflects the latest known reliability rather
+      // than whatever was fetched once at page load.
+      if (!o && onRefreshSpotifyDevices) onRefreshSpotifyDevices();
+      return !o;
+    });
+  };
   const [localProgress, setLocalProgress] = useState({ currentTime: 0, duration: 0 });
   const [albumPosition, setAlbumPosition] = useState(null);
   const lastArtistRef = useRef(null);
@@ -2462,7 +2623,7 @@ function PlayerBar({
                 <div className="np-destination">
                   <button
                     className={`np-side-btn${outputDevice ? ' active' : ''}`}
-                    onClick={() => setDestMenuOpen((o) => !o)}
+                    onClick={toggleDestMenu}
                     aria-label="Playback destination"
                     title={`Playing on ${destinationLabel}`}
                   >
@@ -2483,6 +2644,12 @@ function PlayerBar({
                           onClick={() => { setOutputDevice(d); setDestMenuOpen(false); }}
                         >
                           {deviceIcon(d)} {d.name}
+                          {d.type === 'spotify' && d.status && d.status !== 'unknown' && (
+                            <span
+                              className={`device-status-dot ${d.status}`}
+                              title={d.status === 'failed' ? 'Last playback attempt on this device failed' : 'Last playback attempt on this device succeeded'}
+                            />
+                          )}
                         </button>
                       ))}
                     </div>
@@ -2537,7 +2704,7 @@ function PlayerBar({
           <div className="np-destination">
             <button
               className={`player-btn${outputDevice ? ' active' : ''}`}
-              onClick={() => setDestMenuOpen((o) => !o)}
+              onClick={toggleDestMenu}
               aria-label="Playback destination"
               title={`Playing on ${destinationLabel}`}
             >
@@ -2558,6 +2725,12 @@ function PlayerBar({
                     onClick={() => { setOutputDevice(d); setDestMenuOpen(false); }}
                   >
                     {deviceIcon(d)} {d.name}
+                    {d.type === 'spotify' && d.status && d.status !== 'unknown' && (
+                      <span
+                        className={`device-status-dot ${d.status}`}
+                        title={d.status === 'failed' ? 'Last playback attempt on this device failed' : 'Last playback attempt on this device succeeded'}
+                      />
+                    )}
                   </button>
                 ))}
               </div>
