@@ -742,6 +742,63 @@ main.with-player {
   border-color: var(--accent);
 }
 
+.discover-filter-btn {
+  flex-shrink: 0;
+  padding: 9px 14px;
+  background: var(--accent);
+  border: none;
+  border-radius: 8px;
+  color: white;
+  font-size: 0.85rem;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.15s;
+}
+
+.discover-filter-btn:hover {
+  background: var(--accent-hover);
+}
+
+.discover-filter-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.discover-results {
+  margin-top: 28px;
+  padding-top: 20px;
+  border-top: 1px solid var(--border);
+}
+
+.discover-results h2 {
+  font-size: 1.1rem;
+  color: var(--text-muted);
+  margin-bottom: 14px;
+}
+
+.play-btn.preview {
+  background: var(--bg-input);
+  color: var(--text-muted);
+  font-size: 0.7rem;
+}
+
+.play-btn.preview:hover {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.tracks-grid.grid-view .track-card .play-btn.preview {
+  align-self: center;
+}
+
+.preview-label {
+  color: var(--accent);
+  font-size: 0.78rem;
+  font-weight: 600;
+  margin-top: 2px;
+}
+
 .view-style-toggle {
   display: flex;
   flex-shrink: 0;

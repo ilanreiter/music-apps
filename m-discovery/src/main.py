@@ -169,7 +169,7 @@ async def track_activity(request, call_next):
 
 # Configure Gemini API
 genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
-model = genai.GenerativeModel('gemini-1.5-pro')
+model = genai.GenerativeModel('gemini-flash-latest')
 
 # Pydantic models for data validation and serialization
 class Track(BaseModel):
@@ -188,6 +188,12 @@ class Track(BaseModel):
     artwork_source_url: Optional[str] = None
     is_favorite: Optional[bool] = False
     last_played: Optional[str] = None # Will be datetime string
+    # Populated only for Discover-tab suggestions on non-English tracks (see
+    # _build_prompt) - international catalogs (iTunes/Deezer/Spotify) index
+    # these under their native-script name, not a romanized transliteration,
+    # so search needs this to actually find the track. None for everything else.
+    native_track_name: Optional[str] = None
+    native_artist_name: Optional[str] = None
 
 class DiscoveryHistoryEntry(BaseModel):
     id: Optional[int] = None
@@ -1387,6 +1393,69 @@ def match_local_track_to_spotify(track_id: int, db: psycopg2.extensions.connecti
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Track not found")
     return result
 
+class DiscoverTrackMatchRequest(BaseModel):
+    track_name: str
+    artist_name: str
+    native_track_name: Optional[str] = None
+    native_artist_name: Optional[str] = None
+
+@app.post("/api/spotify/discover-match", response_model=SpotifyMatchResult)
+def match_discovered_track_to_spotify(params: DiscoverTrackMatchRequest):
+    """Same catalog search as the local-library matcher above, but for a
+    Discover-tab suggestion that has no known_tracks row to read from or
+    cache into - nothing to persist, it's a one-off ephemeral lookup."""
+    if not spotify_connect.is_connected():
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Spotify not connected")
+    # Confirmed empirically against iTunes/Deezer (both back the same catalog
+    # data Spotify draws from) for Hebrew: an artist with an established
+    # international presence is indexed under their *romanized* name (e.g.
+    # "Ehud Banai"), but individual *track titles* stay in native script
+    # ("יוצא לאור") - a fully-romanized title gets zero raw results, and so
+    # does a fully-native search (mismatches the romanized artist field).
+    # Try romanized-artist + native-title first (the combination that
+    # actually matched real catalog entries), then the plain romanized
+    # fallback. Capped at 2 attempts (not a 3rd fully-native one) since
+    # Spotify's search is the more rate-limit-fragile of the two APIs this
+    # app talks to for Discover.
+    attempts = []
+    if params.native_track_name:
+        attempts.append((params.native_track_name, params.artist_name))
+    attempts.append((params.track_name, params.artist_name))
+    for track_name, artist_name in attempts:
+        result, match, _identified = spotify_connect.search_track(track_name, artist_name)
+        if result == 'unavailable':
+            return {"matched": False, "reason": "unavailable"}
+        if match:
+            return {"matched": True, "uri": match['uri'], "artwork_url": match.get('artwork_url')}
+    return {"matched": False, "reason": "no_match"}
+
+class DiscoverPreviewRequest(BaseModel):
+    track_name: str
+    artist_name: str
+    native_track_name: Optional[str] = None
+    native_artist_name: Optional[str] = None
+
+@app.post("/api/discover/preview")
+def get_discover_track_preview(params: DiscoverPreviewRequest):
+    """30-second sample clip for a Discover suggestion, via iTunes/Deezer -
+    doesn't touch Spotify at all, so works regardless of whether Spotify is
+    connected or rate-limited."""
+    result = None
+    # See match_discovered_track_to_spotify above for how this priority order
+    # was derived - romanized artist + native title matched real iTunes/
+    # Deezer catalog entries where neither fully-romanized nor fully-native
+    # did. iTunes/Deezer are far less rate-limit-sensitive than Spotify, so a
+    # 3rd (fully-native) attempt is worth it here specifically.
+    if params.native_track_name:
+        result = external_artwork.find_track_preview(params.artist_name, params.native_track_name)
+    if not result and params.native_track_name and params.native_artist_name:
+        result = external_artwork.find_track_preview(params.native_artist_name, params.native_track_name)
+    if not result:
+        result = external_artwork.find_track_preview(params.artist_name, params.track_name)
+    if not result:
+        return {"preview_url": None, "artwork_url": None}
+    return {"preview_url": result['preview_url'], "artwork_url": result.get('artwork_url')}
+
 def _start_spotify_prewarm_background():
     """Kicks off the background Spotify pre-warm job if one isn't already
     running. Returns False (no-op, no error) if one is already in flight -
@@ -1821,7 +1890,13 @@ def _build_prompt(params: DiscoveryParameters) -> str:
         f"I'm looking for music similar to '{params.seed_tracks}'.",
         "Suggest 5-10 tracks that I might not have heard before.",
         "For each track, provide the track name, artist name, and album name.",
-        "Format the output as a JSON array of objects, where each object has 'track_name', 'artist_name', and 'album_name' keys."
+        "If the track's original language isn't English, also provide 'native_track_name' and 'native_artist_name' "
+        "with the title and artist written in their original script/language (e.g. Hebrew, Cyrillic, Japanese) - "
+        "international music catalogs (iTunes, Deezer, Spotify) index non-English tracks under their native-script "
+        "name, not a romanized transliteration, so this is needed to actually find and play these tracks. "
+        "Omit or set these to null for tracks that are already in English.",
+        "Format the output as a JSON array of objects, where each object has 'track_name', 'artist_name', "
+        "'album_name', 'native_track_name', and 'native_artist_name' keys."
     ]
     if params.genre:
         prompt_parts.append(f"The genre should be: {params.genre}.")

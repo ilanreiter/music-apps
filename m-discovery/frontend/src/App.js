@@ -270,16 +270,13 @@ function savePosition(position) {
 }
 
 function App() {
+  // Discover-tab suggestions (AI-recommended tracks seeded from the Library
+  // tab's own current filters) - rendered inline in the Library tab, not a
+  // separate tab, so this lives alongside the rest of the library state.
   const [discoveredTracks, setDiscoveredTracks] = useState([]);
+  const [discovering, setDiscovering] = useState(false);
+  const [discoverError, setDiscoverError] = useState(null);
 
-  const [seedTracks, setSeedTracks] = useState('');
-  const [genre, setGenre] = useState('');
-  const [mood, setMood] = useState('');
-  const [tempo, setTempo] = useState('');
-  const [complexity, setComplexity] = useState('');
-
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState(null);
   const [activeTab, setActiveTab] = useState(() => loadLibraryView()?.activeTab ?? 'library');
   const [settingsOpen, setSettingsOpen] = useState(false);
 
@@ -910,7 +907,7 @@ function App() {
   // an id nothing in that view will ever match.
   useEffect(() => {
     if (!nowPlaying) return;
-    const playedId = nowPlaying.local_id ?? nowPlaying.id;
+    const playedId = nowPlaying.local_id ?? nowPlaying.discover_id ?? nowPlaying.id;
     setPlayedTrackIds((prev) => (prev.has(playedId) ? prev : new Set(prev).add(playedId)));
   }, [nowPlaying]);
 
@@ -927,6 +924,11 @@ function App() {
     const key = JSON.stringify([libraryMode, drill, search, filterGenre, filterDecade, filterQuality, filterFormat, filterSpotifyAvailable, filterTrackLimit]);
     if (key === libraryFetchKeyRef.current) return;
     libraryFetchKeyRef.current = key;
+    // A filter change invalidates any Discover results seeded from the old
+    // filter set - clear them rather than leave stale suggestions on screen
+    // under a set of tracks they weren't actually generated from.
+    setDiscoveredTracks([]);
+    setDiscoverError(null);
     const skipInitialShuffleFetch = skipInitialShuffleFetchRef.current;
     skipInitialShuffleFetchRef.current = false;
     // Spotify playlists aren't in known_tracks - can't reuse the SQL-backed
@@ -1252,26 +1254,80 @@ function App() {
     }
   };
 
-  const handleDiscoverMusic = async (e) => {
-    e.preventDefault();
-    setLoading(true);
-    setError(null);
-    setDiscoveredTracks([]);
+  // How many currently-filtered library tracks to sample when building a
+  // Discover seed, and how many distinct artist names to actually send -
+  // recommending "similar artists" reads better to Gemini than a long list
+  // of individual track titles, and keeps the prompt a sane length even when
+  // the active filter matches thousands of tracks.
+  const DISCOVER_SEED_SAMPLE_LIMIT = 40;
+  const DISCOVER_SEED_ARTIST_LIMIT = 15;
+
+  const handleDiscoverFromLibrary = async () => {
+    setDiscovering(true);
+    setDiscoverError(null);
     try {
+      const sampleParams = { ...buildTrackFilterParams(), shuffle: true, limit: DISCOVER_SEED_SAMPLE_LIMIT };
+      const sampleRes = await axios.get(`${API_BASE_URL}/tracks/known`, { params: sampleParams });
+      const sampleTracks = sampleRes.data.tracks || [];
+      if (sampleTracks.length === 0) {
+        setDiscoverError('No tracks match your current filters to seed Discover from.');
+        setDiscoveredTracks([]);
+        return;
+      }
+      const seenArtists = new Set();
+      const artists = [];
+      for (const t of sampleTracks) {
+        if (!seenArtists.has(t.artist_name)) {
+          seenArtists.add(t.artist_name);
+          artists.push(t.artist_name);
+        }
+        if (artists.length >= DISCOVER_SEED_ARTIST_LIMIT) break;
+      }
       const response = await axios.post(`${API_BASE_URL}/discover`, {
-        seed_tracks: seedTracks,
-        genre: genre || null,
-        mood: mood || null,
-        tempo: tempo ? parseInt(tempo) : null,
-        complexity: complexity || null,
+        seed_tracks: artists.join(', '),
+        genre: filterGenre || null,
         exclude_known: true,
       });
-      setDiscoveredTracks(response.data);
+      const mapped = response.data.map((t, i) => ({
+        id: `discover-${i}`,
+        source: 'discover',
+        track_name: t.track_name,
+        artist_name: t.artist_name,
+        album_name: t.album_name,
+        // Populated by Gemini only for non-English tracks (see _build_prompt
+        // in main.py) - international catalogs index these under their
+        // native-script name, not the romanized track_name/artist_name
+        // above, so the match/preview endpoints try this first when present.
+        native_track_name: t.native_track_name || null,
+        native_artist_name: t.native_artist_name || null,
+        artwork_url: null,
+        preview_url: undefined, // undefined = not yet looked up, null = looked up and none found
+      }));
+      setDiscoveredTracks(mapped);
+      // Eagerly resolve preview/artwork for every result right away (not on
+      // click) - the pool is small (5-10 tracks, per _build_prompt in
+      // main.py), so this is cheap, gives progressive artwork reveal within a
+      // second or two, and means sampleQueueDiscoveredTracks below usually
+      // has a preview_url already in hand with no extra network round trip.
+      mapped.forEach((t) => {
+        axios.post(`${API_BASE_URL}/discover/preview`, {
+          track_name: t.track_name, artist_name: t.artist_name,
+          native_track_name: t.native_track_name, native_artist_name: t.native_artist_name,
+        })
+          .then((r) => {
+            setDiscoveredTracks((prev) => prev.map((p) => (p.id === t.id
+              ? { ...p, preview_url: r.data.preview_url, artwork_url: p.artwork_url || r.data.artwork_url }
+              : p)));
+          })
+          .catch(() => {
+            setDiscoveredTracks((prev) => prev.map((p) => (p.id === t.id ? { ...p, preview_url: null } : p)));
+          });
+      });
     } catch (err) {
-      setError('Failed to discover music. Please try again.');
+      setDiscoverError('Failed to discover music. Please try again.');
       console.error('Error discovering music:', err);
     } finally {
-      setLoading(false);
+      setDiscovering(false);
     }
   };
 
@@ -1457,6 +1513,120 @@ function App() {
     });
   };
 
+  // Discover suggestions are AI text (track/artist/album name), never a
+  // local file or a known_tracks row. Unlike matchAndPlayLocalTracksOnSpotify
+  // above, Discover's candidate pool is always small and bounded (5-10
+  // tracks, per _build_prompt in main.py) - so rather than the incremental
+  // one-ahead lookahead built for browsing a whole (potentially huge)
+  // library, these two functions just resolve the *whole* pool: start the
+  // first match immediately (same low-latency-first philosophy), then keep
+  // resolving the rest and append them to the queue as they land, giving
+  // working Next/Prev within a couple seconds. Both reuse the shared
+  // spotifyMatchRequestIdRef/matchingTrackId race-guard above so a newer
+  // click (of either kind) correctly supersedes an older in-flight one.
+  const matchAndQueueDiscoveredTracksOnSpotify = async (candidates) => {
+    if (candidates.length === 0) return;
+    destNeedsInitialCastRef.current = false;
+    const requestId = ++spotifyMatchRequestIdRef.current;
+    let firstStarted = false;
+    for (const candidate of candidates) {
+      if (spotifyMatchRequestIdRef.current !== requestId) return; // superseded
+      setMatchingTrackId(candidate.id);
+      let matched, uri, artworkUrl, reason;
+      try {
+        const response = await axios.post(`${API_BASE_URL}/spotify/discover-match`, {
+          track_name: candidate.track_name, artist_name: candidate.artist_name,
+          native_track_name: candidate.native_track_name, native_artist_name: candidate.native_artist_name,
+        });
+        ({ matched, uri, artwork_url: artworkUrl, reason } = response.data);
+      } catch (err) {
+        console.error('Error matching discovered track to Spotify:', err);
+        break;
+      }
+      if (spotifyMatchRequestIdRef.current !== requestId) return;
+      if (!matched) {
+        if (reason === 'unavailable') {
+          if (!firstStarted) setSpotifyPlayHint("Spotify's search is temporarily rate-limited - try again later.");
+          break; // no point burning more requests into the same rate limit
+        }
+        continue; // no match for this one - try the next candidate
+      }
+      const queueEntry = {
+        // discover_id (not local_id!) carries the discover card's own id back
+        // through - renderTrackCard's nowPlayingId bridge uses it to
+        // highlight *this* card as playing rather than the Spotify uri.
+        // local_id would be wrong here: it also drives the "switched to This
+        // Browser/WiiM/Chromecast - fall back to the local file" logic
+        // elsewhere, and a discover suggestion has no local file to fall
+        // back to (it should behave like a genuine Spotify-only track there,
+        // not like a matched library track).
+        id: uri, source: 'spotify', uri, context_uri: null, discover_id: candidate.id,
+        track_name: candidate.track_name, artist_name: candidate.artist_name,
+        album_name: candidate.album_name, artwork_url: artworkUrl,
+      };
+      if (!firstStarted) {
+        startQueue([queueEntry]);
+        firstStarted = true;
+      } else {
+        setQueue((prev) => [...prev, queueEntry]);
+      }
+    }
+    if (spotifyMatchRequestIdRef.current === requestId) setMatchingTrackId(null);
+    if (!firstStarted && spotifyMatchRequestIdRef.current === requestId) {
+      setSpotifyPlayHint(`No Spotify match found for "${candidates[0].track_name}"${candidates.length > 1 ? ' or the tracks after it' : ''}.`);
+    }
+  };
+
+  // Same shape as above, but for the 30-second-preview fallback (This
+  // Browser only - previews never cast to a real device). Usually resolves
+  // near-instantly since handleDiscoverFromLibrary already eagerly prefetched
+  // preview_url for every result as soon as they arrived.
+  const sampleQueueDiscoveredTracks = async (candidates) => {
+    if (candidates.length === 0) return;
+    destNeedsInitialCastRef.current = false;
+    const requestId = ++spotifyMatchRequestIdRef.current;
+    let firstStarted = false;
+    for (const candidate of candidates) {
+      if (spotifyMatchRequestIdRef.current !== requestId) return;
+      let url = candidate.preview_url;
+      let artworkUrl = candidate.artwork_url;
+      if (url === undefined) {
+        setMatchingTrackId(candidate.id);
+        try {
+          const response = await axios.post(`${API_BASE_URL}/discover/preview`, {
+            track_name: candidate.track_name, artist_name: candidate.artist_name,
+            native_track_name: candidate.native_track_name, native_artist_name: candidate.native_artist_name,
+          });
+          url = response.data.preview_url;
+          artworkUrl = artworkUrl || response.data.artwork_url;
+        } catch (err) {
+          console.error('Error fetching preview for discovered track:', err);
+          url = null;
+        }
+        setDiscoveredTracks((prev) => prev.map((t) => (t.id === candidate.id
+          ? { ...t, preview_url: url, artwork_url: t.artwork_url || artworkUrl }
+          : t)));
+      }
+      if (spotifyMatchRequestIdRef.current !== requestId) return;
+      if (!url) continue; // no preview found for this one - try the next candidate
+      const queueEntry = {
+        id: candidate.id, source: 'discover',
+        track_name: candidate.track_name, artist_name: candidate.artist_name,
+        album_name: candidate.album_name, artwork_url: artworkUrl, preview_url: url,
+      };
+      if (!firstStarted) {
+        startQueue([queueEntry]);
+        firstStarted = true;
+      } else {
+        setQueue((prev) => [...prev, queueEntry]);
+      }
+    }
+    if (spotifyMatchRequestIdRef.current === requestId) setMatchingTrackId(null);
+    if (!firstStarted && spotifyMatchRequestIdRef.current === requestId) {
+      setSpotifyPlayHint(`No preview available for "${candidates[0].track_name}"${candidates.length > 1 ? ' or the tracks after it' : ''}.`);
+    }
+  };
+
   // Toggle shuffling of the *remaining* queue, keeping the currently-playing
   // track fixed. Remembers the pre-shuffle order so toggling back off restores
   // the original upcoming sequence rather than re-shuffling again.
@@ -1554,6 +1724,24 @@ function App() {
       togglePlay();
       return;
     }
+    // Discover suggestions have no local file and no known_tracks row. With
+    // a Spotify Connect destination selected, match+play (+queue the rest of
+    // the list) in full; with This Browser selected, fall back to a 30s
+    // preview the same way, so Next/Prev still walk through the list. WiiM/
+    // Chromecast can't do either (previews only ever play through this
+    // browser's own <audio> element, by design - see sampleQueueDiscoveredTracks).
+    if (track.source === 'discover') {
+      const startIndex = list.findIndex((t) => t.id === track.id);
+      const candidates = startIndex >= 0 ? list.slice(startIndex) : [track];
+      if (outputDevice?.type === 'spotify') {
+        matchAndQueueDiscoveredTracksOnSpotify(candidates);
+      } else if (!outputDevice) {
+        sampleQueueDiscoveredTracks(candidates);
+      } else {
+        setSpotifyPlayHint('Select a Spotify Connect device, or switch to This Browser to sample, to play Discover suggestions.');
+      }
+      return;
+    }
     // Spotify tracks stream from Spotify's own servers to a Spotify Connect
     // device - there's no local file to hand to WiiM/Chromecast/this browser,
     // and the reverse (a local file to Spotify Connect) doesn't work either.
@@ -1575,12 +1763,22 @@ function App() {
   // Shared between list and grid display styles - grid mode overlays the play
   // button on the artwork instead of showing it as a separate row element.
   const renderTrackCard = (track, list) => {
-    // nowPlaying.id is a Spotify uri for a locally-matched track (see
-    // mapMatchedLocalTrack), not the local id this card is keyed by - bridge
-    // via local_id so "currently playing" still highlights the right card.
-    const nowPlayingId = nowPlaying && (nowPlaying.local_id ?? nowPlaying.id);
+    // nowPlaying.id is a Spotify uri for a locally-matched or Spotify-matched
+    // discover track (see mapMatchedLocalTrack/matchAndQueueDiscoveredTracksOnSpotify),
+    // not the id this card is keyed by - bridge via local_id (library tracks)
+    // or discover_id (Discover suggestions) so "currently playing" still
+    // highlights the right card either way. A previewing discover track
+    // doesn't need bridging at all - its nowPlaying.id already equals the
+    // card's own id (see sampleQueueDiscoveredTracks).
+    const nowPlayingId = nowPlaying && (nowPlaying.local_id ?? nowPlaying.discover_id ?? nowPlaying.id);
+    const isDiscover = track.source === 'discover';
     const isCurrent = nowPlayingId === track.id;
     const isCardPlaying = isCurrent && effectiveIsPlaying;
+    // Only true when *this* card is playing as a 30s preview specifically
+    // (as opposed to a full Spotify match) - nowPlaying.source is 'discover'
+    // only for preview queue entries built by sampleQueueDiscoveredTracks,
+    // 'spotify' for a matched-and-playing-in-full discover suggestion.
+    const isPreviewingThis = isCurrent && nowPlaying?.source === 'discover';
     const isMatching = matchingTrackId === track.id;
     const hasPlayed = !isCurrent && playedTrackIds.has(track.id);
     const wasSkipped = !isCurrent && !hasPlayed && skippedTrackIds.has(track.id);
@@ -1590,16 +1788,45 @@ function App() {
     ) : wasSkipped ? (
       <span className="track-status-badge skipped" title="No Spotify match found - skipped">✕</span>
     ) : null;
+    // Discover suggestions have no known_tracks row, so there's nothing for
+    // the id-based artwork endpoint to serve - only try it for real library
+    // tracks, otherwise it's a guaranteed 404 on every card.
+    const artworkSrc = track.artwork_url || (isDiscover ? null : `${API_BASE_URL}/tracks/${track.id}/artwork`);
+    // Quick single-track sample, independent of the main Play button - only
+    // ever plays through this browser's own <audio> element (previews never
+    // cast to a real device), so it's only offered when that's the active
+    // destination; otherwise it just explains why not.
+    const sampleButton = isDiscover && (
+      <button
+        className="play-btn preview"
+        onClick={(e) => {
+          e.stopPropagation();
+          if (isPreviewingThis) {
+            togglePlay();
+          } else if (outputDevice) {
+            setSpotifyPlayHint('Switch to This Browser to sample tracks.');
+          } else {
+            sampleQueueDiscoveredTracks([track]);
+          }
+        }}
+        aria-label={isPreviewingThis ? 'Stop preview' : 'Sample 30 seconds'}
+        title={isPreviewingThis ? 'Stop preview' : 'Sample 30 seconds'}
+      >
+        {isPreviewingThis ? '◼' : '🎧'}
+      </button>
+    );
     const thumb = (
       <div className="track-thumb-wrap">
         <span className="track-thumb-fallback">{track.track_name.charAt(0).toUpperCase()}</span>
-        <img
-          className="track-thumb"
-          src={track.artwork_url || `${API_BASE_URL}/tracks/${track.id}/artwork`}
-          alt=""
-          loading="lazy"
-          onError={(e) => { e.target.style.display = 'none'; }}
-        />
+        {artworkSrc && (
+          <img
+            className="track-thumb"
+            src={artworkSrc}
+            alt=""
+            loading="lazy"
+            onError={(e) => { e.target.style.display = 'none'; }}
+          />
+        )}
         {statusBadge}
         {trackViewStyle === 'grid' && (
           <button
@@ -1625,11 +1852,15 @@ function App() {
             {playIcon}
           </button>
         )}
+        {trackViewStyle !== 'grid' && sampleButton}
         {thumb}
         <div className="track-info">
           <h3>{track.track_name}</h3>
           <p className="artist">{track.artist_name}</p>
+          {isDiscover && track.album_name && <p className="album">{track.album_name}</p>}
+          {isPreviewingThis && <p className="preview-label">🎧 Sampling 30s preview</p>}
         </div>
+        {trackViewStyle === 'grid' && sampleButton}
       </div>
     );
   };
@@ -1862,12 +2093,6 @@ function App() {
             My Library
           </button>
           <button
-            className={activeTab === 'discover' ? 'active' : ''}
-            onClick={() => setActiveTab('discover')}
-          >
-            Discover
-          </button>
-          <button
             className={activeTab === 'taste' ? 'active' : ''}
             onClick={() => setActiveTab('taste')}
           >
@@ -1886,98 +2111,7 @@ function App() {
       </header>
 
       <main className={nowPlaying ? 'with-player' : ''}>
-        {activeTab === 'discover' ? (
-          <section className="discover-section">
-            <form onSubmit={handleDiscoverMusic} className="discovery-form">
-              <div className="form-row">
-                <div className="form-group full">
-                  <label>Seed Tracks (artists, songs, or genres)</label>
-                  <input
-                    type="text"
-                    value={seedTracks}
-                    onChange={(e) => setSeedTracks(e.target.value)}
-                    placeholder="e.g., Metallica, Iron Maiden, Black Sabbath"
-                    required
-                  />
-                </div>
-              </div>
-
-              <div className="form-row">
-                <div className="form-group">
-                  <label>Genre</label>
-                  <select value={genre} onChange={(e) => setGenre(e.target.value)}>
-                    <option value="">Any Genre</option>
-                    <option value="rock">Rock</option>
-                    <option value="metal">Metal</option>
-                    <option value="electronic">Electronic</option>
-                    <option value="jazz">Jazz</option>
-                    <option value="classical">Classical</option>
-                    <option value="hip-hop">Hip-Hop</option>
-                    <option value="pop">Pop</option>
-                    <option value="indie">Indie</option>
-                  </select>
-                </div>
-                <div className="form-group">
-                  <label>Mood</label>
-                  <select value={mood} onChange={(e) => setMood(e.target.value)}>
-                    <option value="">Any Mood</option>
-                    <option value="energetic">Energetic</option>
-                    <option value="melancholic">Melancholic</option>
-                    <option value="uplifting">Uplifting</option>
-                    <option value="dark">Dark</option>
-                    <option value="calm">Calm</option>
-                    <option value="aggressive">Aggressive</option>
-                  </select>
-                </div>
-              </div>
-
-              <div className="form-row">
-                <div className="form-group">
-                  <label>Tempo (BPM)</label>
-                  <input
-                    type="number"
-                    value={tempo}
-                    onChange={(e) => setTempo(e.target.value)}
-                    placeholder="120"
-                  />
-                </div>
-                <div className="form-group">
-                  <label>Complexity</label>
-                  <select value={complexity} onChange={(e) => setComplexity(e.target.value)}>
-                    <option value="">Any</option>
-                    <option value="simple">Simple</option>
-                    <option value="moderate">Moderate</option>
-                    <option value="complex">Complex</option>
-                  </select>
-                </div>
-              </div>
-
-              <button type="submit" disabled={loading} className="discover-btn">
-                {loading ? 'Finding tracks...' : 'Discover'}
-              </button>
-
-              {error && <p className="error-message">{error}</p>}
-            </form>
-
-            {discoveredTracks.length > 0 && (
-              <div className="results">
-                <h2>Recommended Tracks</h2>
-                <div className="tracks-grid">
-                  {discoveredTracks.map((track, index) => (
-                    <div key={index} className="track-card">
-                      <div className="track-number">{index + 1}</div>
-                      <div className="track-info">
-                        <h3>{track.track_name}</h3>
-                        <p className="artist">{track.artist_name}</p>
-                        <p className="album">{track.album_name}</p>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            )}
-          </section>
-        ) : activeTab === 'library' ? (
+        {activeTab === 'library' ? (
           <section className="library-section">
             {spotifyPlayHint && (
               <p className="empty-state spotify-play-hint">{spotifyPlayHint}</p>
@@ -2060,7 +2194,16 @@ function App() {
                   <option value="1000">Max 1,000</option>
                 </select>
                 <button className="clear-filters-btn" onClick={clearAllFilters}>Clear All</button>
+                <button
+                  className="discover-filter-btn"
+                  onClick={handleDiscoverFromLibrary}
+                  disabled={discovering}
+                  title="Find AI-recommended tracks similar to whatever's currently filtered"
+                >
+                  {discovering ? 'Discovering…' : '✨ Discover similar tracks'}
+                </button>
               </div>
+              {discoverError && <p className="error-message">{discoverError}</p>}
             </div>
 
             {drill && (
@@ -2185,6 +2328,15 @@ function App() {
                     </div>
                   ))
                 )}
+              </div>
+            )}
+
+            {discoveredTracks.length > 0 && (
+              <div className="discover-results">
+                <h2>Discovered for you</h2>
+                <div className={`tracks-grid${trackViewStyle === 'grid' ? ' grid-view' : ''}`}>
+                  {discoveredTracks.map((track) => renderTrackCard(track, discoveredTracks))}
+                </div>
               </div>
             )}
           </section>
@@ -2487,14 +2639,20 @@ function PlayerBar({
 
   const destinationLabel = outputDevice ? outputDevice.name : 'This Browser';
   const deviceIcon = (d) => (d.type === 'chromecast' ? '📺' : d.type === 'spotify' ? '🟢' : '📡');
-  const trackArtworkUrl = (t) => t.artwork_url || `${apiBase}/tracks/${t.id}/artwork`;
+  // Discover suggestions have no known_tracks row, so there's nothing for the
+  // id-based artwork endpoint to serve - only fall back to it for real
+  // library/Spotify tracks.
+  const trackArtworkUrl = (t) => t.artwork_url || (t.source === 'discover' ? '' : `${apiBase}/tracks/${t.id}/artwork`);
   // track.id is a Spotify uri (not a real local track id) whenever the
-  // current track is Spotify-sourced - "This Browser" can only ever stream a
-  // real local file, so it needs the *local* id. local_id bridges that for a
-  // track that started life as a local-library match (mapMatchedLocalTrack);
-  // a genuine Spotify playlist/context track (no local_id) has no local file
-  // to fall back to at all - nothing this browser can play.
-  const localStreamId = track.source === 'spotify' ? (track.local_id ?? null) : track.id;
+  // current track is a Spotify catalog match - "This Browser" can only ever
+  // stream a real local file, so it needs the *local* id. local_id bridges
+  // that for a track that started life as a local-library match
+  // (mapMatchedLocalTrack); a genuine Spotify playlist/context track (no
+  // local_id) has no local file to fall back to at all - nothing this
+  // browser can play. A discover-preview track (source 'discover') is a
+  // third case, handled separately below via its own preview_url - it was
+  // never a local_id candidate to begin with.
+  const localStreamId = track.source === 'spotify' ? (track.local_id ?? null) : (track.source === 'discover' ? null : track.id);
 
   return (
     <div className="player-root">
@@ -2745,7 +2903,30 @@ function PlayerBar({
           </div>
         </div>
 
-        {!outputDevice && (localStreamId != null ? (
+        {!outputDevice && (track.source === 'discover' ? (
+          track.preview_url ? (
+            <audio
+              key={track.id}
+              ref={audioRef}
+              src={track.preview_url}
+              autoPlay={userHasInteracted}
+              className="player-audio-hidden"
+              onPlay={() => setIsPlaying(true)}
+              onPause={() => setIsPlaying(false)}
+              onEnded={onNext}
+              onTimeUpdate={(e) => setLocalProgress({ currentTime: e.target.currentTime, duration: e.target.duration || 0 })}
+              onLoadedMetadata={(e) => {
+                if (initialSeekMs != null) {
+                  e.target.currentTime = initialSeekMs / 1000;
+                  onInitialSeekApplied();
+                }
+                setLocalProgress({ currentTime: e.target.currentTime, duration: e.target.duration || 0 });
+              }}
+            />
+          ) : (
+            <p className="player-no-local-file">No preview available for this track.</p>
+          )
+        ) : localStreamId != null ? (
           <audio
             key={localStreamId}
             ref={audioRef}

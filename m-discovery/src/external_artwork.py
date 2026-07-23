@@ -36,6 +36,7 @@ MATCH_THRESHOLD = 0.72
 
 DEEZER_SEARCH_URL = 'https://api.deezer.com/search/album'
 DEEZER_ALBUM_URL = 'https://api.deezer.com/album'
+DEEZER_TRACK_SEARCH_URL = 'https://api.deezer.com/search'
 
 # TheAudioDB's free-tier key ("123" unless a real one is set) is shared by
 # everyone using it and capped around 30 req/min - a dedicated throttle here
@@ -274,6 +275,63 @@ def find_via_deezer(artist_name, album_name):
     except Exception:
         pass
     return {'raw': raw, 'year': year, 'source_url': best.get('link')}
+
+
+def find_track_preview(artist_name, track_name):
+    """{'preview_url', 'artwork_url', 'source'} for a 30-second sample clip
+    (artwork_url may be None even on a match, if the source result has none),
+    or None. Used by the Discover tab to let a user sample an AI-suggested
+    track that isn't in the library (no file, and possibly no Spotify match
+    either) - unlike the artwork lookups above, nothing here gets cached/
+    persisted, this is a one-off interactive lookup, not a background job, so
+    no throttling/RateLimited machinery is needed."""
+    try:
+        response = requests.get(
+            ITUNES_SEARCH_URL,
+            params={'term': f'{artist_name} {track_name}', 'media': 'music', 'entity': 'song', 'limit': 5},
+            timeout=REQUEST_TIMEOUT,
+        )
+        if response.status_code == 200:
+            best, best_score = None, 0.0
+            for result in response.json().get('results') or []:
+                score = (_similar(track_name, result.get('trackName', '')) + _similar(artist_name, result.get('artistName', ''))) / 2
+                if score > best_score:
+                    best, best_score = result, score
+            if best and best_score >= MATCH_THRESHOLD and best.get('previewUrl'):
+                art = best.get('artworkUrl100')
+                return {
+                    'preview_url': best['previewUrl'],
+                    'artwork_url': art.replace('100x100bb', '600x600bb') if art else None,
+                    'source': 'itunes',
+                }
+    except Exception:
+        pass
+
+    try:
+        response = requests.get(
+            DEEZER_TRACK_SEARCH_URL,
+            params={'q': f'artist:"{artist_name}" track:"{track_name}"', 'limit': 5},
+            timeout=REQUEST_TIMEOUT,
+        )
+        if response.status_code == 200:
+            data = response.json()
+            if not (isinstance(data, dict) and data.get('error')):
+                best, best_score = None, 0.0
+                for result in data.get('data') or []:
+                    score = (_similar(track_name, result.get('title', '')) + _similar(artist_name, (result.get('artist') or {}).get('name', ''))) / 2
+                    if score > best_score:
+                        best, best_score = result, score
+                if best and best_score >= MATCH_THRESHOLD and best.get('preview'):
+                    album = best.get('album') or {}
+                    return {
+                        'preview_url': best['preview'],
+                        'artwork_url': album.get('cover_big') or album.get('cover_medium'),
+                        'source': 'deezer',
+                    }
+    except Exception:
+        pass
+
+    return None
 
 
 def _throttle_audiodb():
