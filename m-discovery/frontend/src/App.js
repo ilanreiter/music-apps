@@ -276,6 +276,11 @@ function App() {
   const [discoveredTracks, setDiscoveredTracks] = useState([]);
   const [discovering, setDiscovering] = useState(false);
   const [discoverError, setDiscoverError] = useState(null);
+  // Toggles the Library tab's main content between the filtered library grid
+  // and the Discovered-for-you results, rather than always stacking both -
+  // false (library) is the default; flips to true automatically once a
+  // Discover run actually produces results.
+  const [showDiscoverPanel, setShowDiscoverPanel] = useState(false);
 
   const [activeTab, setActiveTab] = useState(() => loadLibraryView()?.activeTab ?? 'library');
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -929,6 +934,7 @@ function App() {
     // under a set of tracks they weren't actually generated from.
     setDiscoveredTracks([]);
     setDiscoverError(null);
+    setShowDiscoverPanel(false);
     const skipInitialShuffleFetch = skipInitialShuffleFetchRef.current;
     skipInitialShuffleFetchRef.current = false;
     // Spotify playlists aren't in known_tracks - can't reuse the SQL-backed
@@ -1294,16 +1300,22 @@ function App() {
         track_name: t.track_name,
         artist_name: t.artist_name,
         album_name: t.album_name,
-        // Populated by Gemini only for non-English tracks (see _build_prompt
-        // in main.py) - international catalogs index these under their
-        // native-script name, not the romanized track_name/artist_name
-        // above, so the match/preview endpoints try this first when present.
+        // Always null for Last.fm-sourced results (real catalog names, no
+        // separate native-script concept) - kept on the shape since
+        // /api/discover/preview and /api/spotify/discover-match still
+        // accept and use these fields if ever populated.
         native_track_name: t.native_track_name || null,
         native_artist_name: t.native_artist_name || null,
         artwork_url: null,
         preview_url: undefined, // undefined = not yet looked up, null = looked up and none found
       }));
+      if (mapped.length === 0) {
+        setDiscoverError('No recommendations found for this filter - try a different one.');
+        setDiscoveredTracks([]);
+        return;
+      }
       setDiscoveredTracks(mapped);
+      setShowDiscoverPanel(true);
       // Eagerly resolve preview/artwork for every result right away (not on
       // click) - the pool is small (5-10 tracks, per _build_prompt in
       // main.py), so this is cheap, gives progressive artwork reveal within a
@@ -2198,7 +2210,7 @@ function App() {
                   className="discover-filter-btn"
                   onClick={handleDiscoverFromLibrary}
                   disabled={discovering}
-                  title="Find AI-recommended tracks similar to whatever's currently filtered"
+                  title="Find tracks similar to whatever's currently filtered"
                 >
                   {discovering ? 'Discovering…' : '✨ Discover similar tracks'}
                 </button>
@@ -2206,7 +2218,24 @@ function App() {
               {discoverError && <p className="error-message">{discoverError}</p>}
             </div>
 
-            {drill && (
+            {discoveredTracks.length > 0 && (
+              <div className="library-view-toggle">
+                <button
+                  className={!showDiscoverPanel ? 'active' : ''}
+                  onClick={() => setShowDiscoverPanel(false)}
+                >
+                  📚 Library
+                </button>
+                <button
+                  className={showDiscoverPanel ? 'active' : ''}
+                  onClick={() => setShowDiscoverPanel(true)}
+                >
+                  ✨ Discovered ({discoveredTracks.length})
+                </button>
+              </div>
+            )}
+
+            {!showDiscoverPanel && drill && (
               <div className="drill-header">
                 <button className="back-btn" onClick={() => setDrill(null)}>&larr; Back to {backLabel}</button>
                 <h2>{drill.label}</h2>
@@ -2217,7 +2246,7 @@ function App() {
               </div>
             )}
 
-            {drill || libraryMode === 'all' ? (
+            {!showDiscoverPanel && (drill || libraryMode === 'all' ? (
               <>
                 <div className="library-header">
                   {!drill && (
@@ -2329,9 +2358,9 @@ function App() {
                   ))
                 )}
               </div>
-            )}
+            ))}
 
-            {discoveredTracks.length > 0 && (
+            {showDiscoverPanel && discoveredTracks.length > 0 && (
               <div className="discover-results">
                 <h2>Discovered for you</h2>
                 <div className={`tracks-grid${trackViewStyle === 'grid' ? ' grid-view' : ''}`}>

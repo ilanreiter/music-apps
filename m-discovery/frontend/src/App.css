@@ -765,10 +765,41 @@ main.with-player {
   cursor: not-allowed;
 }
 
+.library-view-toggle {
+  display: flex;
+  gap: 4px;
+  background: var(--bg-card);
+  padding: 4px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  width: fit-content;
+  margin-bottom: 16px;
+}
+
+.library-view-toggle button {
+  background: transparent;
+  border: none;
+  color: var(--text-muted);
+  padding: 7px 14px;
+  border-radius: 7px;
+  cursor: pointer;
+  font-size: 0.85rem;
+  font-weight: 600;
+  white-space: nowrap;
+  transition: all 0.2s ease;
+}
+
+.library-view-toggle button:hover {
+  color: var(--text-main);
+}
+
+.library-view-toggle button.active {
+  background: var(--accent);
+  color: white;
+}
+
 .discover-results {
-  margin-top: 28px;
-  padding-top: 20px;
-  border-top: 1px solid var(--border);
+  margin-top: 0;
 }
 
 .discover-results h2 {
