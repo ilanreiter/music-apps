@@ -807,6 +807,23 @@ main.with-player {
   color: var(--text-muted);
 }
 
+.discover-artist-group {
+  margin-bottom: 24px;
+}
+
+.discover-artist-group:last-child {
+  margin-bottom: 0;
+}
+
+.discover-artist-group h3 {
+  font-size: 0.95rem;
+  font-weight: 600;
+  color: var(--text-main);
+  margin-bottom: 10px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--border);
+}
+
 .play-btn.preview {
   background: var(--bg-input);
   color: var(--text-muted);

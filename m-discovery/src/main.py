@@ -214,8 +214,13 @@ class DiscoveryParameters(BaseModel):
     # How many recommended tracks to aim for - a ceiling, not a guarantee
     # (lastfm.discover_tracks may return fewer if the seed's genuinely
     # strong-match pool runs dry, or exclude_known removes some). Clamped
-    # server-side regardless of what the client sends.
+    # server-side regardless of what the client sends. Means "how many
+    # artists" instead of "how many tracks" when group_by_artist is set.
     limit: Optional[int] = 10
+    # When true, groups results by artist (a few of each recommended
+    # artist's actual top tracks) instead of one track per artist - see
+    # lastfm.discover_tracks' tracks_per_artist param.
+    group_by_artist: Optional[bool] = False
 
 class LibraryScanRequest(BaseModel):
     root_path: str
@@ -1973,9 +1978,10 @@ def discover_music(params: DiscoveryParameters, db: psycopg2.extensions.connecti
 
     seed_artists = [a.strip() for a in params.seed_tracks.split(',') if a.strip()]
     limit = max(1, min(params.limit or 10, 30))
-    print(f"Received discovery request seeded by: {seed_artists}, limit={limit}")
+    tracks_per_artist = 3 if params.group_by_artist else 1
+    print(f"Received discovery request seeded by: {seed_artists}, limit={limit}, group_by_artist={params.group_by_artist}")
 
-    raw_tracks = lastfm.discover_tracks(seed_artists, target_count=limit)
+    raw_tracks = lastfm.discover_tracks(seed_artists, target_count=limit, tracks_per_artist=tracks_per_artist)
     suggested_tracks = [Track(track_name=t['track_name'], artist_name=t['artist_name']) for t in raw_tracks]
     print(f"Last.fm suggested {len(suggested_tracks)} tracks.")
 

@@ -144,7 +144,7 @@ def _dedupe_seed_artists(seed_artists):
     return kept
 
 
-def discover_tracks(seed_artists, target_count=10):
+def discover_tracks(seed_artists, target_count=10, tracks_per_artist=1):
     """[{'track_name', 'artist_name'}, ...] of real tracks similar to
     seed_artists, drawn from Last.fm's similar-artist/top-tracks data - since
     this is real catalog/listening data rather than generated text, it can't
@@ -158,7 +158,16 @@ def discover_tracks(seed_artists, target_count=10):
     with a genre-filtered seed spanning several artists, a plain uniform
     shuffle of the combined pool gave a barely-related low-match candidate
     from one seed the same odds as a strong match from another, producing
-    the "some recommendations make sense, some don't" pattern reported."""
+    the "some recommendations make sense, some don't" pattern reported.
+
+    tracks_per_artist=1 (default) is today's "flat list of individual
+    tracks" mode - target_count means how many tracks, one per artist,
+    randomly weighted toward each artist's most popular. tracks_per_artist>1
+    is "group by artist" mode (see main.py's DiscoveryParameters.group_by_artist) -
+    target_count then means how many *artists*, each contributing up to
+    tracks_per_artist of their actual top tracks (deterministic, most-popular-
+    first - unlike the single-track case, showing an artist's genuinely best-
+    known songs together reads better than a random pick)."""
     seed_artists = _dedupe_seed_artists(seed_artists)
     seed_set = {a.lower() for a in seed_artists}
 
@@ -185,17 +194,23 @@ def discover_tracks(seed_artists, target_count=10):
 
     results = []
     result_keys = set()
+    artists_used = 0
     for candidate_artist in ordered_candidates:
-        if len(results) >= target_count:
+        if artists_used >= target_count:
             break
-        top_tracks = _get_top_tracks(candidate_artist)
+        top_tracks = _get_top_tracks(candidate_artist, limit=max(TOP_TRACKS_PER_ARTIST, tracks_per_artist))
         if not top_tracks:
             continue
-        track_name = _pick_top_track(top_tracks)
-        key = (track_name.lower(), candidate_artist.lower())
-        if key in result_keys:
-            continue
-        result_keys.add(key)
-        results.append({'track_name': track_name, 'artist_name': candidate_artist})
+        picks = top_tracks[:tracks_per_artist] if tracks_per_artist > 1 else [_pick_top_track(top_tracks)]
+        added_any = False
+        for track_name in picks:
+            key = (track_name.lower(), candidate_artist.lower())
+            if key in result_keys:
+                continue
+            result_keys.add(key)
+            results.append({'track_name': track_name, 'artist_name': candidate_artist})
+            added_any = True
+        if added_any:
+            artists_used += 1
 
     return results

@@ -280,6 +280,13 @@ function App() {
   // (see the matching clamp/comment on DiscoveryParameters.limit in
   // main.py - a narrow seed can still return fewer than this).
   const [discoverTrackCount, setDiscoverTrackCount] = useState(10);
+  // Live checkbox state - "should the *next* Discover run group by artist".
+  const [discoverGroupByArtist, setDiscoverGroupByArtist] = useState(false);
+  // Whether the *current* discoveredTracks batch was actually grouped -
+  // separate from the checkbox above since that can change before the next
+  // run; rendering needs to reflect what the results actually are, not
+  // whatever the checkbox currently says.
+  const [discoveredGroupedByArtist, setDiscoveredGroupedByArtist] = useState(false);
   // Toggles the Library tab's main content between the filtered library grid
   // and the Discovered-for-you results, rather than always stacking both -
   // false (library) is the default; flips to true automatically once a
@@ -1298,6 +1305,7 @@ function App() {
         genre: filterGenre || null,
         exclude_known: true,
         limit: discoverTrackCount,
+        group_by_artist: discoverGroupByArtist,
       });
       const mapped = response.data.map((t, i) => ({
         id: `discover-${i}`,
@@ -1320,12 +1328,16 @@ function App() {
         return;
       }
       setDiscoveredTracks(mapped);
+      setDiscoveredGroupedByArtist(discoverGroupByArtist);
       setShowDiscoverPanel(true);
       // Eagerly resolve preview/artwork for every result right away (not on
-      // click) - the pool is small (5-10 tracks, per _build_prompt in
-      // main.py), so this is cheap, gives progressive artwork reveal within a
-      // second or two, and means sampleQueueDiscoveredTracks below usually
-      // has a preview_url already in hand with no extra network round trip.
+      // click) - gives progressive artwork reveal within a second or two,
+      // and means sampleQueueDiscoveredTracks below usually has a
+      // preview_url already in hand with no extra network round trip.
+      // Result sets are capped at 30 tracks (up to 90 in group-by-artist
+      // mode, 30 artists x 3 tracks each) - a burst that size is still fine
+      // for iTunes/Deezer's generous personal-use limits, confirmed live
+      // throughout this session's testing.
       mapped.forEach((t) => {
         axios.post(`${API_BASE_URL}/discover/preview`, {
           track_name: t.track_name, artist_name: t.artist_name,
@@ -2118,6 +2130,20 @@ function App() {
   const backLabel = drill && BACK_LABELS[drill.by];
   const effectiveIsPlaying = outputDevice ? destStatus?.status === 'play' : isPlaying;
 
+  // Only meaningful when discoveredGroupedByArtist is true - discoveredTracks
+  // already has same-artist tracks landing consecutively (lastfm.py builds
+  // results artist-by-artist), so grouping here is just splitting on
+  // consecutive runs of the same artist_name, no extra data needed.
+  const discoverArtistGroups = [];
+  for (const track of discoveredTracks) {
+    const last = discoverArtistGroups[discoverArtistGroups.length - 1];
+    if (last && last.artist_name === track.artist_name) {
+      last.tracks.push(track);
+    } else {
+      discoverArtistGroups.push({ artist_name: track.artist_name, tracks: [track] });
+    }
+  }
+
   return (
     <div className="app">
       <header className="app-header">
@@ -2246,14 +2272,20 @@ function App() {
                 <select
                   value={discoverTrackCount}
                   onChange={(e) => setDiscoverTrackCount(Number(e.target.value))}
-                  title="How many recommended tracks to aim for (a ceiling, not a guarantee - a narrow filter may return fewer)"
+                  title="How many recommended tracks (or artists, in group-by-artist mode) to aim for - a ceiling, not a guarantee, a narrow filter may return fewer"
                 >
-                  <option value="5">5 tracks</option>
-                  <option value="10">10 tracks</option>
-                  <option value="15">15 tracks</option>
-                  <option value="20">20 tracks</option>
-                  <option value="30">30 tracks</option>
+                  {[5, 10, 15, 20, 30].map((n) => (
+                    <option key={n} value={n}>{n} {discoverGroupByArtist ? 'artists' : 'tracks'}</option>
+                  ))}
                 </select>
+                <label className="filter-checkbox-label" title="Show a few of each recommended artist's own top tracks, grouped together, instead of one flat list of individual tracks">
+                  <input
+                    type="checkbox"
+                    checked={discoverGroupByArtist}
+                    onChange={(e) => setDiscoverGroupByArtist(e.target.checked)}
+                  />
+                  🎤 Group by artist
+                </label>
                 <button
                   className="discover-filter-btn"
                   onClick={handleDiscoverFromLibrary}
@@ -2425,9 +2457,20 @@ function App() {
                     </div>
                   )}
                 </div>
-                <div className={`tracks-grid${trackViewStyle === 'grid' ? ' grid-view' : ''}`}>
-                  {discoveredTracks.map((track) => renderTrackCard(track, discoveredTracks))}
-                </div>
+                {discoveredGroupedByArtist ? (
+                  discoverArtistGroups.map((group) => (
+                    <div key={group.artist_name} className="discover-artist-group">
+                      <h3>{group.artist_name}</h3>
+                      <div className={`tracks-grid${trackViewStyle === 'grid' ? ' grid-view' : ''}`}>
+                        {group.tracks.map((track) => renderTrackCard(track, discoveredTracks))}
+                      </div>
+                    </div>
+                  ))
+                ) : (
+                  <div className={`tracks-grid${trackViewStyle === 'grid' ? ' grid-view' : ''}`}>
+                    {discoveredTracks.map((track) => renderTrackCard(track, discoveredTracks))}
+                  </div>
+                )}
               </div>
             )}
           </section>
