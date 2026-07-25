@@ -211,6 +211,11 @@ class DiscoveryParameters(BaseModel):
     # construction since the seed itself is genre-filtered.
     seed_tracks: str
     exclude_known: Optional[bool] = True
+    # How many recommended tracks to aim for - a ceiling, not a guarantee
+    # (lastfm.discover_tracks may return fewer if the seed's genuinely
+    # strong-match pool runs dry, or exclude_known removes some). Clamped
+    # server-side regardless of what the client sends.
+    limit: Optional[int] = 10
 
 class LibraryScanRequest(BaseModel):
     root_path: str
@@ -1261,6 +1266,24 @@ def get_spotify_playlist_tracks(playlist_id: str):
         )
     return tracks
 
+def _create_spotify_playlist_from_uris(name, uris, skipped):
+    """Shared tail for both playlist-creation routes below - create the
+    playlist, add whatever URIs were resolved, report how many were skipped."""
+    if not uris:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="None of these tracks could be matched to Spotify")
+
+    playlist = spotify_connect.create_playlist(name)
+    if playlist is None:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Could not create the playlist - if this account was connected before playlist-modify-private was "
+                   "added, disconnect and reconnect Spotify in Settings to grant it",
+        )
+    if not spotify_connect.add_tracks_to_playlist(playlist['id'], uris):
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Playlist created but adding tracks failed partway through")
+
+    return {"playlist_url": playlist['url'], "added": len(uris), "skipped": skipped}
+
 class CreatePlaylistFromLibraryRequest(BaseModel):
     name: str
     track_ids: List[int]
@@ -1282,20 +1305,53 @@ async def create_spotify_playlist_from_library(
     # plain WHERE id = ANY() doesn't either.
     uris = [f"spotify:track:{spotify_ids_by_track[tid]}" for tid in params.track_ids if spotify_ids_by_track.get(tid)]
     skipped = len(params.track_ids) - len(uris)
-    if not uris:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="None of these tracks are matched to Spotify yet")
+    return _create_spotify_playlist_from_uris(params.name, uris, skipped)
 
-    playlist = spotify_connect.create_playlist(params.name)
-    if playlist is None:
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail="Could not create the playlist - if this account was connected before playlist-modify-private was "
-                   "added, disconnect and reconnect Spotify in Settings to grant it",
-        )
-    if not spotify_connect.add_tracks_to_playlist(playlist['id'], uris):
-        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Playlist created but adding tracks failed partway through")
+class DiscoveredTrackForPlaylist(BaseModel):
+    track_name: str
+    artist_name: str
+    native_track_name: Optional[str] = None
+    native_artist_name: Optional[str] = None
 
-    return {"playlist_url": playlist['url'], "added": len(uris), "skipped": skipped}
+class CreatePlaylistFromDiscoveredRequest(BaseModel):
+    name: str
+    tracks: List[DiscoveredTrackForPlaylist]
+
+@app.post("/api/spotify/playlists/from-discovered")
+def create_spotify_playlist_from_discovered(params: CreatePlaylistFromDiscoveredRequest):
+    """Same idea as from-library above, but for Discover suggestions - these
+    have no known_tracks row to read a cached spotify_track_id from, so each
+    one is matched live via spotify_connect.search_track instead. Only
+    reasonable because Discover result sets are always small (main.py caps
+    DiscoveryParameters.limit at 30) - the same live-match-everything
+    approach would be a bad idea for a large library push, which is why that
+    route stays cache-only and just skips unmatched tracks instead."""
+    if not spotify_connect.is_connected():
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Spotify not connected")
+    if not params.tracks:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No tracks to push")
+
+    uris = []
+    for t in params.tracks:
+        attempts = [(t.native_track_name, t.artist_name)] if t.native_track_name else []
+        attempts.append((t.track_name, t.artist_name))
+        matched_uri = None
+        hit_wall = False
+        for track_name, artist_name in attempts:
+            result, match, _identified = spotify_connect.search_track(track_name, artist_name)
+            if result == 'unavailable':
+                hit_wall = True
+                break
+            if match:
+                matched_uri = match['uri']
+                break
+        if matched_uri:
+            uris.append(matched_uri)
+        if hit_wall:
+            break  # no point burning more requests into the same rate limit - use whatever matched so far
+
+    skipped = len(params.tracks) - len(uris)
+    return _create_spotify_playlist_from_uris(params.name, uris, skipped)
 
 def _match_track_to_spotify(db, track_id):
     """Looks up (or performs and caches) a local track's Spotify match. Shared
@@ -1916,9 +1972,10 @@ def discover_music(params: DiscoveryParameters, db: psycopg2.extensions.connecti
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Last.fm not configured - set LASTFM_API_KEY")
 
     seed_artists = [a.strip() for a in params.seed_tracks.split(',') if a.strip()]
-    print(f"Received discovery request seeded by: {seed_artists}")
+    limit = max(1, min(params.limit or 10, 30))
+    print(f"Received discovery request seeded by: {seed_artists}, limit={limit}")
 
-    raw_tracks = lastfm.discover_tracks(seed_artists)
+    raw_tracks = lastfm.discover_tracks(seed_artists, target_count=limit)
     suggested_tracks = [Track(track_name=t['track_name'], artist_name=t['artist_name']) for t in raw_tracks]
     print(f"Last.fm suggested {len(suggested_tracks)} tracks.")
 

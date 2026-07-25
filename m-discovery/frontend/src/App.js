@@ -276,6 +276,10 @@ function App() {
   const [discoveredTracks, setDiscoveredTracks] = useState([]);
   const [discovering, setDiscovering] = useState(false);
   const [discoverError, setDiscoverError] = useState(null);
+  // How many recommended tracks to ask for - a ceiling, not a guarantee
+  // (see the matching clamp/comment on DiscoveryParameters.limit in
+  // main.py - a narrow seed can still return fewer than this).
+  const [discoverTrackCount, setDiscoverTrackCount] = useState(10);
   // Toggles the Library tab's main content between the filtered library grid
   // and the Discovered-for-you results, rather than always stacking both -
   // false (library) is the default; flips to true automatically once a
@@ -1262,9 +1266,9 @@ function App() {
 
   // How many currently-filtered library tracks to sample when building a
   // Discover seed, and how many distinct artist names to actually send -
-  // recommending "similar artists" reads better to Gemini than a long list
-  // of individual track titles, and keeps the prompt a sane length even when
-  // the active filter matches thousands of tracks.
+  // recommending "similar artists" gives Last.fm's artist.getSimilar a
+  // clean input, and keeps the seed a sane size even when the active filter
+  // matches thousands of tracks.
   const DISCOVER_SEED_SAMPLE_LIMIT = 40;
   const DISCOVER_SEED_ARTIST_LIMIT = 15;
 
@@ -1293,6 +1297,7 @@ function App() {
         seed_tracks: artists.join(', '),
         genre: filterGenre || null,
         exclude_known: true,
+        limit: discoverTrackCount,
       });
       const mapped = response.data.map((t, i) => ({
         id: `discover-${i}`,
@@ -2073,6 +2078,38 @@ function App() {
     }
   };
 
+  // Same idea as pushLibraryToSpotifyPlaylist, but for Discover suggestions -
+  // these have no known_tracks row/cached spotify_track_id, so the backend
+  // matches each one live instead (only reasonable because Discover result
+  // sets are always small - see /api/spotify/playlists/from-discovered).
+  const pushDiscoveredToSpotifyPlaylist = async () => {
+    if (discoveredTracks.length === 0) return;
+    const defaultName = `Discovered — ${new Date().toLocaleDateString()}`;
+    const name = window.prompt('Name for the new Spotify playlist:', defaultName);
+    if (!name) return;
+    setPushingToSpotify(true);
+    try {
+      const response = await axios.post(`${API_BASE_URL}/spotify/playlists/from-discovered`, {
+        name,
+        tracks: discoveredTracks.map((t) => ({
+          track_name: t.track_name, artist_name: t.artist_name,
+          native_track_name: t.native_track_name, native_artist_name: t.native_artist_name,
+        })),
+      });
+      const { added, skipped, playlist_url: playlistUrl } = response.data;
+      setSpotifyPlayHint(
+        `Created "${name}" on Spotify with ${added.toLocaleString()} track${added === 1 ? '' : 's'}` +
+        (skipped > 0 ? ` (${skipped.toLocaleString()} skipped - no Spotify match found)` : '') +
+        (playlistUrl ? '.' : ' (no link returned).')
+      );
+    } catch (err) {
+      console.error('Error pushing discovered tracks to Spotify:', err);
+      setSpotifyPlayHint(err.response?.data?.detail || 'Failed to create the Spotify playlist.');
+    } finally {
+      setPushingToSpotify(false);
+    }
+  };
+
   const viewLabel = (mode) => {
     if (mode === 'all') return 'All Tracks';
     if (mode === 'playlist') return 'Playlists';
@@ -2206,6 +2243,17 @@ function App() {
                   <option value="1000">Max 1,000</option>
                 </select>
                 <button className="clear-filters-btn" onClick={clearAllFilters}>Clear All</button>
+                <select
+                  value={discoverTrackCount}
+                  onChange={(e) => setDiscoverTrackCount(Number(e.target.value))}
+                  title="How many recommended tracks to aim for (a ceiling, not a guarantee - a narrow filter may return fewer)"
+                >
+                  <option value="5">5 tracks</option>
+                  <option value="10">10 tracks</option>
+                  <option value="15">15 tracks</option>
+                  <option value="20">20 tracks</option>
+                  <option value="30">30 tracks</option>
+                </select>
                 <button
                   className="discover-filter-btn"
                   onClick={handleDiscoverFromLibrary}
@@ -2362,7 +2410,21 @@ function App() {
 
             {showDiscoverPanel && discoveredTracks.length > 0 && (
               <div className="discover-results">
-                <h2>Discovered for you</h2>
+                <div className="library-header">
+                  <h2>Discovered for you</h2>
+                  {spotifyConnected && (
+                    <div className="group-actions">
+                      <button
+                        className="group-action-btn"
+                        onClick={pushDiscoveredToSpotifyPlaylist}
+                        disabled={pushingToSpotify}
+                        title="Create a private Spotify playlist from these recommendations (matched live, since they're not in your library)"
+                      >
+                        {pushingToSpotify ? 'Pushing…' : '⬆ Push to Spotify'}
+                      </button>
+                    </div>
+                  )}
+                </div>
                 <div className={`tracks-grid${trackViewStyle === 'grid' ? ' grid-view' : ''}`}>
                   {discoveredTracks.map((track) => renderTrackCard(track, discoveredTracks))}
                 </div>

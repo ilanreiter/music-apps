@@ -805,7 +805,6 @@ main.with-player {
 .discover-results h2 {
   font-size: 1.1rem;
   color: var(--text-muted);
-  margin-bottom: 14px;
 }
 
 .play-btn.preview {

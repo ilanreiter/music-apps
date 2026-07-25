@@ -164,15 +164,23 @@ def discover_tracks(seed_artists, target_count=10):
 
     # key -> (display_name, best match score seen for it across all seeds)
     candidates = {}
+    # Same floor-not-cap reasoning as SHORTLIST_SIZE below - a narrow seed
+    # (few seed artists) asking for a high target_count needs a deeper pull
+    # per seed artist too, not just a bigger shortlist to choose from.
+    per_seed_limit = max(SIMILAR_ARTISTS_PER_SEED, target_count * 2)
     for seed_artist in seed_artists:
-        for name, match in _get_similar_artists(seed_artist):
+        for name, match in _get_similar_artists(seed_artist, limit=per_seed_limit):
             key = name.lower()
             if key in seed_set or match < MIN_ARTIST_MATCH_SCORE:
                 continue
             if key not in candidates or match > candidates[key][1]:
                 candidates[key] = (name, match)
 
-    shortlist = sorted(candidates.values(), key=lambda c: c[1], reverse=True)[:SHORTLIST_SIZE]
+    # SHORTLIST_SIZE is a floor, not a cap - a caller asking for more tracks
+    # than that needs a proportionally larger pool to actually draw from,
+    # otherwise target_count could never be reached regardless of how many
+    # strong matches exist.
+    shortlist = sorted(candidates.values(), key=lambda c: c[1], reverse=True)[:max(SHORTLIST_SIZE, target_count * 3)]
     ordered_candidates = _weighted_sample_without_replacement(shortlist)
 
     results = []
