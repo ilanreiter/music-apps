@@ -774,6 +774,28 @@ async def get_library_groups(
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
 
+@app.get("/api/library/artists/search", response_model=List[GroupEntry])
+async def search_library_artists(q: str, limit: int = 8, db: psycopg2.extensions.connection = Depends(get_db)):
+    """Distinct artist names matching a partial query, most-tracks-first -
+    powers the Library tab's artist autocomplete box. Reuses GroupEntry
+    (key/label/count/sample_track_id) even though this isn't a browse-groups
+    call, so the frontend can reuse the same thumbnail-rendering approach."""
+    q = q.strip()
+    if not q:
+        return []
+    try:
+        cur = db.cursor()
+        cur.execute(f"""
+            SELECT artist_name, COUNT(*), {SAMPLE_TRACK_SQL} FROM known_tracks
+            WHERE artist_name ILIKE %(q)s
+            GROUP BY artist_name ORDER BY COUNT(*) DESC LIMIT %(limit)s
+        """, {'q': f"%{q}%", 'limit': limit})
+        results = [{"key": row[0], "label": row[0], "count": row[1], "sample_track_id": row[2]} for row in cur.fetchall()]
+        cur.close()
+        return results
+    except Exception as e:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
 @app.get("/api/tracks/{track_id}", response_model=Track)
 async def get_track(track_id: int, db: psycopg2.extensions.connection = Depends(get_db)):
     try:

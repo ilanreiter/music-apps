@@ -330,6 +330,14 @@ function App() {
   const [skippedTrackIds, setSkippedTrackIds] = useState(() => new Set());
   const [searchInput, setSearchInput] = useState(() => loadLibraryView()?.search ?? '');
   const [search, setSearch] = useState(() => loadLibraryView()?.search ?? '');
+  // Dedicated artist-name typeahead, separate from the general search box
+  // above (which already matches artist/track/album together but has no
+  // suggestion dropdown) - picking a suggestion filters the library to that
+  // artist via the same search mechanism, just pre-filled with an exact name.
+  const [artistSearchInput, setArtistSearchInput] = useState('');
+  const [artistSuggestions, setArtistSuggestions] = useState([]);
+  const [artistSuggestionsOpen, setArtistSuggestionsOpen] = useState(false);
+  const [artistSuggestionHighlight, setArtistSuggestionHighlight] = useState(-1);
   const [filterGenre, setFilterGenre] = useState(() => loadLibraryView()?.filterGenre ?? '');
   const [filterDecade, setFilterDecade] = useState(() => loadLibraryView()?.filterDecade ?? '');
   // Defaults to deduping same-song duplicate rips down to the best copy - see
@@ -910,6 +918,26 @@ function App() {
     return () => clearTimeout(t);
   }, [searchInput]);
 
+  // Debounced artist-name suggestions for the autocomplete box below.
+  useEffect(() => {
+    const q = artistSearchInput.trim();
+    if (!q) {
+      setArtistSuggestions([]);
+      setArtistSuggestionHighlight(-1);
+      return;
+    }
+    const t = setTimeout(() => {
+      axios.get(`${API_BASE_URL}/library/artists/search`, { params: { q, limit: 8 } })
+        .then((r) => {
+          setArtistSuggestions(r.data);
+          setArtistSuggestionHighlight(-1);
+        })
+        .catch((err) => console.error('Error fetching artist suggestions:', err));
+    }, 250);
+    return () => clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [artistSearchInput]);
+
   useEffect(() => {
     if (!spotifyPlayHint) return;
     const t = setTimeout(() => setSpotifyPlayHint(null), 4000);
@@ -978,41 +1006,45 @@ function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeTab, libraryMode, drill, search, filterGenre, filterDecade, filterQuality, filterFormat, filterSpotifyAvailable, filterTrackLimit]);
 
+  // Refetches each filter dropdown's own option counts whenever search or
+  // any *other* filter changes, so e.g. the Genre dropdown shows "Metal
+  // (12)" instead of the whole-library "Metal (1,842)" once you've searched
+  // or filtered down to something narrower - each fetch omits its own
+  // dimension (see buildAmbientFilterParams) so switching that same filter
+  // still shows every option, not just whichever one is currently selected.
   useEffect(() => {
     if (activeTab !== 'library') return;
-    if (genreOptions.length === 0) {
-      axios.get(`${API_BASE_URL}/library/groups`, { params: { by: 'genre' } })
-        .then((r) => setGenreOptions(r.data))
-        .catch((err) => console.error('Error fetching genres:', err));
-    }
-    if (decadeOptions.length === 0) {
-      axios.get(`${API_BASE_URL}/library/groups`, { params: { by: 'decade' } })
-        .then((r) => setDecadeOptions(r.data))
-        .catch((err) => console.error('Error fetching decades:', err));
-    }
-    if (qualityOptions.length === 0) {
-      axios.get(`${API_BASE_URL}/library/groups`, { params: { by: 'quality' } })
-        .then((r) => setQualityOptions(r.data))
-        .catch((err) => console.error('Error fetching quality tiers:', err));
-    }
-    if (formatOptions.length === 0) {
-      axios.get(`${API_BASE_URL}/library/groups`, { params: { by: 'format' } })
-        .then((r) => setFormatOptions(r.data))
-        .catch((err) => console.error('Error fetching formats:', err));
-    }
+    const withSearch = (params) => (search ? { ...params, search } : params);
+
+    axios.get(`${API_BASE_URL}/library/groups`, { params: { by: 'genre', ...withSearch(buildAmbientFilterParams('genre')) } })
+      .then((r) => setGenreOptions(r.data))
+      .catch((err) => console.error('Error fetching genres:', err));
+    axios.get(`${API_BASE_URL}/library/groups`, { params: { by: 'decade', ...withSearch(buildAmbientFilterParams('decade')) } })
+      .then((r) => setDecadeOptions(r.data))
+      .catch((err) => console.error('Error fetching decades:', err));
+    axios.get(`${API_BASE_URL}/library/groups`, { params: { by: 'quality', ...withSearch(buildAmbientFilterParams('quality')) } })
+      .then((r) => setQualityOptions(r.data))
+      .catch((err) => console.error('Error fetching quality tiers:', err));
+    axios.get(`${API_BASE_URL}/library/groups`, { params: { by: 'format', ...withSearch(buildAmbientFilterParams('format')) } })
+      .then((r) => setFormatOptions(r.data))
+      .catch((err) => console.error('Error fetching formats:', err));
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeTab]);
+  }, [activeTab, search, filterGenre, filterDecade, filterQuality, filterFormat, filterSpotifyAvailable]);
 
   // The genre/decade/quality/format filters stay active no matter which
   // browse-by view or drill-down you're in; a drill-down's own dimension
   // (e.g. drilling into a specific genre) takes precedence over the ambient
   // filter for that same dimension.
-  const buildAmbientFilterParams = () => {
+  // omit excludes one filter dimension from the result - used when fetching
+  // that same dimension's own option counts, so e.g. the Genre dropdown's
+  // counts reflect every *other* active filter but not whatever genre is
+  // currently selected (which would otherwise collapse it to a single row).
+  const buildAmbientFilterParams = (omit) => {
     const params = {};
-    if (filterGenre) params.genre = filterGenre;
-    if (filterDecade) params.decade = Number(filterDecade);
-    if (filterQuality) params.quality = filterQuality;
-    if (filterFormat) params.format = filterFormat;
+    if (filterGenre && omit !== 'genre') params.genre = filterGenre;
+    if (filterDecade && omit !== 'decade') params.decade = Number(filterDecade);
+    if (filterQuality && omit !== 'quality') params.quality = filterQuality;
+    if (filterFormat && omit !== 'format') params.format = filterFormat;
     if (filterSpotifyAvailable) params.spotify_available = true;
     return params;
   };
@@ -1026,6 +1058,36 @@ function App() {
     setFilterTrackLimit('');
     setSearchInput('');
     setSearch('');
+  };
+
+  // Picking a suggestion filters the library to that artist via the same
+  // free-text search the main search box uses (an exact artist name matches
+  // via the existing ILIKE search) - applied immediately rather than
+  // waiting on the main search box's own 400ms debounce.
+  const selectArtistSuggestion = (artistName) => {
+    setSearchInput(artistName);
+    setSearch(artistName);
+    setArtistSearchInput('');
+    setArtistSuggestions([]);
+    setArtistSuggestionsOpen(false);
+    setArtistSuggestionHighlight(-1);
+  };
+
+  const handleArtistSearchKeyDown = (e) => {
+    if (!artistSuggestionsOpen || artistSuggestions.length === 0) return;
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      setArtistSuggestionHighlight((i) => (i + 1) % artistSuggestions.length);
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      setArtistSuggestionHighlight((i) => (i <= 0 ? artistSuggestions.length - 1 : i - 1));
+    } else if (e.key === 'Enter') {
+      e.preventDefault();
+      const pick = artistSuggestions[artistSuggestionHighlight] ?? artistSuggestions[0];
+      selectArtistSuggestion(pick.key);
+    } else if (e.key === 'Escape') {
+      setArtistSuggestionsOpen(false);
+    }
   };
 
   const buildTrackFilterParams = () => {
@@ -2200,6 +2262,33 @@ function App() {
                   value={searchInput}
                   onChange={(e) => setSearchInput(e.target.value)}
                 />
+                <div className="artist-search-wrap">
+                  <input
+                    type="text"
+                    className="search-input artist-search-input"
+                    placeholder="🎤 Find an artist…"
+                    value={artistSearchInput}
+                    onChange={(e) => { setArtistSearchInput(e.target.value); setArtistSuggestionsOpen(true); }}
+                    onFocus={() => { if (artistSuggestions.length > 0) setArtistSuggestionsOpen(true); }}
+                    onBlur={() => setArtistSuggestionsOpen(false)}
+                    onKeyDown={handleArtistSearchKeyDown}
+                  />
+                  {artistSuggestionsOpen && artistSuggestions.length > 0 && (
+                    <div className="artist-suggestions">
+                      {artistSuggestions.map((a, i) => (
+                        <button
+                          key={a.key}
+                          type="button"
+                          className={i === artistSuggestionHighlight ? 'active' : ''}
+                          onMouseDown={(e) => { e.preventDefault(); selectArtistSuggestion(a.key); }}
+                        >
+                          <span className="artist-suggestion-name">{a.label}</span>
+                          <span className="artist-suggestion-count">{a.count.toLocaleString()}</span>
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </div>
                 <div className="view-style-toggle">
                   <button
                     className={trackViewStyle === 'list' ? 'active' : ''}
@@ -2269,6 +2358,9 @@ function App() {
                   <option value="1000">Max 1,000</option>
                 </select>
                 <button className="clear-filters-btn" onClick={clearAllFilters}>Clear All</button>
+              </div>
+              <div className="discover-bar">
+                <span className="discover-bar-label">✨ Discover</span>
                 <select
                   value={discoverTrackCount}
                   onChange={(e) => setDiscoverTrackCount(Number(e.target.value))}
@@ -2292,10 +2384,10 @@ function App() {
                   disabled={discovering}
                   title="Find tracks similar to whatever's currently filtered"
                 >
-                  {discovering ? 'Discovering…' : '✨ Discover similar tracks'}
+                  {discovering ? 'Discovering…' : 'Discover similar tracks'}
                 </button>
+                {discoverError && <p className="error-message">{discoverError}</p>}
               </div>
-              {discoverError && <p className="error-message">{discoverError}</p>}
             </div>
 
             {discoveredTracks.length > 0 && (

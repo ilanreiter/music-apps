@@ -660,6 +660,66 @@ main.with-player {
   box-shadow: 0 0 0 3px var(--accent-soft);
 }
 
+.artist-search-wrap {
+  position: relative;
+  flex: 0 0 220px;
+}
+
+.artist-search-input {
+  width: 100%;
+}
+
+.artist-suggestions {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  right: 0;
+  z-index: 20;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+  overflow: hidden;
+}
+
+.artist-suggestions button {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  width: 100%;
+  padding: 9px 12px;
+  background: none;
+  border: none;
+  color: var(--text-main);
+  font-size: 0.85rem;
+  text-align: left;
+  cursor: pointer;
+}
+
+.artist-suggestions button:hover,
+.artist-suggestions button.active {
+  background: var(--accent-soft);
+}
+
+.artist-suggestion-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.artist-suggestion-count {
+  flex-shrink: 0;
+  color: var(--text-muted);
+  font-size: 0.78rem;
+}
+
+@media (max-width: 700px) {
+  .artist-search-wrap {
+    flex-basis: 100%;
+  }
+}
+
 .view-tabs {
   display: flex;
   gap: 4px;
@@ -706,6 +766,45 @@ main.with-player {
   border-radius: 8px;
   color: var(--text-main);
   font-size: 0.85rem;
+}
+
+/* Visually separate from .filter-row above (which narrows what the library
+   shows) - this bar's controls instead shape what Discover generates from
+   whatever the filters above currently produce, easy to conflate with a
+   library filter otherwise since they render right next to each other. */
+.discover-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  margin-top: 10px;
+  padding: 10px 12px;
+  background: var(--accent-soft);
+  border: 1px solid var(--accent);
+  border-radius: 8px;
+}
+
+.discover-bar-label {
+  flex: 0 0 auto;
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--accent-hover);
+  white-space: nowrap;
+}
+
+.discover-bar select {
+  flex: 0 1 160px;
+  padding: 9px 12px;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text-main);
+  font-size: 0.85rem;
+}
+
+.discover-bar .error-message {
+  flex-basis: 100%;
+  margin: 0;
 }
 
 .filter-checkbox-label {
