@@ -60,9 +60,18 @@ class RateLimited(Exception):
 
 
 def _normalize(text):
+    # [^a-z0-9]+ used to strip *any* non-ASCII character - not just
+    # punctuation, but every Hebrew/Cyrillic/CJK/accented-Latin letter too,
+    # collapsing e.g. a Hebrew title to an empty string. _similar() then
+    # short-circuits to 0.0 whenever either side is empty, so two identical
+    # Hebrew titles compared against each other still scored zero (same bug
+    # already fixed once in spotify_connect.py - this was a second, separate
+    # copy of the same function that never got the fix). \w is Unicode-aware
+    # by default in Python 3's re module, so this keeps letters from any
+    # script while still stripping real punctuation.
     if not text:
         return ''
-    return re.sub(r'[^a-z0-9]+', ' ', text.lower()).strip()
+    return re.sub(r'[^\w]+', ' ', text.lower()).strip()
 
 
 def _similar(a, b):
@@ -70,6 +79,41 @@ def _similar(a, b):
     if not a or not b:
         return 0.0
     return SequenceMatcher(None, a, b).ratio()
+
+
+# Below this length a title's too short/generic (e.g. "Home", "Yes") for an
+# exact match to be reliable identifying evidence on its own - mirrors
+# library_cleanup.py's MIN_FUZZY_LENGTH for the same reason.
+MIN_DISTINCTIVE_TITLE_LENGTH = 6
+NEAR_EXACT_TITLE_THRESHOLD = 0.92
+MIN_ARTIST_OVERLAP_FOR_TITLE_OVERRIDE = 0.15
+
+
+def _is_track_match(query_title, result_title, query_artist, result_artist):
+    """True if a search result is a plausible match for a query - either by
+    the standard averaged title+artist score, or (for a distinctive,
+    non-generic title matched almost exactly) a much looser artist bar.
+
+    Confirmed live: Noa performs under her stage name internationally, but
+    is sometimes credited by her birth name "Achinoam Nini" instead (Gemini
+    did this for a Hebrew-context Discover suggestion) - the two names share
+    almost no characters (_similar scores ~0.375), so even an exact title
+    match ("Mishaela") narrowly missed MATCH_THRESHOLD on the plain average
+    (0.6875, just under 0.72). A near-perfect match on a specific,
+    non-generic title is itself strong identifying evidence, even when the
+    artist field looks like a completely different name for the same
+    performer - unlike a generic title ("Intro"), a distinctive one being an
+    exact match by coincidence across unrelated artists is unlikely."""
+    title_score = _similar(query_title, result_title)
+    artist_score = _similar(query_artist, result_artist)
+    avg_score = (title_score + artist_score) / 2
+    if avg_score >= MATCH_THRESHOLD:
+        return True, avg_score
+    if (title_score >= NEAR_EXACT_TITLE_THRESHOLD
+            and len(_normalize(query_title)) >= MIN_DISTINCTIVE_TITLE_LENGTH
+            and artist_score >= MIN_ARTIST_OVERLAP_FOR_TITLE_OVERRIDE):
+        return True, title_score
+    return False, avg_score
 
 
 def _year_from(value):
@@ -292,12 +336,12 @@ def find_track_preview(artist_name, track_name):
             timeout=REQUEST_TIMEOUT,
         )
         if response.status_code == 200:
-            best, best_score = None, 0.0
+            best, best_score, best_matched = None, 0.0, False
             for result in response.json().get('results') or []:
-                score = (_similar(track_name, result.get('trackName', '')) + _similar(artist_name, result.get('artistName', ''))) / 2
+                matched, score = _is_track_match(track_name, result.get('trackName', ''), artist_name, result.get('artistName', ''))
                 if score > best_score:
-                    best, best_score = result, score
-            if best and best_score >= MATCH_THRESHOLD and best.get('previewUrl'):
+                    best, best_score, best_matched = result, score, matched
+            if best and best_matched and best.get('previewUrl'):
                 art = best.get('artworkUrl100')
                 return {
                     'preview_url': best['previewUrl'],
@@ -316,12 +360,12 @@ def find_track_preview(artist_name, track_name):
         if response.status_code == 200:
             data = response.json()
             if not (isinstance(data, dict) and data.get('error')):
-                best, best_score = None, 0.0
+                best, best_score, best_matched = None, 0.0, False
                 for result in data.get('data') or []:
-                    score = (_similar(track_name, result.get('title', '')) + _similar(artist_name, (result.get('artist') or {}).get('name', ''))) / 2
+                    matched, score = _is_track_match(track_name, result.get('title', ''), artist_name, (result.get('artist') or {}).get('name', ''))
                     if score > best_score:
-                        best, best_score = result, score
-                if best and best_score >= MATCH_THRESHOLD and best.get('preview'):
+                        best, best_score, best_matched = result, score, matched
+                if best and best_matched and best.get('preview'):
                     album = best.get('album') or {}
                     return {
                         'preview_url': best['preview'],

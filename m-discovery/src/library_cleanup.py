@@ -32,10 +32,20 @@ def _is_generic_placeholder(track_name, artist_name):
 
 
 def _normalize(text):
+    # [^a-z0-9]+ used to strip *any* non-ASCII character - not just
+    # punctuation, but every Hebrew/Cyrillic/CJK/accented-Latin letter too,
+    # collapsing e.g. a Hebrew title to an empty string - which then got
+    # silently excluded from duplicate detection entirely (both the exact
+    # and fuzzy passes below skip tracks with an empty normalized key). Same
+    # bug independently found and fixed in spotify_connect.py and
+    # external_artwork.py - this was a third, separate copy of the same
+    # function. \w is Unicode-aware by default in Python 3's re module, so
+    # this keeps letters from any script while still stripping real
+    # punctuation.
     if not text:
         return ''
     text = NOISE_PATTERN.sub('', text)
-    text = re.sub(r'[^a-z0-9]+', ' ', text.lower())
+    text = re.sub(r'[^\w]+', ' ', text.lower())
     return text.strip()
 
 

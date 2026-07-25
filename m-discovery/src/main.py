@@ -25,7 +25,7 @@ from . import spotify_prewarm
 from . import tag_cleanup
 from . import playback_advancer
 from . import shazam_identify
-import google.generativeai as genai
+from . import lastfm
 import logging
 import os
 import json
@@ -167,10 +167,6 @@ async def track_activity(request, call_next):
         _last_activity_at = time.time()
     return await call_next(request)
 
-# Configure Gemini API
-genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
-model = genai.GenerativeModel('gemini-flash-latest')
-
 # Pydantic models for data validation and serialization
 class Track(BaseModel):
     id: Optional[int] = None
@@ -188,10 +184,15 @@ class Track(BaseModel):
     artwork_source_url: Optional[str] = None
     is_favorite: Optional[bool] = False
     last_played: Optional[str] = None # Will be datetime string
-    # Populated only for Discover-tab suggestions on non-English tracks (see
-    # _build_prompt) - international catalogs (iTunes/Deezer/Spotify) index
-    # these under their native-script name, not a romanized transliteration,
-    # so search needs this to actually find the track. None for everything else.
+    # Was populated for Discover-tab suggestions on non-English tracks back
+    # when Discover was Gemini-based (international catalogs index these
+    # under their native-script name, not a romanized transliteration, so
+    # search needed this to find the track). Discover has since moved to
+    # Last.fm (see the lastfm module + discover_music below), which returns
+    # real catalog names directly with no separate native-script concept -
+    # these fields stay on the model (harmless, both Optional) since
+    # /api/discover/preview and /api/spotify/discover-match still accept and
+    # use them if ever populated, but they're currently always None.
     native_track_name: Optional[str] = None
     native_artist_name: Optional[str] = None
 
@@ -202,11 +203,13 @@ class DiscoveryHistoryEntry(BaseModel):
     track_list: List[Track] # Assuming track_list is a JSONB array of tracks
 
 class DiscoveryParameters(BaseModel):
+    # Comma-separated artist names (built by the frontend from whatever's
+    # currently filtered in the Library tab - see handleDiscoverFromLibrary
+    # in frontend/src/App.js). genre/mood/tempo/complexity were dropped once
+    # Discover moved off Gemini to Last.fm's similar-artist API (below) -
+    # Last.fm has no such filters, and genre already carries through by
+    # construction since the seed itself is genre-filtered.
     seed_tracks: str
-    genre: Optional[str] = None
-    mood: Optional[str] = None
-    tempo: Optional[int] = None
-    complexity: Optional[str] = None
     exclude_known: Optional[bool] = True
 
 class LibraryScanRequest(BaseModel):
@@ -1885,51 +1888,7 @@ async def get_discovery_history(db: psycopg2.extensions.connection = Depends(get
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
 
-def _build_prompt(params: DiscoveryParameters) -> str:
-    prompt_parts = [
-        f"I'm looking for music similar to '{params.seed_tracks}'.",
-        "Suggest 5-10 tracks that I might not have heard before.",
-        "For each track, provide the track name, artist name, and album name.",
-        "If the track's original language isn't English, also provide 'native_track_name' and 'native_artist_name' "
-        "with the title and artist written in their original script/language (e.g. Hebrew, Cyrillic, Japanese) - "
-        "international music catalogs (iTunes, Deezer, Spotify) index non-English tracks under their native-script "
-        "name, not a romanized transliteration, so this is needed to actually find and play these tracks. "
-        "Omit or set these to null for tracks that are already in English.",
-        "Format the output as a JSON array of objects, where each object has 'track_name', 'artist_name', "
-        "'album_name', 'native_track_name', and 'native_artist_name' keys."
-    ]
-    if params.genre:
-        prompt_parts.append(f"The genre should be: {params.genre}.")
-    if params.mood:
-        prompt_parts.append(f"The mood should be: {params.mood}.")
-    if params.tempo:
-        prompt_parts.append(f"The tempo should be around {params.tempo} BPM.")
-    if params.complexity:
-        prompt_parts.append(f"The musical complexity should be: {params.complexity}.")
-    
-    prompt_parts.append("Ensure the output is valid JSON and nothing else.")
-    return " ".join(prompt_parts)
-
-async def _call_gemini_api(prompt: str) -> List[Track]:
-    try:
-        response = await model.generate_content_async(prompt)
-        # Extract JSON string from the response
-        text_response = response.text.strip()
-        
-        # Gemini might add markdown ```json ... ```
-        if text_response.startswith("```json") and text_response.endswith("```"):
-            text_response = text_response[7:-3].strip()
-        
-        suggested_tracks_data = json.loads(text_response)
-        
-        # Validate and convert to Track Pydantic models
-        suggested_tracks = [Track(**track_data) for track_data in suggested_tracks_data]
-        return suggested_tracks
-    except Exception as e:
-        print(f"Error calling Gemini API or parsing response: {e}")
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Error from AI: {e}")
-
-async def _filter_known_tracks(suggested_tracks: List[Track], db: psycopg2.extensions.connection) -> List[Track]:
+def _filter_known_tracks(suggested_tracks: List[Track], db: psycopg2.extensions.connection) -> List[Track]:
     if not suggested_tracks:
         return []
 
@@ -1952,28 +1911,33 @@ async def _filter_known_tracks(suggested_tracks: List[Track], db: psycopg2.exten
     return filtered_tracks
 
 @app.post("/api/discover", response_model=List[Track])
-async def discover_music(params: DiscoveryParameters, db: psycopg2.extensions.connection = Depends(get_db)):
-    print(f"Received discovery request with params: {params}")
+def discover_music(params: DiscoveryParameters, db: psycopg2.extensions.connection = Depends(get_db)):
+    if not lastfm.is_configured():
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Last.fm not configured - set LASTFM_API_KEY")
 
-    prompt = _build_prompt(params)
-    print(f"Gemini Prompt: {prompt}")
+    seed_artists = [a.strip() for a in params.seed_tracks.split(',') if a.strip()]
+    print(f"Received discovery request seeded by: {seed_artists}")
 
-    suggested_tracks = await _call_gemini_api(prompt)
-    print(f"Gemini suggested {len(suggested_tracks)} tracks.")
+    raw_tracks = lastfm.discover_tracks(seed_artists)
+    suggested_tracks = [Track(track_name=t['track_name'], artist_name=t['artist_name']) for t in raw_tracks]
+    print(f"Last.fm suggested {len(suggested_tracks)} tracks.")
 
     final_tracks = suggested_tracks
     if params.exclude_known:
-        final_tracks = await _filter_known_tracks(suggested_tracks, db)
+        final_tracks = _filter_known_tracks(suggested_tracks, db)
         print(f"After filtering known tracks, {len(final_tracks)} remain.")
 
-    # Store discovery history
+    # Store discovery history - prompt_used repurposed to describe the seed
+    # (this column predates the Gemini->Last.fm switch and originally held
+    # the LLM prompt text; keeping it as a plain description avoids a schema
+    # change for what's still just a human-readable "what was this run
+    # seeded by" record).
     try:
         cur = db.cursor()
-        # Convert list of Track objects to list of dicts for JSONB storage
         track_list_dicts = [track.model_dump() for track in final_tracks]
         cur.execute(
             "INSERT INTO discovery_history (prompt_used, track_list) VALUES (%s, %s)",
-            (prompt, json.dumps(track_list_dicts))
+            (f"Last.fm similar-artist discovery seeded by: {', '.join(seed_artists)}", json.dumps(track_list_dicts))
         )
         db.commit()
         cur.close()
