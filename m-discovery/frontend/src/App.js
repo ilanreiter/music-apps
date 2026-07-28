@@ -193,11 +193,41 @@ const IconShuffle = (props) => (
     <line x1="4" y1="4" x2="9" y2="9" />
   </svg>
 );
-const IconSpeaker = (props) => (
+// Volume icon shows mute/low/high like Spotify's own volume button - a
+// speaker cone alone (muted), plus one wave (low) or two (high) - rather
+// than a fixed glyph regardless of level.
+const IconVolumeMute = (props) => (
+  <svg viewBox="0 0 24 24" width="1em" height="1em" {...props}>
+    <polygon points="11,5 6,9 2,9 2,15 6,15 11,19" fill="currentColor" />
+    <line x1="16" y1="9" x2="21" y2="15" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
+    <line x1="21" y1="9" x2="16" y2="15" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
+  </svg>
+);
+const IconVolumeLow = (props) => (
+  <svg viewBox="0 0 24 24" width="1em" height="1em" {...props}>
+    <polygon points="11,5 6,9 2,9 2,15 6,15 11,19" fill="currentColor" />
+    <path d="M15.54 8.46a5 5 0 0 1 0 7.07" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
+  </svg>
+);
+const IconVolumeHigh = (props) => (
   <svg viewBox="0 0 24 24" width="1em" height="1em" {...props}>
     <polygon points="11,5 6,9 2,9 2,15 6,15 11,19" fill="currentColor" />
     <path d="M15.54 8.46a5 5 0 0 1 0 7.07" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
     <path d="M18.07 5.93a9 9 0 0 1 0 12.14" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
+  </svg>
+);
+const IconVolume = ({ level, ...props }) => (
+  level === 0 ? <IconVolumeMute {...props} /> : level < 50 ? <IconVolumeLow {...props} /> : <IconVolumeHigh {...props} />
+);
+// "Connect to a device" glyph (Spotify's own icon for this button is a
+// monitor/screen with a cast signal, not a speaker - a speaker there reads as
+// a volume control and gets confused with the actual volume button).
+const IconDevices = (props) => (
+  <svg viewBox="0 0 24 24" width="1em" height="1em" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" {...props}>
+    <rect x="2" y="4" width="15" height="11" rx="1.5" />
+    <line x1="7" y1="19" x2="12" y2="19" />
+    <path d="M17.5 9a3.5 3.5 0 0 1 0 5" />
+    <path d="M20 6.5a7 7 0 0 1 0 11" />
   </svg>
 );
 
@@ -689,6 +719,10 @@ function App() {
   const outputDevices = [...wiimDevices, ...chromecastDevices, ...spotifyDevices];
   const [outputDevice, setOutputDevice] = useState(() => loadSession()?.outputDevice || null);
   const [destStatus, setDestStatus] = useState(null);
+  const [volume, setVolume] = useState(() => {
+    const saved = Number(localStorage.getItem('playerVolume'));
+    return Number.isFinite(saved) && saved >= 0 && saved <= 100 ? saved : 100;
+  });
   const destStatusRef = useRef(null);
   const prevOutputDeviceRef = useRef(null);
   // True once a Chromecast device has a real multi-item queue loaded (so its
@@ -2323,6 +2357,17 @@ function App() {
     }
   };
 
+  const handleSetVolume = (level) => {
+    const clamped = Math.min(100, Math.max(0, Math.round(level)));
+    if (outputDevice) {
+      axios.post(`${deviceEndpoint(outputDevice)}/volume`, { level: clamped })
+        .catch((err) => console.error('Error setting volume:', err));
+      return;
+    }
+    setVolume(clamped);
+    localStorage.setItem('playerVolume', String(clamped));
+  };
+
   const handleTrackPlayClick = (track, list) => {
     if (nowPlaying && nowPlaying.id === track.id) {
       togglePlay();
@@ -3699,6 +3744,8 @@ function App() {
         setOutputDevice={setOutputDevice}
         onRefreshSpotifyDevices={refreshSpotifyDevices}
         destStatus={destStatus}
+        volume={volume}
+        onSetVolume={handleSetVolume}
         shuffleEnabled={shuffleEnabled}
         onToggleShuffle={toggleShuffle}
         onSeek={handleSeek}
@@ -3958,6 +4005,7 @@ function SettingsPanel({
 function PlayerBar({
   track, queue, isPlaying, hasNext, hasPrev, onNext, onPrev, onTogglePlay, setIsPlaying, audioRef, apiBase,
   outputDevices, outputDevice, setOutputDevice, onRefreshSpotifyDevices, destStatus,
+  volume, onSetVolume,
   shuffleEnabled, onToggleShuffle, onSeek, onJumpToQueueItem,
   userHasInteracted, initialSeekMs, onInitialSeekApplied,
 }) {
@@ -3965,6 +4013,7 @@ function PlayerBar({
   const [artistInfo, setArtistInfo] = useState(null);
   const [bioExpanded, setBioExpanded] = useState(false);
   const [destMenuOpen, setDestMenuOpen] = useState(false);
+  const [volumeMenuOpen, setVolumeMenuOpen] = useState(false);
   const toggleDestMenu = () => {
     setDestMenuOpen((o) => {
       // Refresh right as it opens (not on every render) so a Spotify
@@ -4004,6 +4053,15 @@ function PlayerBar({
     setLocalProgress({ currentTime: 0, duration: 0 });
   }, [track?.id]);
 
+  // Applies the locally-stored volume to the <audio> element - needed on
+  // every track change too since a new track_id remounts a fresh <audio>
+  // node (key={localStreamId}) that otherwise starts back at full volume.
+  useEffect(() => {
+    if (!outputDevice && audioRef.current) {
+      audioRef.current.volume = volume / 100;
+    }
+  }, [track?.id, outputDevice, volume, audioRef]);
+
   if (!track) return null;
 
   const metaParts = [track.genre, track.year, formatDuration(track.duration_seconds)].filter(Boolean);
@@ -4034,6 +4092,8 @@ function PlayerBar({
   };
 
   const destinationLabel = outputDevice ? outputDevice.name : 'This Browser';
+  const displayVolume = outputDevice ? (destStatus?.volume ?? 100) : volume;
+  const handleVolumeSliderChange = (e) => onSetVolume(Number(e.target.value));
   const deviceIcon = (d) => (d.type === 'chromecast' ? '📺' : d.type === 'spotify' ? '🟢' : '📡');
   // Discover/Spotify/YT-Music-sourced tracks have no known_tracks row of
   // their own - t.id is a Spotify uri or YouTube video_id for those, not
@@ -4077,6 +4137,7 @@ function PlayerBar({
                 <section className="np-section np-art-section">
                   <div className="now-playing-art">
                     <img
+                      key={track.id}
                       src={trackArtworkUrl(track)}
                       alt=""
                       onError={(e) => { e.target.style.display = 'none'; }}
@@ -4199,7 +4260,7 @@ function PlayerBar({
                     aria-label="Playback destination"
                     title={`Playing on ${destinationLabel}`}
                   >
-                    <IconSpeaker />
+                    <IconDevices />
                   </button>
                   {destMenuOpen && (
                     <div className="np-destination-menu">
@@ -4236,6 +4297,7 @@ function PlayerBar({
       <div className="player-bar">
         <div className="player-thumb-wrap" onClick={() => setExpanded(true)}>
           <img
+            key={track.id}
             src={trackArtworkUrl(track)}
             alt=""
             onError={(e) => { e.target.style.display = 'none'; }}
@@ -4254,60 +4316,86 @@ function PlayerBar({
               <div className="np-progress-handle" style={{ left: `${progressRatio * 100}%` }} />
             </div>
             <span className="player-progress-time">{formatDuration(Math.floor(durationMs / 1000))}</span>
+            <span className="player-destination-label" title={`Playing on ${destinationLabel}`}>
+              Playing on <span className="player-destination-name">{destinationLabel}</span>
+            </span>
           </div>
-          {techParts.length > 0 && <p className="player-tech">{techParts.join(' · ')}</p>}
-        </div>
 
-        <div className="player-controls">
-          <button
-            className={`player-btn${shuffleEnabled ? ' active' : ''}`}
-            onClick={onToggleShuffle}
-            aria-label="Shuffle"
-            aria-pressed={shuffleEnabled}
-            title="Shuffle"
-          >
-            <IconShuffle />
-          </button>
-          <button className="player-btn" onClick={onPrev} disabled={!hasPrev} aria-label="Previous"><IconPrev /></button>
-          <button className="player-btn" onClick={onTogglePlay} aria-label={isPlaying ? 'Pause' : 'Play'}>
-            {isPlaying ? <IconPause /> : <IconPlay />}
-          </button>
-          <button className="player-btn" onClick={onNext} disabled={!hasNext} aria-label="Next"><IconNext /></button>
-          <div className="np-destination">
+          <div className="player-controls">
             <button
-              className={`player-btn${outputDevice ? ' active' : ''}`}
-              onClick={toggleDestMenu}
-              aria-label="Playback destination"
-              title={`Playing on ${destinationLabel}`}
+              className={`player-btn${shuffleEnabled ? ' active' : ''}`}
+              onClick={onToggleShuffle}
+              aria-label="Shuffle"
+              aria-pressed={shuffleEnabled}
+              title="Shuffle"
             >
-              <IconSpeaker />
+              <IconShuffle />
             </button>
-            {destMenuOpen && (
-              <div className="np-destination-menu">
-                <button
-                  className={!outputDevice ? 'active' : ''}
-                  onClick={() => { setOutputDevice(null); setDestMenuOpen(false); }}
-                >
-                  🔊 This Browser
-                </button>
-                {outputDevices.map((d) => (
+            <button className="player-btn" onClick={onPrev} disabled={!hasPrev} aria-label="Previous"><IconPrev /></button>
+            <button className="player-btn" onClick={onTogglePlay} aria-label={isPlaying ? 'Pause' : 'Play'}>
+              {isPlaying ? <IconPause /> : <IconPlay />}
+            </button>
+            <button className="player-btn" onClick={onNext} disabled={!hasNext} aria-label="Next"><IconNext /></button>
+            <div className="player-volume">
+              <button
+                className={`player-btn${volumeMenuOpen ? ' active' : ''}`}
+                onClick={() => setVolumeMenuOpen((o) => !o)}
+                aria-label="Volume"
+                title={`Volume ${displayVolume}%`}
+              >
+                <IconVolume level={displayVolume} />
+              </button>
+              {volumeMenuOpen && (
+                <div className="player-volume-menu">
+                  <input
+                    type="range"
+                    min="0"
+                    max="100"
+                    value={displayVolume}
+                    onChange={handleVolumeSliderChange}
+                  />
+                  <span>{displayVolume}%</span>
+                </div>
+              )}
+            </div>
+            <div className="np-destination">
+              <button
+                className={`player-btn${outputDevice ? ' active' : ''}`}
+                onClick={toggleDestMenu}
+                aria-label="Playback destination"
+                title={`Playing on ${destinationLabel}`}
+              >
+                <IconDevices />
+              </button>
+              {destMenuOpen && (
+                <div className="np-destination-menu">
                   <button
-                    key={d.id}
-                    className={outputDevice?.id === d.id ? 'active' : ''}
-                    onClick={() => { setOutputDevice(d); setDestMenuOpen(false); }}
+                    className={!outputDevice ? 'active' : ''}
+                    onClick={() => { setOutputDevice(null); setDestMenuOpen(false); }}
                   >
-                    {deviceIcon(d)} {d.name}
-                    {d.type === 'spotify' && d.status && d.status !== 'unknown' && (
-                      <span
-                        className={`device-status-dot ${d.status}`}
-                        title={d.status === 'failed' ? 'Last playback attempt on this device failed' : 'Last playback attempt on this device succeeded'}
-                      />
-                    )}
+                    🔊 This Browser
                   </button>
-                ))}
-              </div>
-            )}
+                  {outputDevices.map((d) => (
+                    <button
+                      key={d.id}
+                      className={outputDevice?.id === d.id ? 'active' : ''}
+                      onClick={() => { setOutputDevice(d); setDestMenuOpen(false); }}
+                    >
+                      {deviceIcon(d)} {d.name}
+                      {d.type === 'spotify' && d.status && d.status !== 'unknown' && (
+                        <span
+                          className={`device-status-dot ${d.status}`}
+                          title={d.status === 'failed' ? 'Last playback attempt on this device failed' : 'Last playback attempt on this device succeeded'}
+                        />
+                      )}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
           </div>
+
+          {techParts.length > 0 && <p className="player-tech">{techParts.join(' · ')}</p>}
         </div>
 
         {!outputDevice && (track.source === 'discover' ? (
