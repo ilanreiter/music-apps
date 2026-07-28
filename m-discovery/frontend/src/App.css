@@ -468,6 +468,8 @@ main.with-player {
 .availability-icon {
   display: inline-flex;
   align-items: center;
+  font-size: 14px;
+  line-height: 1;
   opacity: 1;
   transition: opacity 0.2s ease;
 }

@@ -777,20 +777,14 @@ function App() {
     if (nowPlaying.source === 'spotify') {
       if (outputDevice.type !== 'spotify') {
         // Switched away from Spotify to a local-only destination. If this
-        // track came from a local-library match (mapMatchedLocalTrack sets
-        // local_id), fall back to playing the original local file there
-        // instead of leaving the new destination silent - a genuine Spotify
-        // playlist track has no local equivalent, so there's nothing to do.
-        if (nowPlaying.local_id != null) {
-          const payload = { track_id: nowPlaying.local_id };
-          const isChromecast = outputDevice.type === 'chromecast';
-          if (isChromecast) {
-            payload.queue_track_ids = queue.filter((t) => t.local_id != null).slice(0, CHROMECAST_QUEUE_WINDOW).map((t) => t.local_id);
-          }
-          axios.post(`${deviceEndpoint(outputDevice)}/play`, payload)
-            .then(() => { if (isChromecast) chromecastQueueLoadedRef.current = true; })
-            .catch((err) => console.error('Error casting to device:', err));
-        }
+        // track also resolves a local file (mapMatchedLocalTrack's
+        // local_id, or the known_tracks cross-reference on a genuine
+        // Spotify playlist track - see mapSpotifyTrack), fall back to
+        // playing that there instead of leaving the new destination
+        // silent - a Spotify-only track (no local equivalent at all) has
+        // nothing to fall back to.
+        const localId = resolveLocalTrackId(nowPlaying);
+        if (localId != null) castLocalTrack(localId);
         return;
       }
       const endpoint = nowPlaying.context_uri ? 'play' : 'play-uris';
@@ -825,6 +819,20 @@ function App() {
         .finally(() => setTimeout(refreshSpotifyDevices, 7000));
       return;
     }
+    if (nowPlaying.source === 'ytmusic') {
+      if (outputDevice.type === 'spotify') {
+        // Same reasoning as the spotify-source branch above, mirrored: a YT
+        // Music playlist track has no local track_id Spotify could use even
+        // if it also resolves one - it's already got its own dedicated
+        // match pipeline (which also checks matched_spotify_uri first,
+        // skipping a live search when already known).
+        matchAndQueueYtMusicPlaylistTracksOnSpotify([nowPlaying, ...queue]);
+        return;
+      }
+      const localId = resolveLocalTrackId(nowPlaying);
+      if (localId != null) castLocalTrack(localId);
+      return;
+    }
     if (outputDevice.type === 'spotify') {
       // Switched destination to Spotify while a local track was already
       // playing - there's no local track_id Spotify can use, so resolve
@@ -836,16 +844,7 @@ function App() {
       matchAndPlayLocalTracksOnSpotify([nowPlaying, ...queue]);
       return;
     }
-    const payload = { track_id: nowPlaying.id };
-    const isChromecast = outputDevice.type === 'chromecast';
-    if (isChromecast) {
-      payload.queue_track_ids = queue.slice(0, CHROMECAST_QUEUE_WINDOW).map((t) => t.id);
-    }
-    axios.post(`${deviceEndpoint(outputDevice)}/play`, payload)
-      .then(() => {
-        if (isChromecast) chromecastQueueLoadedRef.current = true;
-      })
-      .catch((err) => console.error('Error casting to device:', err));
+    castLocalTrack(resolveLocalTrackId(nowPlaying));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [outputDevice, nowPlaying]);
 
@@ -1800,6 +1799,41 @@ function App() {
     }
   };
 
+  // A track's own local (known_tracks) id, if this exact track can stream
+  // from a local file - either because it genuinely IS a local library
+  // track (its own id already is one), or because the known_tracks
+  // cross-reference found the same track under local_id (a Spotify/YT
+  // Music playlist track that also happens to be on disk - see
+  // mapSpotifyTrack/mapYtMusicTrack). null means there's truly no local
+  // file this track could stream from - WiiM/Chromecast (which can only
+  // ever stream a URL this app serves itself, never Spotify/YouTube
+  // directly) have nothing to play in that case, only Spotify Connect
+  // (for a source:'spotify' track) or This Browser (which can also fall
+  // back to opening YouTube directly for a source:'ytmusic' track) can.
+  const resolveLocalTrackId = (t) => (
+    t.local_id != null ? t.local_id
+      : (t.source === 'spotify' || t.source === 'ytmusic' || t.source === 'discover') ? null
+        : t.id
+  );
+
+  // Casts a resolved local track id to whichever WiiM/Chromecast device is
+  // currently selected - shared by the cast-on-change effect and
+  // togglePlay's initial-cast fallback below, both of which need the exact
+  // same "single track_id, plus a Chromecast queue built from whichever of
+  // the *rest* of the queue also resolves a local id" logic, regardless of
+  // whether nowPlaying is a genuine local track or a Spotify/YT Music
+  // playlist track that happens to also be one (see resolveLocalTrackId).
+  const castLocalTrack = (localId) => {
+    const payload = { track_id: localId };
+    const isChromecast = outputDevice.type === 'chromecast';
+    if (isChromecast) {
+      payload.queue_track_ids = queue.map(resolveLocalTrackId).filter((id) => id != null).slice(0, CHROMECAST_QUEUE_WINDOW);
+    }
+    axios.post(`${deviceEndpoint(outputDevice)}/play`, payload)
+      .then(() => { if (isChromecast) chromecastQueueLoadedRef.current = true; })
+      .catch((err) => console.error('Error casting to device:', err));
+  };
+
   const startQueue = (tracks, { shuffle = false } = {}) => {
     if (!tracks || tracks.length === 0) return;
     // Central guard for every "Play All"/"Shuffle" entry point (library flat
@@ -1808,8 +1842,12 @@ function App() {
     // otherwise silently fail to cast while leaving the destination's status
     // poll to overwrite nowPlaying with whatever Spotify's device already
     // happens to be playing, which looks like "the wrong song is playing."
+    // A source:'spotify' track that also resolves a local id (the
+    // cross-reference above) is exempt from the first check - it's not
+    // Spotify-only, so a WiiM/Chromecast destination can stream it too.
     const isSpotifyTracks = tracks[0]?.source === 'spotify';
-    if (isSpotifyTracks && outputDevice?.type !== 'spotify') {
+    const needsSpotifyConnect = isSpotifyTracks && resolveLocalTrackId(tracks[0]) == null;
+    if (needsSpotifyConnect && outputDevice?.type !== 'spotify') {
       setSpotifyPlayHint('Select a Spotify Connect device (destination picker) to play Spotify playlists.');
       return;
     }
@@ -2228,16 +2266,8 @@ function App() {
         destNeedsInitialCastRef.current = false;
         if (nowPlaying.source === 'spotify') {
           if (outputDevice.type !== 'spotify') {
-            if (nowPlaying.local_id != null) {
-              const localPayload = { track_id: nowPlaying.local_id };
-              const isChromecast = outputDevice.type === 'chromecast';
-              if (isChromecast) {
-                localPayload.queue_track_ids = queue.filter((t) => t.local_id != null).slice(0, CHROMECAST_QUEUE_WINDOW).map((t) => t.local_id);
-              }
-              axios.post(`${deviceEndpoint(outputDevice)}/play`, localPayload)
-                .then(() => { if (isChromecast) chromecastQueueLoadedRef.current = true; })
-                .catch((err) => console.error('Error casting to device:', err));
-            }
+            const localId = resolveLocalTrackId(nowPlaying);
+            if (localId != null) castLocalTrack(localId);
             return;
           }
           const endpoint = nowPlaying.context_uri ? 'play' : 'play-uris';
@@ -2252,20 +2282,20 @@ function App() {
             .finally(() => setTimeout(refreshSpotifyDevices, 7000));
           return;
         }
+        if (nowPlaying.source === 'ytmusic') {
+          if (outputDevice.type === 'spotify') {
+            matchAndQueueYtMusicPlaylistTracksOnSpotify([nowPlaying, ...queue]);
+            return;
+          }
+          const localId = resolveLocalTrackId(nowPlaying);
+          if (localId != null) castLocalTrack(localId);
+          return;
+        }
         if (outputDevice.type === 'spotify') {
           matchAndPlayLocalTracksOnSpotify([nowPlaying, ...queue]);
           return;
         }
-        const payload = { track_id: nowPlaying.id };
-        const isChromecast = outputDevice.type === 'chromecast';
-        if (isChromecast) {
-          payload.queue_track_ids = queue.slice(0, CHROMECAST_QUEUE_WINDOW).map((t) => t.id);
-        }
-        axios.post(`${deviceEndpoint(outputDevice)}/play`, payload)
-          .then(() => {
-            if (isChromecast) chromecastQueueLoadedRef.current = true;
-          })
-          .catch((err) => console.error('Error casting to device:', err));
+        castLocalTrack(resolveLocalTrackId(nowPlaying));
         return;
       }
       const action = destStatus?.status === 'play' ? 'pause' : 'resume';
@@ -2318,10 +2348,12 @@ function App() {
     }
     // YouTube Music playlist tracks: with a Spotify Connect destination,
     // match+play (+queue the rest) on Spotify, same pipeline Discover uses.
-    // With This Browser selected: if this exact video also turned out to be
-    // a local file (local_id, via the known_tracks cross-reference - see
-    // mapYtMusicTrack), stream it directly, no different from a genuine
-    // local-library track. Otherwise open the real video on
+    // Any other destination: if this exact video also turned out to be a
+    // local file (local_id, via the known_tracks cross-reference - see
+    // mapYtMusicTrack), stream it there directly (This Browser, WiiM, or
+    // Chromecast - all three can stream a local file the same way), no
+    // different from a genuine local-library track. Otherwise, with This
+    // Browser selected specifically, open the real video on
     // music.youtube.com in a new tab instead of playing it in-app - an
     // embedded IFrame player was tried and confirmed (live testing) to
     // always fail with "Video unavailable" for every track even though the
@@ -2329,17 +2361,15 @@ function App() {
     // on YouTube; this points to YouTube's bot/integrity verification
     // rejecting the embed context itself (this app runs on a plain-HTTP LAN
     // IP, not a normal registered domain), not a per-video restriction, so
-    // there's no in-app fix. WiiM/Chromecast can do neither (same reasoning
-    // as Discover suggestions) regardless of a local match.
+    // there's no in-app fix. WiiM/Chromecast have no such fallback (nothing
+    // else they could stream) if there's no local match.
     if (track.source === 'ytmusic') {
+      const startIndex = list.findIndex((t) => t.id === track.id);
+      const candidates = startIndex >= 0 ? list.slice(startIndex) : [track];
       if (outputDevice?.type === 'spotify') {
-        const startIndex = list.findIndex((t) => t.id === track.id);
-        const candidates = startIndex >= 0 ? list.slice(startIndex) : [track];
         matchAndQueueYtMusicPlaylistTracksOnSpotify(candidates);
-      } else if (!outputDevice && track.local_id != null) {
-        const startIndex = list.findIndex((t) => t.id === track.id);
-        const candidates = startIndex >= 0 ? list.slice(startIndex) : [track];
-        startQueue(candidates);
+      } else if (track.local_id != null) {
+        startQueue(candidates.filter((t) => resolveLocalTrackId(t) != null));
       } else if (!outputDevice) {
         const playlistId = libraryMode === 'ytmusic-playlist' ? drill?.key : null;
         const url = playlistId
@@ -2347,14 +2377,34 @@ function App() {
           : `https://music.youtube.com/watch?v=${track.video_id}`;
         window.open(url, '_blank', 'noopener,noreferrer');
       } else {
-        setSpotifyPlayHint('Select a Spotify Connect device, or switch to This Browser, to play YouTube Music playlist tracks.');
+        setSpotifyPlayHint('Select a Spotify Connect device, switch to This Browser, or pick a track already in your local library, to play YouTube Music playlist tracks on this device.');
       }
       return;
     }
-    // Spotify tracks stream from Spotify's own servers to a Spotify Connect
-    // device - there's no local file to hand to WiiM/Chromecast/this browser,
-    // and the reverse (a local file to Spotify Connect) doesn't work either.
+    // Spotify playlist tracks stream from Spotify's own servers to a
+    // Spotify Connect device - there's no local file to hand to
+    // WiiM/Chromecast/This Browser instead, UNLESS this exact track also
+    // happens to be a local file (local_id, via the known_tracks
+    // cross-reference - see mapSpotifyTrack), in which case any of those
+    // three can stream that instead. With no local match and This Browser
+    // specifically selected, open Spotify's own web player in a new tab -
+    // same fallback shape as the YT Music branch above (open.spotify.com is
+    // a genuine, fully-featured Spotify Connect-independent player, unlike
+    // the YouTube IFrame embed that was tried and confirmed broken, so this
+    // one didn't need that same investigation). WiiM/Chromecast have no
+    // such fallback - opening a tab on this computer's browser doesn't play
+    // anything on that separate hardware device.
     if (track.source === 'spotify' && outputDevice?.type !== 'spotify') {
+      if (track.local_id != null) {
+        const startIndex = list.findIndex((t) => t.id === track.id);
+        const candidates = (startIndex >= 0 ? list.slice(startIndex) : [track]).filter((t) => resolveLocalTrackId(t) != null);
+        startQueue(candidates);
+        return;
+      }
+      if (!outputDevice) {
+        window.open(`https://open.spotify.com/track/${track.uri.split(':').pop()}`, '_blank', 'noopener,noreferrer');
+        return;
+      }
       setSpotifyPlayHint('Select a Spotify Connect device (destination picker) to play Spotify playlists.');
       return;
     }
@@ -2399,6 +2449,12 @@ function App() {
     const isPlaylistTrack = track.source === 'spotify' || track.source === 'ytmusic';
     const availableOnSpotify = track.source === 'spotify' || Boolean(track.matched_spotify_uri);
     const availableOnYtMusic = track.source === 'ytmusic' || Boolean(track.matched_ytmusic_video_id);
+    // WiiM (and Chromecast/This Browser, which share the exact same
+    // requirement) can only ever stream a local file - never Spotify or
+    // YouTube directly - so this is only ever true when the known_tracks
+    // cross-reference found this exact playlist track is also on disk (see
+    // resolveLocalTrackId/handleTrackPlayClick's WiiM fallback).
+    const availableOnWiim = Boolean(resolveLocalTrackId(track));
     const hasPlayed = !isCurrent && playedTrackIds.has(track.id);
     const wasSkipped = !isCurrent && !hasPlayed && skippedTrackIds.has(track.id);
     const playIcon = isMatching ? '⏳' : isCardPlaying ? '❚❚' : '▶';
@@ -2498,6 +2554,12 @@ function App() {
                 title={availableOnYtMusic ? 'Available on YouTube Music' : 'Not found on YouTube Music'}
               >
                 <YtMusicIcon />
+              </span>
+              <span
+                className={`availability-icon${availableOnWiim ? '' : ' unavailable'}`}
+                title={availableOnWiim ? 'Playable on WiiM (also in your local library)' : 'Not in your local library - can\'t play on WiiM'}
+              >
+                📡
               </span>
             </div>
           )}
@@ -2603,17 +2665,39 @@ function App() {
 
   const playGroup = async (group, { shuffle = false } = {}) => {
     if (group.by === 'playlist') {
-      if (outputDevice?.type !== 'spotify') {
-        setSpotifyPlayHint('Select a Spotify Connect device (destination picker) to play Spotify playlists.');
-        return;
-      }
       try {
         const response = await axios.get(`${API_BASE_URL}/spotify/playlists/${group.key}/tracks`);
         const tracks = response.data.map((t) => mapSpotifyTrack(t));
-        startQueue(tracks, { shuffle });
+        if (outputDevice?.type === 'spotify') {
+          startQueue(tracks, { shuffle });
+        } else if (tracks.some((t) => t.local_id != null)) {
+          // WiiM/Chromecast/This Browser can stream whichever tracks in
+          // this playlist also resolve a local match (the known_tracks
+          // cross-reference - see mapSpotifyTrack) - filter to just those,
+          // skipping the rest rather than blocking the whole playlist.
+          const ordered = shuffle ? shuffleArray(tracks) : tracks;
+          startQueue(ordered.filter((t) => t.local_id != null));
+        } else if (!outputDevice) {
+          // No local match for anything in this playlist and This Browser
+          // selected - open Spotify's own web player on the playlist itself
+          // (a fully-featured, Connect-independent player) rather than
+          // just blocking.
+          window.open(`https://open.spotify.com/playlist/${group.key}`, '_blank', 'noopener,noreferrer');
+        } else {
+          setSpotifyPlayHint('Select a Spotify Connect device (destination picker) to play Spotify playlists - none of these tracks are in your local library.');
+        }
       } catch (err) {
         if (err.response?.status === 403) {
-          playSpotifyContextDirectly(`spotify:playlist:${group.key}`);
+          if (outputDevice?.type === 'spotify') {
+            playSpotifyContextDirectly(`spotify:playlist:${group.key}`);
+          } else if (!outputDevice) {
+            // Can't read the track listing (not owned), but the web player
+            // doesn't need to - it can browse/play a followed/public
+            // playlist just fine on its own.
+            window.open(`https://open.spotify.com/playlist/${group.key}`, '_blank', 'noopener,noreferrer');
+          } else {
+            setSpotifyPlayHint("Spotify doesn't allow reading the track listing of a playlist you don't own, so this app can't tell which of its tracks are in your local library - select a Spotify Connect device to play it via its own context instead.");
+          }
         } else {
           console.error('Error queuing Spotify playlist playback:', err);
         }
@@ -2624,27 +2708,29 @@ function App() {
     // local-library branch below (paramsForGroupKey has no 'ytmusic-playlist'
     // case, so it silently queued nothing) - confirmed live this is why "Play
     // All" did nothing. With a Spotify Connect destination, match+queue the
-    // whole playlist the same way an individual track does. With This Browser
-    // selected, there's no in-app playback path anymore (see the ytmusic
-    // branch of handleTrackPlayClick) - instead open the playlist's first
-    // video on music.youtube.com with list= set to this playlist's id, so
-    // YouTube's own player drives playback through the rest of the playlist
-    // from there.
+    // whole playlist the same way an individual track does. Any other
+    // destination that also resolves at least one local match (the
+    // known_tracks cross-reference - see mapYtMusicTrack) streams just
+    // those tracks, skipping ones with no local file. With none at all and
+    // This Browser selected, there's no in-app playback path anymore (see
+    // the ytmusic branch of handleTrackPlayClick) - instead open the
+    // playlist's first video on music.youtube.com with list= set to this
+    // playlist's id, so YouTube's own player drives playback through the
+    // rest of the playlist from there. WiiM/Chromecast with no local
+    // matches at all have nothing left to fall back to.
     if (group.by === 'ytmusic-playlist') {
-      if (outputDevice && outputDevice.type !== 'spotify') {
-        setSpotifyPlayHint('Select a Spotify Connect device, or switch to This Browser, to play YouTube Music playlists.');
-        return;
-      }
       try {
         const response = await axios.get(`${API_BASE_URL}/ytmusic/playlists/${group.key}/tracks`);
         const tracks = (shuffle ? shuffleArray(response.data) : response.data).map((t) => mapYtMusicTrack(t));
         if (tracks.length === 0) return;
         if (outputDevice?.type === 'spotify') {
           matchAndQueueYtMusicPlaylistTracksOnSpotify(tracks);
-        } else if (tracks[0].local_id != null) {
-          startQueue(tracks);
-        } else {
+        } else if (tracks.some((t) => t.local_id != null)) {
+          startQueue(tracks.filter((t) => t.local_id != null));
+        } else if (!outputDevice) {
           window.open(`https://music.youtube.com/watch?v=${tracks[0].video_id}&list=${group.key}`, '_blank', 'noopener,noreferrer');
+        } else {
+          setSpotifyPlayHint('Select a Spotify Connect device, or switch to This Browser, to play YouTube Music playlists on this device - none of these tracks are in your local library.');
         }
       } catch (err) {
         console.error('Error queuing YouTube Music playlist playback:', err);
@@ -2679,23 +2765,39 @@ function App() {
     if (!tracks || tracks.length === 0) return;
     const ordered = shuffle ? shuffleArray(tracks) : tracks;
     if (libraryMode === 'playlist') {
-      startQueue(ordered);
-      return;
-    }
-    if (outputDevice && outputDevice.type !== 'spotify') {
-      setSpotifyPlayHint('Select a Spotify Connect device, or switch to This Browser, to play YouTube Music playlists.');
+      if (outputDevice?.type === 'spotify') {
+        startQueue(ordered);
+      } else if (ordered.some((t) => t.local_id != null)) {
+        // WiiM/Chromecast/This Browser can stream whichever tracks also
+        // resolve a local match (the known_tracks cross-reference - see
+        // mapSpotifyTrack) - filter to just those.
+        startQueue(ordered.filter((t) => t.local_id != null));
+      } else if (!outputDevice) {
+        // No local match anywhere in this (flattened, cross-playlist) batch
+        // - there's no single playlist page to open here the way
+        // playGroup's version can, so open the first track's own page
+        // instead, same as the YT Music branch below does with its first
+        // video.
+        window.open(`https://open.spotify.com/track/${ordered[0].uri.split(':').pop()}`, '_blank', 'noopener,noreferrer');
+      } else {
+        setSpotifyPlayHint('Select a Spotify Connect device (destination picker) to play Spotify playlists - none of these tracks are in your local library.');
+      }
       return;
     }
     if (outputDevice?.type === 'spotify') {
       matchAndQueueYtMusicPlaylistTracksOnSpotify(ordered);
-    } else if (ordered[0].local_id != null) {
-      // The first track also turned out to be a local file (known_tracks
-      // cross-reference) - stream it directly, same as a single-track click
-      // would. Later tracks lacking a local match still resolve gracefully
-      // per-track (see PlayerBar's "no local copy" fallback message).
-      startQueue(ordered);
-    } else {
+    } else if (ordered.some((t) => t.local_id != null)) {
+      // At least one track also turned out to be a local file (known_tracks
+      // cross-reference) - stream just those (WiiM/Chromecast/This Browser
+      // all can). Filtered out tracks with no local match rather than
+      // leaving them to resolve per-track, unlike a single-track click -
+      // there's no single "first" track's fallback tab to open here for a
+      // whole mixed batch.
+      startQueue(ordered.filter((t) => t.local_id != null));
+    } else if (!outputDevice) {
       window.open(`https://music.youtube.com/watch?v=${ordered[0].video_id}`, '_blank', 'noopener,noreferrer');
+    } else {
+      setSpotifyPlayHint('Select a Spotify Connect device, or switch to This Browser, to play YouTube Music playlists on this device - none of these tracks are in your local library.');
     }
   };
 
