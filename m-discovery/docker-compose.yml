@@ -10,6 +10,7 @@ services:
       - artist_cache:/app/artist_cache
     ports:
       - "8001:8000"
+    restart: unless-stopped
 
   frontend:
     build:
@@ -22,6 +23,7 @@ services:
       - "6443:443"
     depends_on:
       - app
+    restart: unless-stopped
 
 volumes:
   artwork_cache:

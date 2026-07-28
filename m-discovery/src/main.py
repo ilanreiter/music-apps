@@ -8,6 +8,9 @@ from .database import (
     get_db_connection, create_tables,
     save_playback_session, get_playback_session, clear_playback_session,
     update_chromecast_pushed_count,
+    enqueue_ytmusic_push_job, get_active_ytmusic_push_job, get_next_queued_ytmusic_push_job,
+    count_queued_ytmusic_push_jobs, has_pending_ytmusic_push_work,
+    list_pending_ytmusic_push_jobs, delete_ytmusic_push_job,
 )
 from .library_scanner import run_scan
 from .artwork import get_or_create_thumbnail, check_artwork_presence, cache_key_for, normalize_album_name, normalized_album_sql, save_thumbnail
@@ -20,6 +23,8 @@ from .library_cleanup import (
 from . import wiim
 from . import chromecast
 from . import spotify_connect
+from . import ytmusic_connect
+from . import ytmusic_push_job
 from . import external_artwork
 from . import spotify_prewarm
 from . import tag_cleanup
@@ -118,6 +123,12 @@ external_artwork_progress = {"status": "idle"}
 
 spotify_prewarm_lock = threading.Lock()
 spotify_prewarm_progress = {"status": "idle"}
+
+# No in-memory progress dict for this one, unlike the jobs above - its state
+# (status/counters) lives entirely in the ytmusic_push_job Postgres row (see
+# database.py), read directly by the status route below. Just a lock to stop
+# two overlapping background threads.
+ytmusic_push_job_lock = threading.Lock()
 
 tag_cleanup_lock = threading.Lock()
 tag_cleanup_progress = {"status": "idle"}
@@ -465,6 +476,19 @@ async def startup_event():
             if remaining > 0:
                 print(f"Resuming Spotify pre-warm in the background ({remaining} tracks not yet checked).")
                 _start_spotify_prewarm_background()
+
+    # Same auto-resume principle for the paced YouTube Music push queue (see
+    # ytmusic_push_job.py) - each job's progress lives entirely in its own
+    # ytmusic_push_job row, not the in-memory lock/thread, so a restart just
+    # needs to check whether anything was left queued/mid-flight and pick it
+    # back up (the worker itself processes the queue in FIFO order).
+    if ytmusic_connect.is_connected() and has_pending_ytmusic_push_work():
+        active = get_active_ytmusic_push_job()
+        if active:
+            print(f"Resuming YouTube Music push job in the background ({active['tracks_processed_total']} of {active['total']} processed so far).")
+        else:
+            print("Resuming YouTube Music push queue in the background.")
+        _start_ytmusic_push_job_background()
 
     # Unconditional, unlike the backfill jobs above - this is a supervisor
     # that keeps playback advancing to the next track even once the browser
@@ -1380,6 +1404,113 @@ def create_spotify_playlist_from_discovered(params: CreatePlaylistFromDiscovered
     skipped = len(params.tracks) - len(uris)
     return _create_spotify_playlist_from_uris(params.name, uris, skipped)
 
+@app.get("/api/ytmusic/auth/status")
+def ytmusic_auth_status():
+    return {"connected": ytmusic_connect.is_connected()}
+
+@app.post("/api/ytmusic/auth/start")
+def ytmusic_auth_start():
+    """Kicks off Google's device-code flow - unlike Spotify's redirect-based
+    login, there's no URL to send the browser to directly. The frontend shows
+    the returned verification_url/user_code and polls /auth/poll until the
+    user finishes the pairing on any device."""
+    if not ytmusic_connect.is_configured():
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="YTMUSIC_OAUTH_CLIENT_ID/YTMUSIC_OAUTH_CLIENT_SECRET not set in .env")
+    try:
+        return ytmusic_connect.start_auth()
+    except Exception:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Could not start the YouTube Music sign-in - check the OAuth client id/secret")
+
+@app.post("/api/ytmusic/auth/poll")
+def ytmusic_auth_poll():
+    try:
+        result = ytmusic_connect.poll_auth()
+    except Exception:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="YouTube Music sign-in failed - check the OAuth client id/secret")
+    return {"status": result}
+
+@app.post("/api/ytmusic/auth/disconnect")
+def ytmusic_auth_disconnect():
+    ytmusic_connect.disconnect()
+    return {"status": "disconnected"}
+
+@app.post("/api/ytmusic/playlists/from-discovered")
+def create_ytmusic_playlist_from_discovered(params: CreatePlaylistFromDiscoveredRequest):
+    """Same request shape as the Spotify equivalent above (reused directly,
+    not duplicated - it's pure text with no Spotify-specific fields) - each
+    track is matched live via ytmusic_connect.create_playlist_and_push, same
+    "Discover result sets are always small" reasoning as the Spotify route."""
+    if not ytmusic_connect.is_connected():
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="YouTube Music not connected")
+    if not params.tracks:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No tracks to push")
+
+    tracks = [t.model_dump() for t in params.tracks]
+    result = ytmusic_connect.create_playlist_and_push(params.name, tracks)
+    if result is None:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Could not create the YouTube Music playlist")
+    if result["playlist_url"] is None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="None of these tracks could be matched on YouTube Music")
+    return result
+
+# Below this size, push synchronously in one request (unchanged behavior -
+# a live search+insert pair costs real YouTube Data API quota per track,
+# 100 + 50 units, so this stays small enough to comfortably fit one
+# request's worth of quota). At or above it, the request would need more
+# quota than a single day safely allows, so it's added to the FIFO queue
+# ytmusic_push_job.py works through instead - it paces search+insert across
+# however many days it takes, appending to that job's own growing playlist,
+# and automatically moves on to the next queued job once each one finishes.
+YTMUSIC_LIBRARY_PUSH_LIMIT = 30
+
+@app.post("/api/ytmusic/playlists/from-library")
+def create_ytmusic_playlist_from_library(
+    params: CreatePlaylistFromLibraryRequest, db: psycopg2.extensions.connection = Depends(get_db),
+):
+    if not ytmusic_connect.is_connected():
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="YouTube Music not connected")
+    if not params.track_ids:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No tracks to push")
+
+    if len(params.track_ids) <= YTMUSIC_LIBRARY_PUSH_LIMIT:
+        cur = db.cursor()
+        cur.execute("SELECT id, track_name, artist_name FROM known_tracks WHERE id = ANY(%s)", (params.track_ids,))
+        rows_by_id = {row[0]: {"track_name": row[1], "artist_name": row[2]} for row in cur.fetchall()}
+        cur.close()
+        # Preserve the caller's (possibly shuffled) order - a dict lookup and
+        # a plain WHERE id = ANY() don't, same reasoning as the Spotify route.
+        tracks = [rows_by_id[tid] for tid in params.track_ids if tid in rows_by_id]
+
+        result = ytmusic_connect.create_playlist_and_push(params.name, tracks)
+        if result is None:
+            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Could not create the YouTube Music playlist")
+        if result["playlist_url"] is None:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="None of these tracks could be matched on YouTube Music")
+        # Report against the full requested count (not just any dropped by a
+        # future cap change) so skipped stays an honest total.
+        result["skipped"] = len(params.track_ids) - result["added"]
+        return result
+
+    cur = db.cursor()
+    cur.execute("SELECT id, track_name, artist_name FROM known_tracks WHERE id = ANY(%s)", (params.track_ids,))
+    rows_by_id = {row[0]: {"track_name": row[1], "artist_name": row[2]} for row in cur.fetchall()}
+    cur.close()
+    tracks = [
+        {"track_name": rows_by_id[tid]["track_name"], "artist_name": rows_by_id[tid]["artist_name"], "known_track_id": tid}
+        for tid in params.track_ids if tid in rows_by_id
+    ]
+    if not tracks:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="None of these track ids were found in the library")
+
+    # Always accepted - a push while another is active/waiting_quota just
+    # joins the back of the FIFO queue instead of being rejected. Counting
+    # ahead-of-it jobs before enqueueing (rather than after) means this new
+    # job's own id is correctly excluded from its own queue position.
+    queue_position = count_queued_ytmusic_push_jobs() + (1 if get_active_ytmusic_push_job() else 0)
+    enqueue_ytmusic_push_job(params.name, tracks)
+    _start_ytmusic_push_job_background()
+    return {"job_started": True, "queue_position": queue_position}
+
 def _match_track_to_spotify(db, track_id):
     """Looks up (or performs and caches) a local track's Spotify match. Shared
     by the single-track and batch match routes. Returns a dict shaped like
@@ -1585,6 +1716,111 @@ async def get_spotify_prewarm_stats(db: psycopg2.extensions.connection = Depends
     matched = cur.fetchone()[0]
     cur.close()
     return {"total": total, "checked": checked, "matched": matched}
+
+def _start_ytmusic_push_job_background():
+    """Kicks off the background YouTube Music push job if one isn't already
+    running - same non-blocking-lock pattern as _start_spotify_prewarm_background,
+    for the same reason (a run interrupted by a container rebuild needs to
+    auto-resume, since the in-memory lock doesn't survive the process exiting;
+    the job's actual progress lives in the ytmusic_push_job row instead)."""
+    if not ytmusic_push_job_lock.acquire(blocking=False):
+        return False
+    try:
+        def _run():
+            try:
+                ytmusic_push_job.run(get_db_connection)
+            finally:
+                ytmusic_push_job_lock.release()
+
+        threading.Thread(target=_run, daemon=True).start()
+        return True
+    except Exception:
+        ytmusic_push_job_lock.release()
+        raise
+
+class YtMusicPushJobStatus(BaseModel):
+    status: str = "idle"
+    name: Optional[str] = None
+    playlist_url: Optional[str] = None
+    total: Optional[int] = None
+    matched: Optional[int] = None
+    inserted: Optional[int] = None
+    skipped: Optional[int] = None
+    tracks_processed_total: Optional[int] = None
+    pace_tracks_per_day: Optional[float] = None
+    eta_days: Optional[float] = None
+    error: Optional[str] = None
+    queued_count: int = 0
+
+@app.get("/api/ytmusic/push-job/status", response_model=YtMusicPushJobStatus)
+async def get_ytmusic_push_job_status():
+    queued_count = count_queued_ytmusic_push_jobs()
+    job = get_active_ytmusic_push_job()
+    if not job:
+        # A brief window can exist right after enqueueing, before the worker
+        # thread promotes the next queued job to 'running' - fall back to
+        # showing that job as 'queued' rather than flashing "idle".
+        job = get_next_queued_ytmusic_push_job()
+        if not job:
+            return {"status": "idle", "queued_count": 0}
+        queued_count = max(queued_count - 1, 0)  # this job itself isn't "behind" anything
+        return {
+            "status": "queued", "name": job["name"], "total": job["total"],
+            "matched": 0, "inserted": 0, "skipped": 0, "tracks_processed_total": 0,
+            "queued_count": queued_count,
+        }
+
+    # Pace/ETA measured in quota units spent, not wall-clock time - most of a
+    # job's elapsed time is spent idle waiting for tomorrow's quota, so a
+    # wall-clock rate would swing wildly between polls. units_spent_total and
+    # tracks_processed_total are both monotonic (unaffected by idle waiting),
+    # so this stays stable and self-corrects as the cache-hit ratio improves.
+    pace_tracks_per_day, eta_days = None, None
+    if job["tracks_processed_total"] > 0 and job["units_spent_total"] > 0:
+        avg_units_per_track = job["units_spent_total"] / job["tracks_processed_total"]
+        pace_tracks_per_day = ytmusic_push_job.DAILY_SAFE_BUDGET / avg_units_per_track
+        remaining = max(job["total"] - job["tracks_processed_total"], 0)
+        eta_days = remaining / pace_tracks_per_day if pace_tracks_per_day > 0 else None
+
+    return {
+        "status": job["status"],
+        "name": job["name"],
+        "playlist_url": f"https://www.youtube.com/playlist?list={job['playlist_id']}" if job["playlist_id"] else None,
+        "total": job["total"],
+        "matched": job["matched"],
+        "inserted": job["inserted"],
+        "skipped": job["skipped"],
+        "tracks_processed_total": job["tracks_processed_total"],
+        "pace_tracks_per_day": pace_tracks_per_day,
+        "eta_days": eta_days,
+        "error": job["error"],
+        "queued_count": queued_count,
+    }
+
+class YtMusicPendingPushJob(BaseModel):
+    id: int
+    name: Optional[str] = None
+    total: Optional[int] = None
+    matched: Optional[int] = None
+    tracks_processed_total: Optional[int] = None
+    status: str
+    created_at: Optional[str] = None
+
+@app.get("/api/ytmusic/push-jobs", response_model=List[YtMusicPendingPushJob])
+async def list_ytmusic_push_jobs():
+    """Every job still owed work (queued, running, or paused on quota),
+    oldest first - fetched by the frontend only once there's more than one
+    to show, rather than folded into the single-job /status route above."""
+    return list_pending_ytmusic_push_jobs()
+
+@app.delete("/api/ytmusic/push-jobs/{job_id}")
+async def remove_ytmusic_push_job(job_id: int):
+    """Removes a pending push outright - stops future work on it, but
+    doesn't undo whatever it already added to its playlist (see
+    database.delete_ytmusic_push_job)."""
+    if not delete_ytmusic_push_job(job_id):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No pending push with that id")
+    return {"status": "removed"}
 
 @app.get("/api/library/track-identification/status")
 async def get_track_identification_status():

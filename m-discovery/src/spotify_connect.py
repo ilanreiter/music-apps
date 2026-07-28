@@ -7,13 +7,13 @@ import secrets
 import subprocess
 import threading
 import time
-from difflib import SequenceMatcher
 from urllib.parse import quote
 
 import requests
 from ytmusicapi import YTMusic
 
 from . import database
+from .text_match import MATCH_THRESHOLD, _normalize, _similar, _tokens_contained
 
 logger = logging.getLogger(__name__)
 
@@ -155,6 +155,17 @@ def disconnect():
 # the block worse, not just wasted effort.
 _search_blocked_until = 0.0
 
+# Spotify's 429 response for /search has been confirmed live to sometimes
+# omit Retry-After entirely - falling back to "assume 1 second" in that case
+# (as if Spotify meant "barely rate-limited at all") defeats the whole point
+# of _search_blocked_until above: the always-on background pre-warm job
+# (spotify_prewarm.py, one attempt every 5 minutes) would just try again
+# almost immediately, re-poking an endpoint that's already rate-limiting the
+# account and plausibly extending the penalty rather than ever letting it
+# cool down. When the header's missing, assume a real block is in effect and
+# back off for a while instead of barely at all.
+SEARCH_RATE_LIMIT_FALLBACK_SECONDS = 300
+
 
 def _api_request(method, path, params=None, json_body=None, retried=False):
     global _search_blocked_until
@@ -174,9 +185,14 @@ def _api_request(method, path, params=None, json_body=None, retried=False):
         return None
 
     if response.status_code == 429:
-        retry_after = int(response.headers.get('Retry-After', 1))
+        retry_after_header = response.headers.get('Retry-After')
+        retry_after = int(retry_after_header) if retry_after_header is not None else 1
         if path == '/search':
-            _search_blocked_until = time.time() + retry_after
+            # A missing header doesn't mean "barely rate-limited" - assume a
+            # real block and back off for a while rather than the ~1s this
+            # would otherwise fall back to (see SEARCH_RATE_LIMIT_FALLBACK_SECONDS).
+            block_seconds = retry_after if retry_after_header is not None else SEARCH_RATE_LIMIT_FALLBACK_SECONDS
+            _search_blocked_until = time.time() + block_seconds
         if not retried:
             wait = min(retry_after, RATE_LIMIT_RETRY_CAP_SECONDS)
             time.sleep(wait)
@@ -709,42 +725,6 @@ def clear_queue(device_id, max_drain=CLEAR_QUEUE_MAX_DRAIN):
     for _ in range(min(pending, max_drain)):
         if not next_track(device_id):
             break
-
-
-# How close a search result's own title/artist must be to what we searched for
-# before we trust it as a real match, rather than an unrelated track that
-# happened to rank first (common for generic titles like "Intro" or "Home").
-MATCH_THRESHOLD = 0.72
-
-
-def _normalize(text):
-    # [^a-z0-9]+ used to strip *any* non-ASCII character - not just
-    # punctuation, but every Hebrew/Cyrillic/CJK/accented-Latin letter too,
-    # collapsing e.g. a Hebrew title to an empty string. _similar() then
-    # short-circuits to 0.0 whenever either side is empty, so two identical
-    # Hebrew titles compared against each other still scored zero (confirmed
-    # live). \w is Unicode-aware by default in Python 3's re module, so this
-    # keeps letters from any script while still stripping real punctuation.
-    if not text:
-        return ''
-    return re.sub(r'[^\w]+', ' ', text.lower()).strip()
-
-
-def _similar(a, b):
-    a, b = _normalize(a), _normalize(b)
-    if not a or not b:
-        return 0.0
-    return SequenceMatcher(None, a, b).ratio()
-
-
-def _tokens_contained(needle_tokens, haystack_tokens):
-    if not needle_tokens or not haystack_tokens or len(needle_tokens) > len(haystack_tokens):
-        return False
-    span = len(needle_tokens)
-    return any(
-        haystack_tokens[i:i + span] == needle_tokens
-        for i in range(len(haystack_tokens) - span + 1)
-    )
 
 
 def _artist_guard_passes(local_artist, bridged_artist):

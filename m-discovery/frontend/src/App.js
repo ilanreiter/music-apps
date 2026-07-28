@@ -66,6 +66,9 @@ const SPOTIFY_MATCH_CONSECUTIVE_CAP = 20;
 // concern - only Spotify's poll interval is widened.
 const SPOTIFY_STATUS_POLL_INTERVAL_MS = 5000;
 const DEFAULT_STATUS_POLL_INTERVAL_MS = 2000;
+// Must match YTMUSIC_LIBRARY_PUSH_LIMIT in main.py - shown in the push
+// button's tooltip only, the server enforces the actual cap.
+const YTMUSIC_LIBRARY_PUSH_LIMIT = 30;
 
 function shuffleArray(arr) {
   const copy = [...arr];
@@ -269,6 +272,171 @@ function savePosition(position) {
   }
 }
 
+// Brand icons for the push-to-* buttons - path data + hex colors from the
+// simple-icons project (simple-icons/simple-icons, MIT licensed), not
+// hand-drawn, so the shapes/colors are exactly the official marks.
+function SpotifyIcon() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="#1DB954" aria-hidden="true" focusable="false">
+      <path d="M12 0C5.4 0 0 5.4 0 12s5.4 12 12 12 12-5.4 12-12S18.66 0 12 0zm5.521 17.34c-.24.359-.66.48-1.021.24-2.82-1.74-6.36-2.101-10.561-1.141-.418.122-.779-.179-.899-.539-.12-.421.18-.78.54-.9 4.56-1.021 8.52-.6 11.64 1.32.42.18.479.659.301 1.02zm1.44-3.3c-.301.42-.841.6-1.262.3-3.239-1.98-8.159-2.58-11.939-1.38-.479.12-1.02-.12-1.14-.6-.12-.48.12-1.021.6-1.141C9.6 9.9 15 10.561 18.72 12.84c.361.181.54.78.241 1.2zm.12-3.36C15.24 8.4 8.82 8.16 5.16 9.301c-.6.179-1.2-.181-1.38-.721-.18-.601.18-1.2.72-1.381 4.26-1.26 11.28-1.02 15.721 1.621.539.3.719 1.02.419 1.56-.299.421-1.02.599-1.559.3z" />
+    </svg>
+  );
+}
+
+function YtMusicIcon() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="#FF0000" aria-hidden="true" focusable="false">
+      <path d="M12 0C5.376 0 0 5.376 0 12s5.376 12 12 12 12-5.376 12-12S18.624 0 12 0zm0 19.104c-3.924 0-7.104-3.18-7.104-7.104S8.076 4.896 12 4.896s7.104 3.18 7.104 7.104-3.18 7.104-7.104 7.104zm0-13.332c-3.432 0-6.228 2.796-6.228 6.228S8.568 18.228 12 18.228s6.228-2.796 6.228-6.228S15.432 5.772 12 5.772zM9.684 15.54V8.46L15.816 12l-6.132 3.54z" />
+    </svg>
+  );
+}
+
+// Dismiss-required popup, reusing the Settings modal's overlay/card look for
+// a consistent visual language - used for messages that shouldn't silently
+// vanish before being read (confirmed live: the 4s auto-fade hint cut off a
+// message about a background push job starting before it could be read).
+function InfoPopup({ message, onClose }) {
+  if (!message) return null;
+  return (
+    <div className="settings-overlay" onClick={onClose}>
+      <div className="settings-modal info-popup" onClick={(e) => e.stopPropagation()}>
+        <p>{message}</p>
+        <button type="button" className="scan-btn" onClick={onClose}>OK</button>
+      </div>
+    </div>
+  );
+}
+
+// Opened by clicking the library view's "Push to YouTube Music" button -
+// shows the current push job's status (a push too large for one request
+// becomes a multi-day background job, see YTMUSIC_LIBRARY_PUSH_LIMIT in
+// main.py) as a progress bar, plus a button to push the currently-shown mix.
+// Polls only while open (5s - faster than the old always-mounted panel,
+// since this is now something the user is actively looking at).
+function YtMusicPushPanel({ apiBase, onPush, pushing, onClose }) {
+  const [jobStatus, setJobStatus] = useState(null);
+  // Only fetched (and only shown) once there's more than one pending push -
+  // for the common single-job case the /status response above already has
+  // everything needed, no reason to pay for a second request.
+  const [pendingJobs, setPendingJobs] = useState(null);
+
+  const refresh = () => {
+    axios.get(`${apiBase}/ytmusic/push-job/status`).then((response) => {
+      setJobStatus(response.data);
+      if ((response.data.queued_count || 0) > 0) {
+        axios.get(`${apiBase}/ytmusic/push-jobs`)
+          .then((jobsResponse) => setPendingJobs(jobsResponse.data))
+          .catch((err) => console.error('Error fetching pending YouTube Music push jobs:', err));
+      } else {
+        setPendingJobs(null);
+      }
+    }).catch((err) => console.error('Error fetching YouTube Music push job status:', err));
+  };
+
+  useEffect(() => {
+    refresh();
+    const intervalId = setInterval(refresh, 5000);
+    return () => clearInterval(intervalId);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [apiBase]);
+
+  const removeJob = (jobId) => {
+    axios.delete(`${apiBase}/ytmusic/push-jobs/${jobId}`)
+      .then(refresh)
+      .catch((err) => console.error('Error removing YouTube Music push job:', err));
+  };
+
+  const total = jobStatus?.total || 0;
+  const processed = jobStatus?.tracks_processed_total || 0;
+  const percent = total > 0 ? Math.min(100, Math.round((processed / total) * 100)) : 0;
+  const hasJob = jobStatus && jobStatus.status !== 'idle';
+  // A push while one is already active/waiting_quota/queued just joins the
+  // back of the FIFO queue instead of being blocked - the button always
+  // works, only the label changes to set the right expectation.
+  const willQueue = jobStatus && ['running', 'waiting_quota', 'queued'].includes(jobStatus.status);
+  const showList = pendingJobs && pendingJobs.length > 1;
+
+  return (
+    <div className="settings-overlay" onClick={onClose}>
+      <div className="settings-modal ytmusic-push-modal" onClick={(e) => e.stopPropagation()}>
+        <div className="settings-header">
+          <h2>YouTube Music Push</h2>
+          <button className="settings-close" onClick={onClose} aria-label="Close">&times;</button>
+        </div>
+
+        {showList ? (
+          <div className="ytmusic-pending-list">
+            {pendingJobs.map((job) => (
+              <div key={job.id} className="ytmusic-pending-row">
+                <div className="ytmusic-pending-info">
+                  <strong>{job.name}</strong>
+                  <span className="hint">
+                    {(job.total || 0).toLocaleString()} track{job.total === 1 ? '' : 's'}
+                    {' · '}created {job.created_at ? new Date(job.created_at).toLocaleDateString() : 'just now'}
+                    {' · '}{job.status === 'queued'
+                      ? 'queued'
+                      : `${(job.tracks_processed_total || 0).toLocaleString()}/${(job.total || 0).toLocaleString()} done`}
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  className="settings-close"
+                  title="Remove this push - stops future work on it, doesn't undo tracks already added"
+                  onClick={() => removeJob(job.id)}
+                >
+                  &times;
+                </button>
+              </div>
+            ))}
+          </div>
+        ) : hasJob ? (
+          <>
+            <div className="progress-bar-track">
+              <div className="progress-bar-fill" style={{ width: `${percent}%` }} />
+            </div>
+            <p className="hint">
+              {jobStatus.status === 'done'
+                ? `Done — ${(jobStatus.matched || 0).toLocaleString()} of ${total.toLocaleString()} tracks added to "${jobStatus.name}".`
+                : jobStatus.status === 'error'
+                  ? `Error: ${jobStatus.error}`
+                  : jobStatus.status === 'queued'
+                    ? `Queued — "${jobStatus.name}" (${total.toLocaleString()} tracks) will start once the current push finishes.`
+                    : (
+                      `${processed.toLocaleString()}/${total.toLocaleString()} tracks — "${jobStatus.name}"` +
+                      (jobStatus.status === 'waiting_quota' ? ' — paused until more quota is available' : '') +
+                      (jobStatus.pace_tracks_per_day ? ` — ~${Math.round(jobStatus.pace_tracks_per_day)}/day` : '') +
+                      (jobStatus.eta_days != null
+                        ? `, ETA ${jobStatus.eta_days < 1 ? '< 1 day' : `~${Math.ceil(jobStatus.eta_days)}d`}`
+                        : '')
+                    )}
+              {jobStatus.playlist_url && (
+                <> — <a href={jobStatus.playlist_url} target="_blank" rel="noreferrer">view playlist</a></>
+              )}
+            </p>
+          </>
+        ) : (
+          <p className="hint">No push in progress yet.</p>
+        )}
+
+        <button
+          className="group-action-btn"
+          onClick={onPush}
+          disabled={pushing}
+          title={willQueue
+            ? 'A push is already in progress - this will join the back of the queue and start once it and any others ahead of it finish'
+            : `Create a YouTube Music playlist from the tracks currently shown (matched live, capped at the first ${YTMUSIC_LIBRARY_PUSH_LIMIT}, or a paced background job above that)`}
+        >
+          <YtMusicIcon /> {pushing
+            ? 'Pushing…'
+            : willQueue
+              ? 'Queue another push to YouTube Music'
+              : 'Push current mix to YouTube Music'}
+        </button>
+      </div>
+    </div>
+  );
+}
+
 function App() {
   // Discover-tab suggestions (AI-recommended tracks seeded from the Library
   // tab's own current filters) - rendered inline in the Library tab, not a
@@ -314,6 +482,9 @@ function App() {
   // the current output destination - null when hidden, a message when shown.
   const [spotifyPlayHint, setSpotifyPlayHint] = useState(null);
   const [pushingToSpotify, setPushingToSpotify] = useState(false);
+  const [ytMusicPlayHint, setYtMusicPlayHint] = useState(null);
+  const [pushingToYtMusic, setPushingToYtMusic] = useState(false);
+  const [ytMusicPushPanelOpen, setYtMusicPushPanelOpen] = useState(false);
   // True when the currently-drilled Spotify playlist's tracks came back 403 -
   // Spotify blocks reading the track listing of a playlist you don't own,
   // even public/followed ones, though playing it via context_uri still works.
@@ -435,6 +606,7 @@ function App() {
   const [chromecastDevices, setChromecastDevices] = useState([]);
   const [spotifyDevices, setSpotifyDevices] = useState([]);
   const [spotifyConnected, setSpotifyConnected] = useState(false);
+  const [ytMusicConnected, setYtMusicConnected] = useState(false);
   const outputDevices = [...wiimDevices, ...chromecastDevices, ...spotifyDevices];
   const [outputDevice, setOutputDevice] = useState(() => loadSession()?.outputDevice || null);
   const [destStatus, setDestStatus] = useState(null);
@@ -478,6 +650,12 @@ function App() {
       .catch((err) => console.error('Error fetching Spotify auth status:', err));
   };
 
+  const refreshYtMusicStatus = () => {
+    axios.get(`${API_BASE_URL}/ytmusic/auth/status`)
+      .then((r) => setYtMusicConnected(r.data.connected))
+      .catch((err) => console.error('Error fetching YouTube Music auth status:', err));
+  };
+
   useEffect(() => {
     resumeScanIfRunning();
     axios.get(`${API_BASE_URL}/wiim/devices`)
@@ -487,6 +665,7 @@ function App() {
       .then((r) => setChromecastDevices(r.data.map((d) => ({ ...d, type: 'chromecast' }))))
       .catch((err) => console.error('Error fetching Chromecast devices:', err));
     refreshSpotifyStatus();
+    refreshYtMusicStatus();
     // Landed back here from the Spotify OAuth redirect (main.py's
     // /api/spotify/auth/callback) - the ?spotify=... param is just a signal
     // to re-check status, not something to keep in the URL/history.
@@ -943,6 +1122,12 @@ function App() {
     const t = setTimeout(() => setSpotifyPlayHint(null), 4000);
     return () => clearTimeout(t);
   }, [spotifyPlayHint]);
+
+  // No auto-dismiss timeout here (unlike spotifyPlayHint above) - this can
+  // carry an important, easy-to-miss message (e.g. "too large to push in one
+  // go, started a background job") that a 4s fade was confirmed to cut off
+  // before the user could read it. Rendered as a dismiss-required popup
+  // (InfoPopup, below) instead of a fading inline hint.
 
   // Marks a track as "played this session" the moment it becomes nowPlaying,
   // for any destination. A local track matched to Spotify (see
@@ -1620,6 +1805,12 @@ function App() {
     destNeedsInitialCastRef.current = false;
     const requestId = ++spotifyMatchRequestIdRef.current;
     let firstStarted = false;
+    let hitRateLimit = false;
+    // The per-card spinner icon alone isn't enough feedback - confirmed live
+    // that a rate-limited match can silently take 6-7s (the backend retries
+    // once with a sleep before giving up, see spotify_connect._api_request),
+    // which reads as "nothing is happening" without this.
+    setSpotifyPlayHint(`Searching Spotify for "${candidates[0].track_name}"…`);
     for (const candidate of candidates) {
       if (spotifyMatchRequestIdRef.current !== requestId) return; // superseded
       setMatchingTrackId(candidate.id);
@@ -1637,7 +1828,7 @@ function App() {
       if (spotifyMatchRequestIdRef.current !== requestId) return;
       if (!matched) {
         if (reason === 'unavailable') {
-          if (!firstStarted) setSpotifyPlayHint("Spotify's search is temporarily rate-limited - try again later.");
+          hitRateLimit = true;
           break; // no point burning more requests into the same rate limit
         }
         continue; // no match for this one - try the next candidate
@@ -1664,7 +1855,15 @@ function App() {
     }
     if (spotifyMatchRequestIdRef.current === requestId) setMatchingTrackId(null);
     if (!firstStarted && spotifyMatchRequestIdRef.current === requestId) {
-      setSpotifyPlayHint(`No Spotify match found for "${candidates[0].track_name}"${candidates.length > 1 ? ' or the tracks after it' : ''}.`);
+      // hitRateLimit must win over the generic "no match" message below it -
+      // confirmed live this was previously getting silently overwritten:
+      // the rate-limited hint was set inside the loop above, then this same
+      // synchronous pass immediately replaced it with "No Spotify match
+      // found" since firstStarted was still false either way, so the
+      // accurate message never actually reached the user.
+      setSpotifyPlayHint(hitRateLimit
+        ? "Spotify's search is temporarily rate-limited - try again later."
+        : `No Spotify match found for "${candidates[0].track_name}"${candidates.length > 1 ? ' or the tracks after it' : ''}.`);
     }
   };
 
@@ -2152,6 +2351,50 @@ function App() {
     }
   };
 
+  // Same idea as pushLibraryToSpotifyPlaylist, but for YouTube Music - unlike
+  // Spotify, there's no prewarmed match cache for YT Music, so a small push
+  // (<= YTMUSIC_LIBRARY_PUSH_LIMIT) is matched live and completes immediately,
+  // same as before. A larger push can't fit in one request's worth of quota,
+  // so the backend instead starts a paced multi-day background job and
+  // responds with {job_started: true} - progress/pace/ETA for that job show
+  // up in Settings > YouTube Music (YtMusicSettingsSection), not here, since
+  // it keeps running long after this button click returns.
+  const pushLibraryToYtMusicPlaylist = async () => {
+    if (libraryTracks.length === 0) return;
+    const defaultName = `Library — ${new Date().toLocaleDateString()}`;
+    const name = window.prompt('Name for the new YouTube Music playlist:', defaultName);
+    if (!name) return;
+    setPushingToYtMusic(true);
+    try {
+      const response = await axios.post(`${API_BASE_URL}/ytmusic/playlists/from-library`, {
+        name,
+        track_ids: libraryTracks.map((t) => t.id),
+      });
+      if (response.data.job_started) {
+        const queuePosition = response.data.queue_position || 0;
+        setYtMusicPlayHint(
+          `"${name}" is too large to push in one go - ` +
+          (queuePosition > 0
+            ? `queued behind ${queuePosition} other push${queuePosition === 1 ? '' : 'es'}.`
+            : 'started as a background job that\'ll add tracks over the next several days.') +
+          ' Click "Push to YouTube Music" again any time to see progress.'
+        );
+        return;
+      }
+      const { added, skipped, playlist_url: playlistUrl } = response.data;
+      setYtMusicPlayHint(
+        `Created "${name}" on YouTube Music with ${added.toLocaleString()} track${added === 1 ? '' : 's'}` +
+        (skipped > 0 ? ` (${skipped.toLocaleString()} skipped - no YouTube Music match found)` : '') +
+        (playlistUrl ? '.' : ' (no link returned).')
+      );
+    } catch (err) {
+      console.error('Error pushing playlist to YouTube Music:', err);
+      setYtMusicPlayHint(err.response?.data?.detail || 'Failed to create the YouTube Music playlist.');
+    } finally {
+      setPushingToYtMusic(false);
+    }
+  };
+
   // Same idea as pushLibraryToSpotifyPlaylist, but for Discover suggestions -
   // these have no known_tracks row/cached spotify_track_id, so the backend
   // matches each one live instead (only reasonable because Discover result
@@ -2181,6 +2424,37 @@ function App() {
       setSpotifyPlayHint(err.response?.data?.detail || 'Failed to create the Spotify playlist.');
     } finally {
       setPushingToSpotify(false);
+    }
+  };
+
+  // Same idea as pushDiscoveredToSpotifyPlaylist, but for YouTube Music -
+  // reuses the identical request shape (POST /api/ytmusic/playlists/from-discovered
+  // takes the same {name, tracks} body) since it's pure text either way.
+  const pushDiscoveredToYtMusicPlaylist = async () => {
+    if (discoveredTracks.length === 0) return;
+    const defaultName = `Discovered — ${new Date().toLocaleDateString()}`;
+    const name = window.prompt('Name for the new YouTube Music playlist:', defaultName);
+    if (!name) return;
+    setPushingToYtMusic(true);
+    try {
+      const response = await axios.post(`${API_BASE_URL}/ytmusic/playlists/from-discovered`, {
+        name,
+        tracks: discoveredTracks.map((t) => ({
+          track_name: t.track_name, artist_name: t.artist_name,
+          native_track_name: t.native_track_name, native_artist_name: t.native_artist_name,
+        })),
+      });
+      const { added, skipped, playlist_url: playlistUrl } = response.data;
+      setYtMusicPlayHint(
+        `Created "${name}" on YouTube Music with ${added.toLocaleString()} track${added === 1 ? '' : 's'}` +
+        (skipped > 0 ? ` (${skipped.toLocaleString()} skipped - no YouTube Music match found)` : '') +
+        (playlistUrl ? '.' : ' (no link returned).')
+      );
+    } catch (err) {
+      console.error('Error pushing discovered tracks to YouTube Music:', err);
+      setYtMusicPlayHint(err.response?.data?.detail || 'Failed to create the YouTube Music playlist.');
+    } finally {
+      setPushingToYtMusic(false);
     }
   };
 
@@ -2252,6 +2526,15 @@ function App() {
           <section className="library-section">
             {spotifyPlayHint && (
               <p className="empty-state spotify-play-hint">{spotifyPlayHint}</p>
+            )}
+            <InfoPopup message={ytMusicPlayHint} onClose={() => setYtMusicPlayHint(null)} />
+            {ytMusicPushPanelOpen && (
+              <YtMusicPushPanel
+                apiBase={API_BASE_URL}
+                onPush={pushLibraryToYtMusicPlaylist}
+                pushing={pushingToYtMusic}
+                onClose={() => setYtMusicPushPanelOpen(false)}
+              />
             )}
             <div className="library-controls">
               <div className="search-row">
@@ -2459,7 +2742,16 @@ function App() {
                           disabled={pushingToSpotify}
                           title="Create a private Spotify playlist from the tracks currently shown (already-matched ones only)"
                         >
-                          {pushingToSpotify ? 'Pushing…' : '⬆ Push to Spotify'}
+                          <SpotifyIcon /> {pushingToSpotify ? 'Pushing…' : 'Push to Spotify'}
+                        </button>
+                      )}
+                      {ytMusicConnected && (
+                        <button
+                          className="group-action-btn"
+                          onClick={() => setYtMusicPushPanelOpen(true)}
+                          title="View YouTube Music push status, or push the current mix"
+                        >
+                          <YtMusicIcon /> Push to YouTube Music
                         </button>
                       )}
                     </div>
@@ -2536,16 +2828,28 @@ function App() {
               <div className="discover-results">
                 <div className="library-header">
                   <h2>Discovered for you</h2>
-                  {spotifyConnected && (
+                  {(spotifyConnected || ytMusicConnected) && (
                     <div className="group-actions">
-                      <button
-                        className="group-action-btn"
-                        onClick={pushDiscoveredToSpotifyPlaylist}
-                        disabled={pushingToSpotify}
-                        title="Create a private Spotify playlist from these recommendations (matched live, since they're not in your library)"
-                      >
-                        {pushingToSpotify ? 'Pushing…' : '⬆ Push to Spotify'}
-                      </button>
+                      {spotifyConnected && (
+                        <button
+                          className="group-action-btn"
+                          onClick={pushDiscoveredToSpotifyPlaylist}
+                          disabled={pushingToSpotify}
+                          title="Create a private Spotify playlist from these recommendations (matched live, since they're not in your library)"
+                        >
+                          <SpotifyIcon /> {pushingToSpotify ? 'Pushing…' : 'Push to Spotify'}
+                        </button>
+                      )}
+                      {ytMusicConnected && (
+                        <button
+                          className="group-action-btn"
+                          onClick={pushDiscoveredToYtMusicPlaylist}
+                          disabled={pushingToYtMusic}
+                          title="Create a YouTube Music playlist from these recommendations (matched live, since they're not in your library)"
+                        >
+                          <YtMusicIcon /> {pushingToYtMusic ? 'Pushing…' : 'Push to YouTube Music'}
+                        </button>
+                      )}
                     </div>
                   )}
                 </div>
@@ -2623,6 +2927,9 @@ function App() {
           apiBase={API_BASE_URL}
           spotifyConnected={spotifyConnected}
           onSpotifyDisconnect={() => axios.post(`${API_BASE_URL}/spotify/auth/logout`).finally(refreshSpotifyStatus)}
+          ytMusicConnected={ytMusicConnected}
+          onYtMusicConnected={refreshYtMusicStatus}
+          onYtMusicDisconnect={() => axios.post(`${API_BASE_URL}/ytmusic/auth/disconnect`).finally(refreshYtMusicStatus)}
         />
       )}
 
@@ -2675,7 +2982,81 @@ function channelLabel(channels) {
   return `${channels}ch`;
 }
 
-function SettingsPanel({ onClose, rootPath, setRootPath, scanning, scanResult, scanError, onScan, outputDevices, apiBase, spotifyConnected, onSpotifyDisconnect }) {
+function YtMusicSettingsSection({ ytMusicConnected, apiBase, onConnected, onDisconnect }) {
+  const [pairing, setPairing] = useState(null); // { verification_url, user_code } while a device-code login is in progress
+  const [error, setError] = useState(null);
+  const pollRef = useRef(null);
+
+  const stopPolling = () => {
+    if (pollRef.current) {
+      clearInterval(pollRef.current);
+      pollRef.current = null;
+    }
+  };
+  useEffect(() => stopPolling, []);
+
+  const startConnect = async () => {
+    setError(null);
+    try {
+      const response = await axios.post(`${apiBase}/ytmusic/auth/start`);
+      setPairing(response.data);
+      pollRef.current = setInterval(async () => {
+        try {
+          const pollResponse = await axios.post(`${apiBase}/ytmusic/auth/poll`);
+          if (pollResponse.data.status === 'connected') {
+            stopPolling();
+            setPairing(null);
+            onConnected();
+          } else if (pollResponse.data.status === 'expired') {
+            stopPolling();
+            setPairing(null);
+            setError('Sign-in code expired - click Connect to try again.');
+          }
+        } catch (err) {
+          stopPolling();
+          setPairing(null);
+          setError(err.response?.data?.detail || 'YouTube Music sign-in failed.');
+        }
+      }, 3000);
+    } catch (err) {
+      setError(err.response?.data?.detail || 'Could not start YouTube Music sign-in.');
+    }
+  };
+
+  if (ytMusicConnected) {
+    return (
+      <>
+        <p className="hint">Connected. Discover playlists can be pushed to YouTube Music above.</p>
+        <button type="button" className="scan-btn" onClick={onDisconnect}>Disconnect YouTube Music</button>
+      </>
+    );
+  }
+
+  if (pairing) {
+    return (
+      <>
+        <p className="hint">
+          Go to <a href={pairing.verification_url} target="_blank" rel="noreferrer">{pairing.verification_url}</a> and enter this code:
+        </p>
+        <p className="ytmusic-pairing-code">{pairing.user_code}</p>
+        <p className="hint">Waiting for you to finish signing in…</p>
+      </>
+    );
+  }
+
+  return (
+    <>
+      <p className="hint">Connect your YouTube Music (Google) account to push Discover recommendations there as a playlist.</p>
+      {error && <p className="error-message">{error}</p>}
+      <button type="button" className="scan-btn" onClick={startConnect}>Connect YouTube Music</button>
+    </>
+  );
+}
+
+function SettingsPanel({
+  onClose, rootPath, setRootPath, scanning, scanResult, scanError, onScan, outputDevices, apiBase,
+  spotifyConnected, onSpotifyDisconnect, ytMusicConnected, onYtMusicConnected, onYtMusicDisconnect,
+}) {
   const [prewarmStatus, setPrewarmStatus] = useState(null);
 
   useEffect(() => {
@@ -2779,6 +3160,16 @@ function SettingsPanel({ onClose, rootPath, setRootPath, scanning, scanResult, s
               <a className="scan-btn" href={`${apiBase}/spotify/auth/login`}>Connect Spotify</a>
             </>
           )}
+        </div>
+
+        <div className="settings-section">
+          <label>YouTube Music</label>
+          <YtMusicSettingsSection
+            ytMusicConnected={ytMusicConnected}
+            apiBase={apiBase}
+            onConnected={onYtMusicConnected}
+            onDisconnect={onYtMusicDisconnect}
+          />
         </div>
       </div>
     </div>
