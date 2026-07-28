@@ -459,6 +459,24 @@ main.with-player {
   opacity: 0.7;
 }
 
+.track-availability {
+  display: flex;
+  gap: 6px;
+  margin-top: 4px;
+}
+
+.availability-icon {
+  display: inline-flex;
+  align-items: center;
+  opacity: 1;
+  transition: opacity 0.2s ease;
+}
+
+.availability-icon.unavailable {
+  opacity: 0.2;
+  filter: grayscale(1);
+}
+
 .empty-state {
   text-align: center;
   color: var(--text-muted);
@@ -769,6 +787,26 @@ main.with-player {
 .view-tabs button.active {
   background: var(--accent);
   color: white;
+}
+
+/* Separates two unrelated button groups sharing one .view-tabs pill (e.g.
+   platform vs. By Playlist/All Tracks in the Playlists tab) without a second
+   bordered container. */
+.view-tabs-divider {
+  width: 1px;
+  align-self: stretch;
+  background: var(--border);
+  margin: 2px 2px;
+}
+
+.playlist-cache-status {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 6px 4px;
+  text-align: left;
+  font-size: 0.85rem;
 }
 
 .filter-row {

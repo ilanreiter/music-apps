@@ -310,6 +310,15 @@ def _transfer_to_device(device_id):
 
 
 def play(device_id, context_uri, track_uri=None, drain_queue=False):
+    """Returns True (sent successfully), False (a genuine failure - the API
+    call itself failed), or the string 'superseded' (a newer play()/
+    play_uris() call for this same device came in first, so this one
+    deliberately did nothing - not a failure, see _start_intent). Callers
+    must not treat 'superseded' as a real error - confirmed live this was
+    previously conflated with a genuine failure (both returned bare False),
+    which surfaced a misleading "couldn't reach Spotify" error to the user
+    for what was actually just a normal race between two of their own quick
+    actions (e.g. pressing Next twice)."""
     token = _start_intent(device_id)
     if drain_queue:
         # Must transfer first - clear_queue's GET /me/player/queue and the
@@ -318,10 +327,10 @@ def play(device_id, context_uri, track_uri=None, drain_queue=False):
         # is already it (same reason play/play_uris always transfer before
         # playing - see _transfer_to_device).
         _transfer_to_device(device_id)
-        clear_queue(device_id)
+        clear_queue(device_id, token=token)
     if not _is_current_intent(device_id, token):
         logger.info("play %s: superseded by a newer call, bailing out", device_id)
-        return False
+        return 'superseded'
     _transfer_to_device(device_id)
     body = {'context_uri': context_uri}
     if track_uri:
@@ -504,15 +513,92 @@ def get_playlist_tracks(playlist_id):
             continue  # local files / unavailable tracks Spotify can't play via Connect
         album = t.get('album') or {}
         images = album.get('images') or []
+        artists = t.get('artists') or []
+        external_ids = t.get('external_ids') or {}
         tracks.append({
             'uri': t['uri'],
             'name': t['name'],
-            'artists': ', '.join(a['name'] for a in t.get('artists', [])),
+            'artists': ', '.join(a['name'] for a in artists),
             'album': album.get('name'),
             'duration_ms': t.get('duration_ms'),
             'artwork_url': images[0]['url'] if images else None,
+            # Extra metadata for the Playlists tab's "All Tracks" cache (see
+            # get_all_playlist_tracks below) - all come free off this same
+            # track object, no extra API calls. Harmless extra keys for
+            # every other caller (main.py's response_model filters them back
+            # out for the plain playlist-browsing route). genre isn't here -
+            # it's an artist-level attribute in Spotify's API, not a
+            # per-track one, so it's looked up separately by primary_artist_id.
+            'isrc': external_ids.get('isrc'),
+            'popularity': t.get('popularity'),
+            'explicit': t.get('explicit'),
+            'release_date': album.get('release_date'),
+            'primary_artist_id': artists[0]['id'] if artists else None,
         })
     return tracks
+
+
+def get_artist_genres(artist_ids):
+    """Batched artist genre lookup - GET /artists accepts up to 50 ids per
+    call, so this costs one request per ~50 unique artists rather than one
+    per track. Genre is an artist-level attribute in Spotify's API (not a
+    per-track one), which is why get_all_playlist_tracks looks it up this
+    way instead of per track. Returns {artist_id: 'genre1, genre2'}."""
+    token = _get_valid_access_token()
+    if not token:
+        return {}
+    genres_by_id = {}
+    unique_ids = list(dict.fromkeys(aid for aid in artist_ids if aid))
+    for i in range(0, len(unique_ids), 50):
+        batch = unique_ids[i:i + 50]
+        try:
+            resp = requests.get(
+                f"{API_BASE_URL}/artists",
+                headers={'Authorization': f'Bearer {token}'}, params={'ids': ','.join(batch)}, timeout=REQUEST_TIMEOUT,
+            )
+        except Exception:
+            continue
+        if not resp.ok:
+            continue
+        for artist in resp.json().get('artists') or []:
+            if artist and artist.get('id'):
+                genres_by_id[artist['id']] = ', '.join(artist.get('genres') or [])
+    return genres_by_id
+
+
+def get_all_playlist_tracks():
+    """Every track across every playlist, deduped by uri (the same track in
+    two playlists is genuinely the same track, not two rows) - backs the
+    Playlists tab's "All Tracks" mode. Playlists this account doesn't own
+    403 on their track listing (see get_playlist_tracks) - counted and
+    skipped rather than aborting the whole aggregation. Returns
+    (tracks, skipped_count), each track dict shaped for
+    database.replace_playlist_track_cache."""
+    seen = {}
+    skipped = 0
+    for p in list_playlists():
+        tracks = get_playlist_tracks(p['id'])
+        if tracks is None:
+            skipped += 1
+            continue
+        for t in tracks:
+            if t['uri'] not in seen:
+                seen[t['uri']] = t
+    unique_tracks = list(seen.values())
+    genres_by_artist = get_artist_genres([t.get('primary_artist_id') for t in unique_tracks])
+    return [{
+        'track_id': t['uri'].split(':')[-1],
+        'track_name': t['name'],
+        'artist_name': t['artists'],
+        'album': t['album'],
+        'artwork_url': t['artwork_url'],
+        'isrc': t.get('isrc'),
+        'duration_ms': t.get('duration_ms'),
+        'popularity': t.get('popularity'),
+        'explicit': t.get('explicit'),
+        'release_date': t.get('release_date'),
+        'genre': genres_by_artist.get(t.get('primary_artist_id')),
+    } for t in unique_tracks], skipped
 
 
 PLAYLIST_ADD_BATCH_SIZE = 100  # Spotify's own per-request cap on POST .../tracks
@@ -556,7 +642,13 @@ def add_tracks_to_playlist(playlist_id, uris):
     return True
 
 
-PLAY_URIS_MAX_ATTEMPTS = 3
+# Bumped from 3 - confirmed live one of this account's actual devices
+# (a budget WiFi streamer) needed all 3 of the old attempts to catch up and
+# start the right track, leaving no margin before play_uris gives up and
+# main.py surfaces a 502 to the user. 5 attempts at the same 2s spacing
+# still fails within ~10-16s worst case, not an unreasonable wait, and gives
+# genuinely slow/flaky devices like that one real headroom instead of none.
+PLAY_URIS_MAX_ATTEMPTS = 5
 PLAY_URIS_CONFIRM_DELAY_SECONDS = 2
 SUSTAIN_CHECK_DELAY_SECONDS = 5
 
@@ -615,23 +707,28 @@ def play_uris(device_id, uris, drain_queue=False):
     session (never for the driven Next/Prev or lookahead-handoff callers of
     this function, which rely on the queue's own lookahead entry).
 
-    Bails out early (returns False, sends no further requests) if superseded
-    by a newer play()/play_uris() call for the same device - see
+    Bails out early (returns 'superseded', sends no further requests) if
+    superseded by a newer play()/play_uris() call for the same device - see
     _start_intent. Confirmed live this matters: switching the output device
     (which re-casts whatever was already nowPlaying) landing at nearly the
     same moment as a fresh Shuffle All match finishing fired two concurrent
     play_uris calls for the same device; without this guard, the older
     call's retry loop kept fighting the newer one for the device's state and
-    could win the last word, leaving the previous (wrong) track playing."""
+    could win the last word, leaving the previous (wrong) track playing.
+    'superseded' is deliberately distinct from a bare False (a genuine
+    failure after exhausting every attempt) - callers must not treat it as
+    an error, see play()'s docstring for the fuller reasoning (this was
+    previously conflated, surfacing a misleading error to the user for a
+    normal race between two of their own quick actions)."""
     token = _start_intent(device_id)
     if drain_queue:
         # Must transfer first - see the matching comment in play().
         _transfer_to_device(device_id)
-        clear_queue(device_id)
+        clear_queue(device_id, token=token)
     for attempt in range(1, PLAY_URIS_MAX_ATTEMPTS + 1):
         if not _is_current_intent(device_id, token):
             logger.info("play_uris %s: superseded by a newer call before attempt %d, bailing out", device_id, attempt)
-            return False
+            return 'superseded'
         _transfer_to_device(device_id)
         result = _api_request('PUT', '/me/player/play', params={'device_id': device_id}, json_body={'uris': uris})
         if result is None:
@@ -640,7 +737,7 @@ def play_uris(device_id, uris, drain_queue=False):
         time.sleep(PLAY_URIS_CONFIRM_DELAY_SECONDS)
         if not _is_current_intent(device_id, token):
             logger.info("play_uris %s: superseded by a newer call after attempt %d's play, bailing out", device_id, attempt)
-            return False
+            return 'superseded'
         confirm_status = get_status(device_id)
         if confirm_status and confirm_status.get('status') == 'play' and confirm_status.get('track_uri') == uris[0]:
             if attempt > 1:
@@ -686,9 +783,20 @@ def add_to_queue(device_id, uri):
 
 
 CLEAR_QUEUE_MAX_DRAIN = 20
+# Confirmed live this matters, specifically for a slower/flakier device (a
+# budget WiFi streamer, on this account): firing the drain's /next calls
+# back-to-back with no pause at all could leave it in an inconsistent state
+# right as the follow-up play() call landed moments later, surfacing as
+# "wrong track playing" or "nothing playing" - and only ever on a freshly
+# restored/new session, since that's the only time drain_queue=True runs at
+# all. CLEAR_QUEUE_STEP_DELAY_SECONDS paces each individual skip;
+# CLEAR_QUEUE_SETTLE_DELAY_SECONDS gives one more moment for the device to
+# fully catch up after the last one, before the actual play command arrives.
+CLEAR_QUEUE_STEP_DELAY_SECONDS = 0.3
+CLEAR_QUEUE_SETTLE_DELAY_SECONDS = 0.5
 
 
-def clear_queue(device_id, max_drain=CLEAR_QUEUE_MAX_DRAIN):
+def clear_queue(device_id, max_drain=CLEAR_QUEUE_MAX_DRAIN, token=None):
     """Spotify's Web API has no endpoint to remove a track from the queue -
     once something lands there it can only be consumed by skipping past it.
     A manually-queued track (via add_to_queue above - this app's own
@@ -713,6 +821,12 @@ def clear_queue(device_id, max_drain=CLEAR_QUEUE_MAX_DRAIN):
     failure just leaves the residue for next time rather than blocking
     playback.
 
+    token: the caller's own _start_intent token, if it has one (play()/
+    play_uris() do) - lets a multi-step drain bail out immediately if a
+    newer call for the same device supersedes this one partway through,
+    rather than continuing to fire skip commands that would only fight with
+    (and waste time ahead of) the newer call's own attempt.
+
     Caller must already have transferred to device_id (see play()/play_uris())
     before calling this - GET /me/player/queue and the `next` calls this
     drains with both act on whatever device is *currently* active
@@ -722,9 +836,17 @@ def clear_queue(device_id, max_drain=CLEAR_QUEUE_MAX_DRAIN):
     if not data:
         return
     pending = len(data.get('queue') or [])
+    drained = 0
     for _ in range(min(pending, max_drain)):
+        if token is not None and not _is_current_intent(device_id, token):
+            logger.info("clear_queue %s: superseded by a newer call mid-drain, bailing out", device_id)
+            return
         if not next_track(device_id):
             break
+        drained += 1
+        time.sleep(CLEAR_QUEUE_STEP_DELAY_SECONDS)
+    if drained:
+        time.sleep(CLEAR_QUEUE_SETTLE_DELAY_SECONDS)
 
 
 def _artist_guard_passes(local_artist, bridged_artist):

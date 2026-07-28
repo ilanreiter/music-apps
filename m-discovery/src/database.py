@@ -1,7 +1,7 @@
 import os
 import psycopg2
 from psycopg2 import Error
-from psycopg2.extras import Json
+from psycopg2.extras import Json, execute_values
 
 def get_db_connection():
     """Establishes and returns a database connection."""
@@ -236,6 +236,95 @@ def create_tables():
                 );
             """)
             print("Table 'playback_session' checked/created successfully.")
+
+            # Cache for the Playlists tab's "All Tracks" mode - flattening
+            # every playlist's tracks live (N+1 calls to Spotify/YouTube, one
+            # per playlist) is what made that view slow to open every time.
+            # One row per track (not one JSONB blob per platform - the
+            # original shape this replaced) so genre/isrc/duration/etc. are
+            # queryable columns rather than buried in JSON. Served as-is on
+            # every read regardless of age - main.py's routes only recompute
+            # it when explicitly asked to refresh, so a stale cache is a
+            # deliberate trade for speed, not an oversight.
+            #
+            # track_id is the Spotify track's bare id (not the full uri) for
+            # platform='spotify' rows, or the YouTube video_id for
+            # platform='ytmusic' rows - both already the natural per-platform
+            # identifier, just made an explicit column instead of parsed out
+            # of a blob every time something needs it.
+            #
+            # album/isrc/popularity/explicit/release_date only ever populate
+            # for platform='spotify' (all come free off the same track object
+            # Spotify's playlist-items endpoint already returns - no extra
+            # API calls). genre is the primary artist's Spotify genres,
+            # joined - fetched via a batched artist lookup (see
+            # spotify_connect.get_artist_genres), so it costs one call per
+            # ~50 unique artists, not per track. YouTube's public Data API
+            # has no genre or ISRC for either platform to backfill - those
+            # columns just stay NULL on platform='ytmusic' rows.
+            #
+            # matched_spotify_uri/matched_at are ytmusic-only: a pre-resolved
+            # Spotify catalog match for this YouTube Music track, found by
+            # playlist_match_prewarm.py running the same search_track
+            # pipeline the live per-click match already used, just once in
+            # the background instead of on every play click. matched_at
+            # tracks whether a match attempt has even been made yet (NULL
+            # means "not tried" - distinct from "tried, no match found",
+            # which leaves matched_spotify_uri NULL but sets matched_at).
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS playlist_track_cache (
+                    platform TEXT NOT NULL,
+                    track_id TEXT NOT NULL,
+                    track_name TEXT NOT NULL,
+                    artist_name TEXT,
+                    album TEXT,
+                    artwork_url TEXT,
+                    isrc TEXT,
+                    duration_ms INTEGER,
+                    popularity INTEGER,
+                    explicit BOOLEAN,
+                    release_date TEXT,
+                    genre TEXT,
+                    matched_spotify_uri TEXT,
+                    matched_at TIMESTAMP,
+                    PRIMARY KEY (platform, track_id)
+                );
+            """)
+            # Cross-reference to known_tracks - this row's track also exists
+            # as a local file, if set. Soft reference (no FK), same precedent
+            # as ytmusic_push_job_tracks.known_track_id above: a local
+            # library rescan can legitimately delete/recreate known_tracks
+            # rows, and this cache shouldn't be held hostage to that.
+            # Populated in bulk by bulk_backfill_local_track_ids, called from
+            # replace_playlist_track_cache right after every refresh.
+            cur.execute("ALTER TABLE playlist_track_cache ADD COLUMN IF NOT EXISTS local_track_id INTEGER;")
+            # Mirrors matched_spotify_uri (which lives on platform='ytmusic'
+            # rows) for the other direction - a platform='spotify' row's
+            # matching YouTube video_id, once known. Backs the Playlists
+            # tab's cross-service availability badges. Populated in bulk by
+            # bulk_backfill_cross_platform_matches, same call site as
+            # bulk_backfill_local_track_ids.
+            cur.execute("ALTER TABLE playlist_track_cache ADD COLUMN IF NOT EXISTS matched_ytmusic_video_id TEXT;")
+            print("Table 'playlist_track_cache' checked/created successfully.")
+
+            # Per-platform metadata that isn't a per-track fact - skipped_count
+            # (Spotify playlists this account doesn't own, whose tracks 403)
+            # and when the whole cache was last rebuilt.
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS playlist_track_cache_meta (
+                    platform TEXT PRIMARY KEY,
+                    skipped_count INTEGER DEFAULT 0,
+                    refreshed_at TIMESTAMP
+                );
+            """)
+            print("Table 'playlist_track_cache_meta' checked/created successfully.")
+
+            # Superseded by playlist_track_cache above (this was its original
+            # one-JSONB-blob-per-platform shape, replaced the same day it was
+            # built once one-row-per-track with real metadata columns turned
+            # out to be worth the normalization) - drop rather than leave a
+            # dead, never-populated table around.
+            cur.execute("DROP TABLE IF EXISTS playlist_all_tracks_cache;")
 
             conn.commit()
             cur.close()
@@ -844,6 +933,319 @@ def clear_playback_session():
     finally:
         if conn:
             conn.close()
+
+def replace_playlist_track_cache(platform, tracks, skipped_count):
+    """Upserts every track's metadata for this platform, then drops any
+    previously-cached row no longer present (removed from every playlist
+    since the last refresh). Deliberately an upsert, not a delete-then-insert
+    - matched_spotify_uri/matched_at (playlist_match_prewarm's work) are not
+    touched here, so re-running Refresh never throws away a resolved match
+    for a track that's still around. tracks is a list of dicts with keys
+    track_id/track_name/artist_name/album/artwork_url/isrc/duration_ms/
+    popularity/explicit/release_date/genre (missing/None is fine for any of
+    the metadata fields - only track_id/track_name are ever required).
+
+    Refuses to do anything at all when tracks is empty - confirmed live this
+    is a real risk, not theoretical: a transient upstream failure (Spotify
+    429 rate-limit, an expired token) can make list_playlists()/
+    get_all_playlist_tracks() come back with zero results, indistinguishable
+    at this layer from "you genuinely have no playlists left". Wiping a
+    previously-good cache of thousands of tracks on a transient failure is a
+    far worse outcome than leaving stale data in place until the next
+    successful refresh - a real "deleted every playlist" case just has to
+    wait for a manual retry, a vanishingly rare tradeoff against silent
+    catastrophic data loss (which is exactly what happened here before this
+    guard existed)."""
+    if not tracks:
+        print(f"playlist_track_cache: refusing to replace '{platform}' rows with an empty fetch result - almost certainly a transient failure, not genuinely zero tracks.")
+        return
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        track_ids = [t['track_id'] for t in tracks]
+        execute_values(cur, """
+            INSERT INTO playlist_track_cache
+                (platform, track_id, track_name, artist_name, album, artwork_url,
+                 isrc, duration_ms, popularity, explicit, release_date, genre)
+            VALUES %s
+            ON CONFLICT (platform, track_id) DO UPDATE SET
+                track_name = EXCLUDED.track_name, artist_name = EXCLUDED.artist_name,
+                album = EXCLUDED.album, artwork_url = EXCLUDED.artwork_url,
+                isrc = EXCLUDED.isrc, duration_ms = EXCLUDED.duration_ms,
+                popularity = EXCLUDED.popularity, explicit = EXCLUDED.explicit,
+                release_date = EXCLUDED.release_date, genre = EXCLUDED.genre
+        """, [(
+            platform, t['track_id'], t['track_name'], t.get('artist_name'), t.get('album'),
+            t.get('artwork_url'), t.get('isrc'), t.get('duration_ms'), t.get('popularity'),
+            t.get('explicit'), t.get('release_date'), t.get('genre'),
+        ) for t in tracks])
+        cur.execute(
+            "DELETE FROM playlist_track_cache WHERE platform = %s AND NOT (track_id = ANY(%s))",
+            (platform, track_ids),
+        )
+        cur.execute("""
+            INSERT INTO playlist_track_cache_meta (platform, skipped_count, refreshed_at)
+            VALUES (%s, %s, NOW())
+            ON CONFLICT (platform) DO UPDATE SET skipped_count = EXCLUDED.skipped_count, refreshed_at = NOW()
+        """, (platform, skipped_count))
+        conn.commit()
+        cur.close()
+    except Error as e:
+        print(f"Error replacing playlist_track_cache for {platform}: {e}")
+        if conn:
+            conn.rollback()
+    finally:
+        if conn:
+            conn.close()
+    bulk_backfill_local_track_ids(platform)
+    bulk_backfill_cross_platform_matches(platform)
+
+
+def get_playlist_track_cache(platform):
+    """Returns {'tracks': [...], 'skipped_count': int, 'refreshed_at': iso str}
+    for this platform ('spotify'/'ytmusic'), or None if nothing's cached yet.
+    Each track dict includes matched_spotify_uri/matched_at (both None until
+    playlist_match_prewarm reaches that row, ytmusic-only)."""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT skipped_count, refreshed_at FROM playlist_track_cache_meta WHERE platform = %s",
+            (platform,),
+        )
+        meta_row = cur.fetchone()
+        if not meta_row:
+            cur.close()
+            return None
+        cur.execute("""
+            SELECT track_id, track_name, artist_name, album, artwork_url, isrc,
+                   duration_ms, popularity, explicit, release_date, genre,
+                   matched_spotify_uri, matched_at, local_track_id, matched_ytmusic_video_id
+            FROM playlist_track_cache WHERE platform = %s
+        """, (platform,))
+        rows = cur.fetchall()
+        cur.close()
+        tracks = [{
+            'track_id': r[0], 'track_name': r[1], 'artist_name': r[2], 'album': r[3],
+            'artwork_url': r[4], 'isrc': r[5], 'duration_ms': r[6], 'popularity': r[7],
+            'explicit': r[8], 'release_date': r[9], 'genre': r[10],
+            'matched_spotify_uri': r[11], 'matched_at': r[12].isoformat() if r[12] else None,
+            'local_track_id': r[13], 'matched_ytmusic_video_id': r[14],
+        } for r in rows]
+        return {
+            'tracks': tracks, 'skipped_count': meta_row[0],
+            'refreshed_at': meta_row[1].isoformat() if meta_row[1] else None,
+        }
+    except Error as e:
+        print(f"Error reading playlist_track_cache for {platform}: {e}")
+        return None
+    finally:
+        if conn:
+            conn.close()
+
+
+def get_unmatched_ytmusic_tracks(limit=1):
+    """Rows playlist_match_prewarm hasn't attempted a Spotify match for yet -
+    matched_at IS NULL distinguishes "not tried" from "tried, no match"."""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT track_id, track_name, artist_name FROM playlist_track_cache
+            WHERE platform = 'ytmusic' AND matched_at IS NULL
+            LIMIT %s
+        """, (limit,))
+        rows = cur.fetchall()
+        cur.close()
+        return [{'track_id': r[0], 'track_name': r[1], 'artist_name': r[2]} for r in rows]
+    except Error as e:
+        print(f"Error reading unmatched ytmusic tracks: {e}")
+        return []
+    finally:
+        if conn:
+            conn.close()
+
+
+def set_track_match(track_id, matched_spotify_uri):
+    """Writes back playlist_match_prewarm's result for one ytmusic track -
+    matched_spotify_uri is None on a genuine "no match found", which still
+    sets matched_at so this row isn't retried forever."""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            UPDATE playlist_track_cache SET matched_spotify_uri = %s, matched_at = NOW()
+            WHERE platform = 'ytmusic' AND track_id = %s
+        """, (matched_spotify_uri, track_id))
+        conn.commit()
+        cur.close()
+    except Error as e:
+        print(f"Error setting track match for {track_id}: {e}")
+    finally:
+        if conn:
+            conn.close()
+
+
+def find_known_track_external_match(ytmusic_video_id=None, spotify_track_id=None):
+    """Exact-id lookup into known_tracks - the safe (never fuzzy) half of the
+    cross-reference this app now does before any live search: if a local
+    library track has already been matched to this exact Spotify/YouTube id
+    by a *different* code path (spotify_prewarm.py, ytmusic_push_job.py, the
+    reverse direction of this same cross-reference), reuse that instead of
+    searching again. Exactly one of the two kwargs should be given. Returns
+    {'id', 'spotify_track_id', 'ytmusic_video_id'} or None."""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        if ytmusic_video_id is not None:
+            cur.execute(
+                "SELECT id, spotify_track_id, ytmusic_video_id FROM known_tracks WHERE ytmusic_video_id = %s",
+                (ytmusic_video_id,),
+            )
+        else:
+            cur.execute(
+                "SELECT id, spotify_track_id, ytmusic_video_id FROM known_tracks WHERE spotify_track_id = %s",
+                (spotify_track_id,),
+            )
+        row = cur.fetchone()
+        cur.close()
+        if not row:
+            return None
+        return {'id': row[0], 'spotify_track_id': row[1], 'ytmusic_video_id': row[2]}
+    except Error as e:
+        print(f"Error finding known_tracks external match: {e}")
+        return None
+    finally:
+        if conn:
+            conn.close()
+
+
+def backfill_known_track_ids(known_track_id, spotify_track_id=None, ytmusic_video_id=None):
+    """Writes a freshly-resolved external id back into known_tracks -
+    COALESCE so an id known_tracks already had (however it got there) is
+    never overwritten, only ever filled in when it was previously unset.
+    Marks the corresponding *_checked flag true either way, since a
+    known_track_id is only ever passed here once its match (found or
+    genuinely absent upstream) is settled."""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        if spotify_track_id is not None:
+            cur.execute("""
+                UPDATE known_tracks SET
+                    spotify_track_id = COALESCE(spotify_track_id, %s), spotify_checked = TRUE
+                WHERE id = %s
+            """, (spotify_track_id, known_track_id))
+        if ytmusic_video_id is not None:
+            cur.execute("""
+                UPDATE known_tracks SET
+                    ytmusic_video_id = COALESCE(ytmusic_video_id, %s), ytmusic_checked = TRUE
+                WHERE id = %s
+            """, (ytmusic_video_id, known_track_id))
+        conn.commit()
+        cur.close()
+    except Error as e:
+        print(f"Error backfilling known_tracks ids for {known_track_id}: {e}")
+    finally:
+        if conn:
+            conn.close()
+
+
+def backfill_ytmusic_cache_match(video_id, spotify_uri):
+    """Same write as set_track_match, under a name that makes sense at its
+    other call sites (the discover-match route, _match_track_to_spotify) -
+    those resolve a YT<->Spotify match via a different path than
+    playlist_match_prewarm itself, but playlist_track_cache should stay in
+    sync regardless of which code path found it."""
+    set_track_match(video_id, spotify_uri)
+
+
+def bulk_backfill_local_track_ids(platform):
+    """Cross-references every cached row for this platform against
+    known_tracks in one query, setting local_track_id wherever this
+    playlist/library track turns out to be the same track (matched by the
+    platform's own external id column) - enables local playback for a
+    playlist track that also happens to be a file already on disk. Run
+    after every replace_playlist_track_cache call; a plain UPDATE...FROM
+    join, no extra API calls."""
+    external_column = 'spotify_track_id' if platform == 'spotify' else 'ytmusic_video_id'
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute(f"""
+            UPDATE playlist_track_cache AS ptc
+            SET local_track_id = kt.id
+            FROM known_tracks AS kt
+            WHERE ptc.platform = %s AND kt.{external_column} = ptc.track_id
+        """, (platform,))
+        conn.commit()
+        cur.close()
+    except Error as e:
+        print(f"Error backfilling local_track_id for {platform}: {e}")
+    finally:
+        if conn:
+            conn.close()
+
+
+def bulk_backfill_cross_platform_matches(platform):
+    """Populates cross-service availability in bulk right after every
+    refresh, backing the Playlists tab's availability badges - rather than
+    only ever relying on playlist_match_prewarm's slow paced background
+    resolution for a real, already-knowable answer.
+
+    platform='ytmusic': a known_tracks-bridge quick win for
+    matched_spotify_uri - COALESCE means this never overwrites what the
+    paced prewarm job already found, it just gets there sooner for tracks
+    the local library already resolved. The prewarm job still handles
+    everything this bridge doesn't catch.
+
+    platform='spotify': matched_ytmusic_video_id has no dedicated background
+    job of its own - it's populated entirely as a byproduct here, via (1)
+    the same known_tracks bridge and (2) a reverse lookup against
+    already-resolved ytmusic rows (a ytmusic track matched to this exact
+    Spotify id means this Spotify track is available on YouTube Music too,
+    with that video_id)."""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        if platform == 'ytmusic':
+            cur.execute("""
+                UPDATE playlist_track_cache AS ptc
+                SET matched_spotify_uri = COALESCE(ptc.matched_spotify_uri, 'spotify:track:' || kt.spotify_track_id),
+                    matched_at = COALESCE(ptc.matched_at, NOW())
+                FROM known_tracks AS kt
+                WHERE ptc.platform = 'ytmusic' AND ptc.local_track_id = kt.id AND kt.spotify_track_id IS NOT NULL
+            """)
+        else:
+            cur.execute("""
+                UPDATE playlist_track_cache AS ptc
+                SET matched_ytmusic_video_id = COALESCE(ptc.matched_ytmusic_video_id, kt.ytmusic_video_id)
+                FROM known_tracks AS kt
+                WHERE ptc.platform = 'spotify' AND ptc.local_track_id = kt.id AND kt.ytmusic_video_id IS NOT NULL
+            """)
+            cur.execute("""
+                UPDATE playlist_track_cache AS ptc
+                SET matched_ytmusic_video_id = COALESCE(ptc.matched_ytmusic_video_id, other.track_id)
+                FROM playlist_track_cache AS other
+                WHERE ptc.platform = 'spotify' AND other.platform = 'ytmusic'
+                  AND other.matched_spotify_uri = 'spotify:track:' || ptc.track_id
+            """)
+        conn.commit()
+        cur.close()
+    except Error as e:
+        print(f"Error backfilling cross-platform matches for {platform}: {e}")
+    finally:
+        if conn:
+            conn.close()
+
 
 if __name__ == "__main__":
     # This block will be executed when database.py is run directly

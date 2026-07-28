@@ -4,7 +4,7 @@ import './App.css';
 
 const LIBRARY_PAGE_SIZE = 100;
 const GROUP_QUEUE_LIMIT = 500;
-const VIEW_MODES = ['all', 'album', 'genre', 'decade', 'quality', 'format', 'favorite', 'length', 'playlist', 'ytmusic-playlist'];
+const VIEW_MODES = ['all', 'album', 'genre', 'decade', 'quality', 'format', 'favorite', 'length'];
 const BACK_LABELS = {
   album: 'Albums', genre: 'Genres', decade: 'Decades',
   quality: 'Quality Tiers', format: 'Formats', favorite: 'Favorites', length: 'Lengths',
@@ -37,6 +37,15 @@ function mapSpotifyTrack(t) {
     album_name: t.album,
     duration_seconds: t.duration_ms != null ? t.duration_ms / 1000 : null,
     artwork_url: t.artwork_url,
+    // Set when this same track also exists as a local file (see
+    // main.py's _attach_spotify_track_extras / bulk_backfill_local_track_ids) -
+    // same local_id bridging mapMatchedLocalTrack already uses, so This
+    // Browser can stream the local file instead of needing Spotify Connect.
+    local_id: t.local_track_id,
+    // Set when this same track is also known to be on YouTube Music (see
+    // main.py's _attach_spotify_track_extras) - backs the Playlists tab's
+    // cross-service availability badge.
+    matched_ytmusic_video_id: t.matched_ytmusic_video_id,
   };
 }
 
@@ -54,6 +63,17 @@ function mapYtMusicTrack(t) {
     track_name: t.track_name,
     artist_name: t.artist_name,
     artwork_url: t.artwork_url,
+    // Only ever present on a track pulled from the Playlists tab's "All
+    // Tracks" cache (see fetchAllPlaylistTracksFlat) - undefined for a
+    // drilled-into-one-playlist track, which comes straight from the live
+    // per-playlist endpoint and was never run through playlist_match_prewarm.
+    // matchAndQueueYtMusicPlaylistTracksOnSpotify uses this to skip the live
+    // Spotify search entirely when already resolved.
+    matched_spotify_uri: t.matched_spotify_uri,
+    // Set when this same video also exists as a local file (see
+    // main.py's _attach_local_track_ids / bulk_backfill_local_track_ids) -
+    // lets This Browser stream the local file instead of opening a new tab.
+    local_id: t.local_track_id,
   };
 }
 
@@ -478,7 +498,17 @@ function App() {
   // Discover run actually produces results.
   const [showDiscoverPanel, setShowDiscoverPanel] = useState(false);
 
-  const [activeTab, setActiveTab] = useState(() => loadLibraryView()?.activeTab ?? 'library');
+  const [activeTab, setActiveTab] = useState(() => {
+    const saved = loadLibraryView();
+    // Spotify/YT Music playlist browsing used to live as two library-mode
+    // sub-tabs inside "My Library" - now consolidated into their own top-level
+    // "Playlists" tab. A reload from before this change would otherwise land
+    // back on "My Library" with a libraryMode it no longer has a tab for.
+    if ((saved?.libraryMode === 'playlist' || saved?.libraryMode === 'ytmusic-playlist') && (saved?.activeTab ?? 'library') === 'library') {
+      return 'playlists';
+    }
+    return saved?.activeTab ?? 'library';
+  });
   const [settingsOpen, setSettingsOpen] = useState(false);
 
   const [rootPath, setRootPath] = useState('');
@@ -495,9 +525,21 @@ function App() {
   // (same "resume where you left off" treatment already given to playback).
   const [libraryMode, setLibraryMode] = useState(() => loadLibraryView()?.libraryMode ?? 'all');
   const [drill, setDrill] = useState(() => loadLibraryView()?.drill ?? null); // { by, key, label } once a group is opened
-  // Briefly shown when a track's source (local vs. Spotify) doesn't match
-  // the current output destination - null when hidden, a message when shown.
+  // Terminal Spotify-matching outcomes only (rate-limited, no match,
+  // wrong-destination instructions, push failures) - shown as a
+  // dismiss-required popup (InfoPopup) since these need to actually be
+  // read, not glanced at. null when hidden.
   const [spotifyPlayHint, setSpotifyPlayHint] = useState(null);
+  // A transient "Searching Spotify for X…" progress indicator, kept
+  // deliberately separate from spotifyPlayHint above - it's not something
+  // that needs deliberate reading (the per-track spinner icon already
+  // covers "something is happening"), and confirmed live that funneling it
+  // through the same popup as genuine errors made it flash and vanish
+  // before it could be read, since it's always immediately superseded by
+  // either a real result or the terminal error message. Always explicitly
+  // cleared by whichever function sets it, once resolved either way -
+  // never relies on a timeout.
+  const [spotifyMatchProgress, setSpotifyMatchProgress] = useState(null);
   const [pushingToSpotify, setPushingToSpotify] = useState(false);
   const [ytMusicPlayHint, setYtMusicPlayHint] = useState(null);
   const [pushingToYtMusic, setPushingToYtMusic] = useState(false);
@@ -506,6 +548,26 @@ function App() {
   // Spotify blocks reading the track listing of a playlist you don't own,
   // even public/followed ones, though playing it via context_uri still works.
   const [playlistTracksRestricted, setPlaylistTracksRestricted] = useState(false);
+  // Client-side only - the Playlists tab's whole group/track list is already
+  // fetched in full (see fetchSpotifyPlaylistsAsGroups/fetchYtMusicPlaylistsAsGroups
+  // and their track-list counterparts), so filtering it doesn't need a server
+  // round trip the way the main Library search does.
+  const [playlistSearchInput, setPlaylistSearchInput] = useState('');
+  // "All Tracks" mode for the Playlists tab - every track from every playlist
+  // on the current platform, flattened into one searchable list, instead of
+  // browsing one playlist at a time. Independent of drill/groups (those still
+  // drive "By Playlist" mode) - fetched fresh whenever this turns on or the
+  // platform switches.
+  const [playlistsFlatView, setPlaylistsFlatView] = useState(false);
+  const [flatPlaylistTracks, setFlatPlaylistTracks] = useState([]);
+  const [flatPlaylistTracksLoading, setFlatPlaylistTracksLoading] = useState(false);
+  // Spotify playlists this account doesn't own can't have their individual
+  // tracks read (see playlistTracksRestricted above) - counted so the flat
+  // view can say why its total looks short instead of silently omitting them.
+  const [flatPlaylistSkippedCount, setFlatPlaylistSkippedCount] = useState(0);
+  // When the cache backing this view was last built (server timestamp) - null
+  // until the first fetch resolves.
+  const [flatPlaylistRefreshedAt, setFlatPlaylistRefreshedAt] = useState(null);
   // id of a local track currently being searched for on Spotify (drives a
   // loading indicator on its play button) - null when nothing's in flight.
   const [matchingTrackId, setMatchingTrackId] = useState(null);
@@ -751,7 +813,7 @@ function App() {
         ? { context_uri: nowPlaying.context_uri, track_uri: nowPlaying.uri, clear_queue: true }
         : { uris: [nowPlaying.uri, ...queue.slice(0, SPOTIFY_PLAY_QUEUE_LIMIT).map((t) => t.uri)], clear_queue: true };
       axios.post(`${deviceEndpoint(outputDevice)}/${endpoint}`, payload)
-        .catch((err) => console.error('Error casting to Spotify device:', err))
+        .catch(handleSpotifyCastError)
         // The destination picker's status dot (see spotify_connect
         // ._device_last_outcome) only refreshes when the picker itself is
         // opened - without this, a device that fails or drops out *after*
@@ -1134,17 +1196,14 @@ function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [artistSearchInput]);
 
-  useEffect(() => {
-    if (!spotifyPlayHint) return;
-    const t = setTimeout(() => setSpotifyPlayHint(null), 4000);
-    return () => clearTimeout(t);
-  }, [spotifyPlayHint]);
-
-  // No auto-dismiss timeout here (unlike spotifyPlayHint above) - this can
-  // carry an important, easy-to-miss message (e.g. "too large to push in one
-  // go, started a background job") that a 4s fade was confirmed to cut off
-  // before the user could read it. Rendered as a dismiss-required popup
-  // (InfoPopup, below) instead of a fading inline hint.
+  // No auto-dismiss timeout for spotifyPlayHint or ytMusicPlayHint - a 4s
+  // fade was confirmed live to cut off messages before they could be fully
+  // read (e.g. a rate-limit explanation, or "too large to push in one go,
+  // started a background job"). Both render as dismiss-required popups
+  // (InfoPopup, below) instead of a fading inline hint; every function that
+  // sets spotifyPlayHint as a transient "Searching…" progress message
+  // explicitly clears it back to null on success, so the popup never
+  // lingers once an action actually worked.
 
   // Marks a track as "played this session" the moment it becomes nowPlaying,
   // for any destination. A local track matched to Spotify (see
@@ -1158,7 +1217,10 @@ function App() {
   }, [nowPlaying]);
 
   useEffect(() => {
-    if (activeTab !== 'library') return;
+    // The Playlists tab drives libraryMode/drill too (always 'playlist' or
+    // 'ytmusic-playlist' there - see its nav button and platform sub-tabs
+    // below), so this same dispatch has to run for it as well as 'library'.
+    if (activeTab !== 'library' && activeTab !== 'playlists') return;
     // activeTab has to be a dependency so this runs on first arrival at the
     // tab, but that means it *also* re-fires on every later re-arrival (e.g.
     // Cleanup and back) even though nothing filter-related changed - which
@@ -1211,6 +1273,15 @@ function App() {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeTab, libraryMode, drill, search, filterGenre, filterDecade, filterQuality, filterFormat, filterSpotifyAvailable, filterTrackLimit]);
+
+  // Playlists tab's "All Tracks" mode - independent of the dispatch above
+  // (which only ever drives "By Playlist" groups/drill), refetches whenever
+  // flat mode turns on or the platform switches while it's already on.
+  useEffect(() => {
+    if (activeTab !== 'playlists' || !playlistsFlatView) return;
+    fetchAllPlaylistTracksFlat();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeTab, playlistsFlatView, libraryMode]);
 
   // Refetches each filter dropdown's own option counts whenever search or
   // any *other* filter changes, so e.g. the Genre dropdown shows "Metal
@@ -1504,6 +1575,55 @@ function App() {
     }
   };
 
+  // "All Tracks" mode for the Playlists tab: every track across every
+  // playlist on the current platform, flattened+deduped. Backed by a
+  // database cache (main.py's /playlists/all-tracks routes) rather than
+  // fetched fresh every time - flattening live is an N+1 fetch (one round
+  // trip per playlist) that made this view slow to open every time it was
+  // built client-side. Served from cache unless refresh=true, which the
+  // Refresh button passes to pick up playlists/tracks changed since.
+  const fetchAllPlaylistTracksFlat = async (refresh = false) => {
+    setFlatPlaylistTracksLoading(true);
+    try {
+      const isSpotify = libraryMode === 'playlist';
+      const platformPath = isSpotify ? 'spotify' : 'ytmusic';
+      const response = await axios.get(`${API_BASE_URL}/${platformPath}/playlists/all-tracks`, {
+        params: refresh ? { refresh: true } : {},
+      });
+      // The cache returns a uniform row shape for both platforms
+      // (track_id/track_name/artist_name/album/artwork_url/isrc/duration_ms/
+      // popularity/explicit/release_date/genre/matched_spotify_uri) - adapt
+      // each into the native shape mapSpotifyTrack/mapYtMusicTrack expect,
+      // then carry the extra metadata through on top (isrc/popularity/etc.
+      // aren't surfaced in the UI yet, but are there for it to use).
+      const tracks = response.data.tracks.map((t) => (isSpotify
+        ? {
+          ...mapSpotifyTrack({
+            uri: `spotify:track:${t.track_id}`, name: t.track_name, artists: t.artist_name,
+            album: t.album, duration_ms: t.duration_ms, artwork_url: t.artwork_url,
+            local_track_id: t.local_track_id, matched_ytmusic_video_id: t.matched_ytmusic_video_id,
+          }),
+          isrc: t.isrc, popularity: t.popularity, explicit: t.explicit, release_date: t.release_date, genre: t.genre,
+        }
+        : {
+          ...mapYtMusicTrack({
+            video_id: t.track_id, track_name: t.track_name, artist_name: t.artist_name,
+            artwork_url: t.artwork_url, matched_spotify_uri: t.matched_spotify_uri,
+            local_track_id: t.local_track_id,
+          }),
+          duration_ms: t.duration_ms, genre: t.genre,
+        }));
+      setFlatPlaylistTracks(tracks);
+      setFlatPlaylistSkippedCount(response.data.skipped_count || 0);
+      setFlatPlaylistRefreshedAt(response.data.refreshed_at || null);
+    } catch (err) {
+      console.error('Error fetching playlist tracks for All Tracks view:', err);
+      setFlatPlaylistTracks([]);
+    } finally {
+      setFlatPlaylistTracksLoading(false);
+    }
+  };
+
   const fetchStats = async () => {
     setStatsLoading(true);
     try {
@@ -1660,6 +1780,23 @@ function App() {
       console.error('Error discovering music:', err);
     } finally {
       setDiscovering(false);
+    }
+  };
+
+  // Surfaces a genuine Spotify Connect casting failure to the user -
+  // previously this only ever went to console.error, so a real failure
+  // (confirmed live: main.py's /play and /play-uris routes deliberately
+  // return 502 when spotify_connect.play/play_uris exhausts its own
+  // confirm-playback-landed retries, e.g. a slow/flaky device that loads
+  // the right track but is sluggish to actually start it) was completely
+  // silent from the user's side - nothing ever told them what happened.
+  const handleSpotifyCastError = (err) => {
+    console.error('Error casting to Spotify device:', err);
+    const deviceName = outputDevice?.name || 'the selected device';
+    if (err.response?.status === 502) {
+      setSpotifyPlayHint(`${deviceName} didn't confirm playback started after a few tries - it may just need a moment to catch up, or try pressing Play again.`);
+    } else {
+      setSpotifyPlayHint(`Couldn't cast to ${deviceName}: ${err.response?.data?.detail || err.message}`);
     }
   };
 
@@ -1831,6 +1968,7 @@ function App() {
           : (noMatchHint || 'No Spotify match found for these tracks.'));
         return;
       }
+      setSpotifyPlayHint(null);
       startQueue([found]);
     } finally {
       if (spotifyMatchRequestIdRef.current === requestId) setMatchingTrackId(null);
@@ -1862,11 +2000,14 @@ function App() {
     const requestId = ++spotifyMatchRequestIdRef.current;
     let firstStarted = false;
     let hitRateLimit = false;
+    setSpotifyPlayHint(null);
     // The per-card spinner icon alone isn't enough feedback - confirmed live
     // that a rate-limited match can silently take 6-7s (the backend retries
     // once with a sleep before giving up, see spotify_connect._api_request),
-    // which reads as "nothing is happening" without this.
-    setSpotifyPlayHint(`Searching Spotify for "${candidates[0].track_name}"…`);
+    // which reads as "nothing is happening" without this. Uses
+    // spotifyMatchProgress (not spotifyPlayHint) - see that state's own
+    // comment for why.
+    setSpotifyMatchProgress(`Searching Spotify for "${candidates[0].track_name}"…`);
     for (const candidate of candidates) {
       if (spotifyMatchRequestIdRef.current !== requestId) return; // superseded
       setMatchingTrackId(candidate.id);
@@ -1903,6 +2044,7 @@ function App() {
         album_name: candidate.album_name, artwork_url: artworkUrl,
       };
       if (!firstStarted) {
+        setSpotifyMatchProgress(null);
         startQueue([queueEntry]);
         firstStarted = true;
       } else {
@@ -1910,6 +2052,7 @@ function App() {
       }
     }
     if (spotifyMatchRequestIdRef.current === requestId) setMatchingTrackId(null);
+    if (spotifyMatchRequestIdRef.current === requestId) setSpotifyMatchProgress(null);
     if (!firstStarted && spotifyMatchRequestIdRef.current === requestId) {
       // hitRateLimit must win over the generic "no match" message below it -
       // confirmed live this was previously getting silently overwritten:
@@ -1934,19 +2077,40 @@ function App() {
     const requestId = ++spotifyMatchRequestIdRef.current;
     let firstStarted = false;
     let hitRateLimit = false;
-    setSpotifyPlayHint(`Searching Spotify for "${candidates[0].track_name}"…`);
+    setSpotifyPlayHint(null);
+    // Uses spotifyMatchProgress (not spotifyPlayHint) - see that state's own
+    // comment for why. Still shown even when candidate.matched_spotify_uri
+    // is already cached client-side, since the backend's own cross-reference
+    // check (main.py's match_discovered_track_to_spotify) is a real network
+    // round trip too, just a fast DB lookup rather than a live Spotify
+    // search - this briefly flashing and clearing on its own is expected,
+    // not an error.
+    setSpotifyMatchProgress(`Searching Spotify for "${candidates[0].track_name}"…`);
     for (const candidate of candidates) {
       if (spotifyMatchRequestIdRef.current !== requestId) return;
       setMatchingTrackId(candidate.id);
       let matched, uri, artworkUrl, reason;
-      try {
-        const response = await axios.post(`${API_BASE_URL}/spotify/discover-match`, {
-          track_name: candidate.track_name, artist_name: candidate.artist_name,
-        });
-        ({ matched, uri, artwork_url: artworkUrl, reason } = response.data);
-      } catch (err) {
-        console.error('Error matching YouTube Music track to Spotify:', err);
-        break;
+      if (candidate.matched_spotify_uri) {
+        // Already resolved by playlist_match_prewarm.py (see the Playlists
+        // tab's "All Tracks" cache) - skip the live search entirely.
+        matched = true;
+        uri = candidate.matched_spotify_uri;
+        artworkUrl = candidate.artwork_url;
+      } else {
+        try {
+          const response = await axios.post(`${API_BASE_URL}/spotify/discover-match`, {
+            track_name: candidate.track_name, artist_name: candidate.artist_name,
+            // Lets the backend try an exact-id cross-reference (known_tracks/
+            // playlist_track_cache) before falling back to fuzzy search, and
+            // write the result back everywhere it helps next time - see
+            // main.py's match_discovered_track_to_spotify.
+            ytmusic_video_id: candidate.video_id,
+          });
+          ({ matched, uri, artwork_url: artworkUrl, reason } = response.data);
+        } catch (err) {
+          console.error('Error matching YouTube Music track to Spotify:', err);
+          break;
+        }
       }
       if (spotifyMatchRequestIdRef.current !== requestId) return;
       if (!matched) {
@@ -1959,13 +2123,18 @@ function App() {
       const queueEntry = {
         // ytmusic_id (not local_id/discover_id) carries the playlist card's
         // own id back through, same bridging role discover_id plays for
-        // Discover suggestions - a YT Music playlist track has no local file
-        // to fall back to either, so it should behave like a genuine
-        // Spotify-only track once matched.
+        // Discover suggestions. Deliberately NOT local_id, even though a YT
+        // Music playlist track can turn out to also be a local file (see
+        // mapYtMusicTrack) - the "now playing" highlight bridge
+        // (nowPlayingId below) checks local_id before ytmusic_id, so
+        // setting both here would highlight the wrong card (a plain
+        // library card sharing that same track) instead of this playlist
+        // card.
         id: uri, source: 'spotify', uri, context_uri: null, ytmusic_id: candidate.id,
         track_name: candidate.track_name, artist_name: candidate.artist_name, artwork_url: artworkUrl,
       };
       if (!firstStarted) {
+        setSpotifyMatchProgress(null);
         startQueue([queueEntry]);
         firstStarted = true;
       } else {
@@ -1973,6 +2142,7 @@ function App() {
       }
     }
     if (spotifyMatchRequestIdRef.current === requestId) setMatchingTrackId(null);
+    if (spotifyMatchRequestIdRef.current === requestId) setSpotifyMatchProgress(null);
     if (!firstStarted && spotifyMatchRequestIdRef.current === requestId) {
       setSpotifyPlayHint(hitRateLimit
         ? "Spotify's search is temporarily rate-limited - try again later."
@@ -2018,6 +2188,7 @@ function App() {
         album_name: candidate.album_name, artwork_url: artworkUrl, preview_url: url,
       };
       if (!firstStarted) {
+        setSpotifyPlayHint(null);
         startQueue([queueEntry]);
         firstStarted = true;
       } else {
@@ -2077,7 +2248,7 @@ function App() {
             ? { context_uri: nowPlaying.context_uri, track_uri: nowPlaying.uri, clear_queue: true }
             : { uris: [nowPlaying.uri, ...queue.slice(0, SPOTIFY_PLAY_QUEUE_LIMIT).map((t) => t.uri)], clear_queue: true };
           axios.post(`${deviceEndpoint(outputDevice)}/${endpoint}`, spotifyPayload)
-            .catch((err) => console.error('Error casting to Spotify device:', err))
+            .catch(handleSpotifyCastError)
             .finally(() => setTimeout(refreshSpotifyDevices, 7000));
           return;
         }
@@ -2147,20 +2318,28 @@ function App() {
     }
     // YouTube Music playlist tracks: with a Spotify Connect destination,
     // match+play (+queue the rest) on Spotify, same pipeline Discover uses.
-    // With This Browser selected, open the real video on music.youtube.com in
-    // a new tab instead of playing it in-app - an embedded IFrame player was
-    // tried and confirmed (live testing) to always fail with "Video
-    // unavailable" for every track even though the Data API reports them all
-    // embeddable=true and they play fine directly on YouTube; this points to
-    // YouTube's bot/integrity verification rejecting the embed context itself
-    // (this app runs on a plain-HTTP LAN IP, not a normal registered domain),
-    // not a per-video restriction, so there's no in-app fix. WiiM/Chromecast
-    // can do neither (same reasoning as Discover suggestions).
+    // With This Browser selected: if this exact video also turned out to be
+    // a local file (local_id, via the known_tracks cross-reference - see
+    // mapYtMusicTrack), stream it directly, no different from a genuine
+    // local-library track. Otherwise open the real video on
+    // music.youtube.com in a new tab instead of playing it in-app - an
+    // embedded IFrame player was tried and confirmed (live testing) to
+    // always fail with "Video unavailable" for every track even though the
+    // Data API reports them all embeddable=true and they play fine directly
+    // on YouTube; this points to YouTube's bot/integrity verification
+    // rejecting the embed context itself (this app runs on a plain-HTTP LAN
+    // IP, not a normal registered domain), not a per-video restriction, so
+    // there's no in-app fix. WiiM/Chromecast can do neither (same reasoning
+    // as Discover suggestions) regardless of a local match.
     if (track.source === 'ytmusic') {
       if (outputDevice?.type === 'spotify') {
         const startIndex = list.findIndex((t) => t.id === track.id);
         const candidates = startIndex >= 0 ? list.slice(startIndex) : [track];
         matchAndQueueYtMusicPlaylistTracksOnSpotify(candidates);
+      } else if (!outputDevice && track.local_id != null) {
+        const startIndex = list.findIndex((t) => t.id === track.id);
+        const candidates = startIndex >= 0 ? list.slice(startIndex) : [track];
+        startQueue(candidates);
       } else if (!outputDevice) {
         const playlistId = libraryMode === 'ytmusic-playlist' ? drill?.key : null;
         const url = playlistId
@@ -2210,6 +2389,16 @@ function App() {
     // 'spotify' for a matched-and-playing-in-full discover suggestion.
     const isPreviewingThis = isCurrent && nowPlaying?.source === 'discover';
     const isMatching = matchingTrackId === track.id;
+    // Cross-service availability badges - only ever meaningful for a
+    // Playlists-tab track (source 'spotify'/'ytmusic'; a matched-local-track
+    // queue entry from mapMatchedLocalTrack never gets rendered as its own
+    // card, so this never misfires elsewhere). matched_spotify_uri/
+    // matched_ytmusic_video_id come from the cross-reference built into the
+    // playlist cache/live routes (see main.py's _attach_spotify_track_extras/
+    // _attach_ytmusic_track_extras).
+    const isPlaylistTrack = track.source === 'spotify' || track.source === 'ytmusic';
+    const availableOnSpotify = track.source === 'spotify' || Boolean(track.matched_spotify_uri);
+    const availableOnYtMusic = track.source === 'ytmusic' || Boolean(track.matched_ytmusic_video_id);
     const hasPlayed = !isCurrent && playedTrackIds.has(track.id);
     const wasSkipped = !isCurrent && !hasPlayed && skippedTrackIds.has(track.id);
     const playIcon = isMatching ? '⏳' : isCardPlaying ? '❚❚' : '▶';
@@ -2218,10 +2407,17 @@ function App() {
     ) : wasSkipped ? (
       <span className="track-status-badge skipped" title="No Spotify match found - skipped">✕</span>
     ) : null;
-    // Discover suggestions have no known_tracks row, so there's nothing for
-    // the id-based artwork endpoint to serve - only try it for real library
-    // tracks, otherwise it's a guaranteed 404 on every card.
-    const artworkSrc = track.artwork_url || (isDiscover ? null : `${API_BASE_URL}/tracks/${track.id}/artwork`);
+    // Discover/Spotify/YT-Music-sourced tracks have no known_tracks row of
+    // their own - track.id is a Spotify uri or YouTube video_id for those,
+    // not the integer local track id this endpoint expects (confirmed live:
+    // this was firing a guaranteed 422 on every card lacking its own
+    // artwork_url). local_id bridges the cross-referenced case where the
+    // same track also exists locally; otherwise there's nothing to serve.
+    const artworkSrc = track.artwork_url || (
+      isPlaylistTrack ? (track.local_id != null ? `${API_BASE_URL}/tracks/${track.local_id}/artwork` : null)
+        : isDiscover ? null
+          : `${API_BASE_URL}/tracks/${track.id}/artwork`
+    );
     // Quick single-track sample, independent of the main Play button - only
     // ever plays through this browser's own <audio> element (previews never
     // cast to a real device), so it's only offered when that's the active
@@ -2289,6 +2485,22 @@ function App() {
           <p className="artist">{track.artist_name}</p>
           {isDiscover && track.album_name && <p className="album">{track.album_name}</p>}
           {isPreviewingThis && <p className="preview-label">🎧 Sampling 30s preview</p>}
+          {isPlaylistTrack && (
+            <div className="track-availability">
+              <span
+                className={`availability-icon${availableOnSpotify ? '' : ' unavailable'}`}
+                title={availableOnSpotify ? 'Available on Spotify' : 'Not found on Spotify'}
+              >
+                <SpotifyIcon />
+              </span>
+              <span
+                className={`availability-icon${availableOnYtMusic ? '' : ' unavailable'}`}
+                title={availableOnYtMusic ? 'Available on YouTube Music' : 'Not found on YouTube Music'}
+              >
+                <YtMusicIcon />
+              </span>
+            </div>
+          )}
         </div>
         {trackViewStyle === 'grid' && sampleButton}
       </div>
@@ -2322,7 +2534,7 @@ function App() {
         // corresponding /queue append for that slot. Sending the exact URI
         // we already have locally sidesteps that race entirely.
         axios.post(`${deviceEndpoint(outputDevice)}/play-uris`, { uris: [prevQueue[0].uri] })
-          .catch((err) => console.error('Error advancing Spotify playback:', err));
+          .catch(handleSpotifyCastError);
       }
       setHistory((h) => (nowPlaying ? [...h, nowPlaying] : h));
       setNowPlaying(prevQueue[0]);
@@ -2347,7 +2559,7 @@ function App() {
         // steps through server-side history we don't control the timing or
         // exact contents of.
         axios.post(`${deviceEndpoint(outputDevice)}/play-uris`, { uris: [last.uri] })
-          .catch((err) => console.error('Error reversing Spotify playback:', err));
+          .catch(handleSpotifyCastError);
       }
       setQueue((q) => (nowPlaying ? [nowPlaying, ...q] : q));
       setNowPlaying(last);
@@ -2429,6 +2641,8 @@ function App() {
         if (tracks.length === 0) return;
         if (outputDevice?.type === 'spotify') {
           matchAndQueueYtMusicPlaylistTracksOnSpotify(tracks);
+        } else if (tracks[0].local_id != null) {
+          startQueue(tracks);
         } else {
           window.open(`https://music.youtube.com/watch?v=${tracks[0].video_id}&list=${group.key}`, '_blank', 'noopener,noreferrer');
         }
@@ -2449,6 +2663,39 @@ function App() {
       }
     } catch (err) {
       console.error('Error queuing group playback:', err);
+    }
+  };
+
+  // Play All/Shuffle for the Playlists tab's "All Tracks" mode - the tracks
+  // are already in hand (flattened across every playlist, see
+  // fetchAllPlaylistTracksFlat), so unlike playGroup above this never fetches
+  // anything itself. Spotify-platform tracks are already real Spotify catalog
+  // tracks (mapSpotifyTrack), so startQueue handles them directly the same
+  // way a Spotify playlist's own Play All does; YT Music-platform tracks need
+  // the same match-to-Spotify-or-open-a-tab branching as a single YT Music
+  // track click/playGroup's ytmusic-playlist case, just over the whole
+  // (filtered) flat list instead of one playlist's tracks.
+  const playAllPlaylistTracksFlat = (tracks, { shuffle = false } = {}) => {
+    if (!tracks || tracks.length === 0) return;
+    const ordered = shuffle ? shuffleArray(tracks) : tracks;
+    if (libraryMode === 'playlist') {
+      startQueue(ordered);
+      return;
+    }
+    if (outputDevice && outputDevice.type !== 'spotify') {
+      setSpotifyPlayHint('Select a Spotify Connect device, or switch to This Browser, to play YouTube Music playlists.');
+      return;
+    }
+    if (outputDevice?.type === 'spotify') {
+      matchAndQueueYtMusicPlaylistTracksOnSpotify(ordered);
+    } else if (ordered[0].local_id != null) {
+      // The first track also turned out to be a local file (known_tracks
+      // cross-reference) - stream it directly, same as a single-track click
+      // would. Later tracks lacking a local match still resolve gracefully
+      // per-track (see PlayerBar's "no local copy" fallback message).
+      startQueue(ordered);
+    } else {
+      window.open(`https://music.youtube.com/watch?v=${ordered[0].video_id}`, '_blank', 'noopener,noreferrer');
     }
   };
 
@@ -2629,12 +2876,27 @@ function App() {
 
   const viewLabel = (mode) => {
     if (mode === 'all') return 'All Tracks';
-    if (mode === 'playlist') return 'Playlists';
-    if (mode === 'ytmusic-playlist') return 'YT Music Playlists';
     return `By ${mode.charAt(0).toUpperCase()}${mode.slice(1)}`;
   };
   const backLabel = drill && BACK_LABELS[drill.by];
   const effectiveIsPlaying = outputDevice ? destStatus?.status === 'play' : isPlaying;
+
+  // Playlists tab search - purely client-side over whatever's already been
+  // fetched in full (groups = playlist list, libraryTracks = one drilled
+  // playlist's tracks). Guarded by activeTab so this never bothers filtering
+  // a potentially large My Library libraryTracks array on every render.
+  const playlistSearchLower = playlistSearchInput.trim().toLowerCase();
+  const filteredPlaylistGroups = activeTab === 'playlists' && playlistSearchLower
+    ? groups.filter((g) => g.label.toLowerCase().includes(playlistSearchLower))
+    : groups;
+  const filteredPlaylistTracks = activeTab === 'playlists' && playlistSearchLower
+    ? libraryTracks.filter((t) => t.track_name.toLowerCase().includes(playlistSearchLower)
+      || (t.artist_name || '').toLowerCase().includes(playlistSearchLower))
+    : libraryTracks;
+  const filteredFlatPlaylistTracks = playlistSearchLower
+    ? flatPlaylistTracks.filter((t) => t.track_name.toLowerCase().includes(playlistSearchLower)
+      || (t.artist_name || '').toLowerCase().includes(playlistSearchLower))
+    : flatPlaylistTracks;
 
   // Only meaningful when discoveredGroupedByArtist is true - discoveredTracks
   // already has same-artist tracks landing consecutively (lastfm.py builds
@@ -2669,7 +2931,17 @@ function App() {
         <nav className="nav-tabs">
           <button
             className={activeTab === 'library' ? 'active' : ''}
-            onClick={() => setActiveTab('library')}
+            onClick={() => {
+              setActiveTab('library');
+              // 'playlist'/'ytmusic-playlist' only belong to the Playlists tab
+              // now - VIEW_MODES no longer has a button for either, so leaving
+              // libraryMode on one here would show an orphaned view with no
+              // way to switch it from this tab.
+              if (libraryMode === 'playlist' || libraryMode === 'ytmusic-playlist') {
+                setLibraryMode('all');
+                setDrill(null);
+              }
+            }}
           >
             My Library
           </button>
@@ -2678,6 +2950,18 @@ function App() {
             onClick={() => setActiveTab('taste')}
           >
             Taste Profile
+          </button>
+          <button
+            className={activeTab === 'playlists' ? 'active' : ''}
+            onClick={() => {
+              setActiveTab('playlists');
+              if (libraryMode !== 'playlist' && libraryMode !== 'ytmusic-playlist') {
+                setLibraryMode('playlist');
+                setDrill(null);
+              }
+            }}
+          >
+            Playlists
           </button>
           <button
             className={activeTab === 'cleanup' ? 'active' : ''}
@@ -2694,8 +2978,9 @@ function App() {
       <main className={nowPlaying ? 'with-player' : ''}>
         {activeTab === 'library' ? (
           <section className="library-section">
-            {spotifyPlayHint && (
-              <p className="empty-state spotify-play-hint">{spotifyPlayHint}</p>
+            <InfoPopup message={spotifyPlayHint} onClose={() => setSpotifyPlayHint(null)} />
+            {spotifyMatchProgress && (
+              <p className="empty-state spotify-play-hint">{spotifyMatchProgress}</p>
             )}
             <InfoPopup message={ytMusicPlayHint} onClose={() => setYtMusicPlayHint(null)} />
             {ytMusicPushPanelOpen && (
@@ -2934,13 +3219,7 @@ function App() {
                 </div>
                 {libraryTracks.length === 0 ? (
                   <p className="empty-state">
-                    {libraryLoading
-                      ? 'Loading…'
-                      : playlistTracksRestricted
-                        ? "Spotify doesn't allow browsing individual tracks in a playlist you don't own — use Play All / Shuffle above to play the whole playlist."
-                        : drill?.by === 'playlist'
-                          ? 'This playlist has no tracks.'
-                          : 'No tracks found. Open Settings to scan a library folder.'}
+                    {libraryLoading ? 'Loading…' : 'No tracks found. Open Settings to scan a library folder.'}
                   </p>
                 ) : (
                   <div className={`tracks-grid${trackViewStyle === 'grid' ? ' grid-view' : ''}`}>
@@ -2961,12 +3240,8 @@ function App() {
               <div className={`groups-grid${trackViewStyle === 'grid' ? ' grid-view' : ''}`}>
                 {groupsLoading ? (
                   <p className="empty-state">Loading…</p>
-                ) : libraryMode === 'playlist' && !spotifyConnected ? (
-                  <p className="empty-state">Connect Spotify in Settings to browse your playlists.</p>
-                ) : libraryMode === 'ytmusic-playlist' && !ytMusicConnected ? (
-                  <p className="empty-state">Connect YouTube Music in Settings to browse your playlists.</p>
                 ) : groups.length === 0 ? (
-                  <p className="empty-state">No {libraryMode === 'ytmusic-playlist' ? 'YouTube Music playlist' : libraryMode}s found.</p>
+                  <p className="empty-state">No {libraryMode}s found.</p>
                 ) : (
                   groups.map((g) => (
                     <div key={g.key} className="group-card">
@@ -3040,6 +3315,205 @@ function App() {
                   </div>
                 )}
               </div>
+            )}
+          </section>
+        ) : activeTab === 'playlists' ? (
+          <section className="library-section playlists-section">
+            <InfoPopup message={spotifyPlayHint} onClose={() => setSpotifyPlayHint(null)} />
+            {spotifyMatchProgress && (
+              <p className="empty-state spotify-play-hint">{spotifyMatchProgress}</p>
+            )}
+            <div className="library-controls">
+              <div className="search-row">
+                <input
+                  type="text"
+                  className="search-input"
+                  placeholder={
+                    playlistsFlatView ? 'Search all tracks…' : drill ? 'Search this playlist’s tracks…' : 'Search playlists…'
+                  }
+                  value={playlistSearchInput}
+                  onChange={(e) => setPlaylistSearchInput(e.target.value)}
+                />
+                <div className="view-style-toggle">
+                  <button
+                    className={trackViewStyle === 'list' ? 'active' : ''}
+                    onClick={() => setTrackViewStyle('list')}
+                    aria-label="List view"
+                    title="List view"
+                  >
+                    &#9776;
+                  </button>
+                  <button
+                    className={trackViewStyle === 'grid' ? 'active' : ''}
+                    onClick={() => setTrackViewStyle('grid')}
+                    aria-label="Grid view"
+                    title="Grid view"
+                  >
+                    &#9638;
+                  </button>
+                </div>
+              </div>
+              <div className="view-tabs">
+                <button
+                  className={libraryMode === 'playlist' ? 'active' : ''}
+                  onClick={() => { setLibraryMode('playlist'); setDrill(null); setPlaylistSearchInput(''); }}
+                >
+                  <SpotifyIcon /> Spotify
+                </button>
+                <button
+                  className={libraryMode === 'ytmusic-playlist' ? 'active' : ''}
+                  onClick={() => { setLibraryMode('ytmusic-playlist'); setDrill(null); setPlaylistSearchInput(''); }}
+                >
+                  <YtMusicIcon /> YouTube Music
+                </button>
+                <span className="view-tabs-divider" />
+                <button
+                  className={!playlistsFlatView ? 'active' : ''}
+                  onClick={() => { setPlaylistsFlatView(false); setPlaylistSearchInput(''); }}
+                >
+                  By Playlist
+                </button>
+                <button
+                  className={playlistsFlatView ? 'active' : ''}
+                  onClick={() => { setPlaylistsFlatView(true); setDrill(null); setPlaylistSearchInput(''); }}
+                >
+                  All Tracks
+                </button>
+              </div>
+            </div>
+
+            {playlistsFlatView ? (
+              <>
+                <div className="library-header">
+                  <h2>
+                    Playing on:{' '}
+                    <span style={{ color: isPlaying ? '#16a34a' : 'var(--text-main)' }}>
+                      {outputDevice ? outputDevice.name : 'This Browser'}
+                    </span>
+                  </h2>
+                  {filteredFlatPlaylistTracks.length > 0 && (
+                    <div className="group-actions">
+                      <button className="group-action-btn" onClick={() => playAllPlaylistTracksFlat(filteredFlatPlaylistTracks)}>&#9654; Play All</button>
+                      <button className="group-action-btn" onClick={() => playAllPlaylistTracksFlat(filteredFlatPlaylistTracks, { shuffle: true })}>&#128256; Shuffle</button>
+                    </div>
+                  )}
+                  <span className="library-count">{filteredFlatPlaylistTracks.length.toLocaleString()} tracks</span>
+                </div>
+                <div className="empty-state playlist-cache-status">
+                  <span>
+                    {flatPlaylistRefreshedAt
+                      ? `Last updated ${new Date(flatPlaylistRefreshedAt).toLocaleString()}`
+                      : flatPlaylistTracksLoading ? 'Loading…' : ''}
+                  </span>
+                  <button
+                    type="button"
+                    className="load-more-btn"
+                    disabled={flatPlaylistTracksLoading}
+                    onClick={() => fetchAllPlaylistTracksFlat(true)}
+                  >
+                    {flatPlaylistTracksLoading ? 'Refreshing…' : 'Refresh'}
+                  </button>
+                </div>
+                {flatPlaylistSkippedCount > 0 && (
+                  <p className="empty-state spotify-play-hint">
+                    {flatPlaylistSkippedCount} playlist{flatPlaylistSkippedCount > 1 ? 's' : ''} you don't own couldn't be read individually and {flatPlaylistSkippedCount > 1 ? 'were' : 'was'} left out - use that playlist's own Play All/Shuffle from By Playlist view instead.
+                  </p>
+                )}
+                {flatPlaylistTracksLoading && flatPlaylistTracks.length === 0 ? (
+                  <p className="empty-state">Loading…</p>
+                ) : filteredFlatPlaylistTracks.length === 0 ? (
+                  <p className="empty-state">
+                    {playlistSearchLower ? `No tracks match "${playlistSearchInput}".` : 'No tracks found.'}
+                  </p>
+                ) : (
+                  <div className={`tracks-grid${trackViewStyle === 'grid' ? ' grid-view' : ''}`}>
+                    {filteredFlatPlaylistTracks.map((track) => renderTrackCard(track, filteredFlatPlaylistTracks))}
+                  </div>
+                )}
+              </>
+            ) : (
+              <>
+                {drill && (
+                  <div className="drill-header">
+                    <button className="back-btn" onClick={() => { setDrill(null); setPlaylistSearchInput(''); }}>&larr; Back to {backLabel}</button>
+                    <h2>{drill.label}</h2>
+                    <div className="group-actions">
+                      <button className="group-action-btn" onClick={() => playGroup(drill)}>&#9654; Play All</button>
+                      <button className="group-action-btn" onClick={() => playGroup(drill, { shuffle: true })}>&#128256; Shuffle</button>
+                    </div>
+                  </div>
+                )}
+
+                {!drill && (
+                  <div className="library-header">
+                    <h2>
+                      Playing on:{' '}
+                      <span style={{ color: isPlaying ? '#16a34a' : 'var(--text-main)' }}>
+                        {outputDevice ? outputDevice.name : 'This Browser'}
+                      </span>
+                    </h2>
+                  </div>
+                )}
+
+                {drill ? (
+                  filteredPlaylistTracks.length === 0 ? (
+                    <p className="empty-state">
+                      {libraryLoading
+                        ? 'Loading…'
+                        : playlistTracksRestricted
+                          ? "Spotify doesn't allow browsing individual tracks in a playlist you don't own — use Play All / Shuffle above to play the whole playlist."
+                          : playlistSearchLower
+                            ? `No tracks match "${playlistSearchInput}".`
+                            : 'This playlist has no tracks.'}
+                    </p>
+                  ) : (
+                    <div className={`tracks-grid${trackViewStyle === 'grid' ? ' grid-view' : ''}`}>
+                      {filteredPlaylistTracks.map((track) => renderTrackCard(track, filteredPlaylistTracks))}
+                    </div>
+                  )
+                ) : (
+                  <div className={`groups-grid${trackViewStyle === 'grid' ? ' grid-view' : ''}`}>
+                    {groupsLoading ? (
+                      <p className="empty-state">Loading…</p>
+                    ) : libraryMode === 'playlist' && !spotifyConnected ? (
+                      <p className="empty-state">Connect Spotify in Settings to browse your playlists.</p>
+                    ) : libraryMode === 'ytmusic-playlist' && !ytMusicConnected ? (
+                      <p className="empty-state">Connect YouTube Music in Settings to browse your playlists.</p>
+                    ) : filteredPlaylistGroups.length === 0 ? (
+                      <p className="empty-state">
+                        {playlistSearchLower
+                          ? `No playlists match "${playlistSearchInput}".`
+                          : `No ${libraryMode === 'ytmusic-playlist' ? 'YouTube Music playlist' : 'Spotify playlist'}s found.`}
+                      </p>
+                    ) : (
+                      filteredPlaylistGroups.map((g) => (
+                        <div key={g.key} className="group-card">
+                          <div className="group-thumb-wrap">
+                            <span className="group-thumb-fallback">{g.label.charAt(0).toUpperCase()}</span>
+                            {(g.artwork_url || g.sample_track_id != null) && (
+                              <img
+                                className="group-thumb"
+                                src={g.artwork_url || `${API_BASE_URL}/tracks/${g.sample_track_id}/artwork`}
+                                alt=""
+                                loading="lazy"
+                                onError={(e) => { e.target.style.display = 'none'; }}
+                              />
+                            )}
+                          </div>
+                          <div className="group-card-main" onClick={() => { setDrill({ by: libraryMode, key: g.key, label: g.label }); setPlaylistSearchInput(''); }}>
+                            <h3>{g.label}</h3>
+                            <span className="group-count">{g.count.toLocaleString()} tracks</span>
+                          </div>
+                          <div className="group-card-actions">
+                            <button title="Play all" onClick={() => playGroup({ by: libraryMode, key: g.key })}>&#9654;</button>
+                            <button title="Shuffle" onClick={() => playGroup({ by: libraryMode, key: g.key }, { shuffle: true })}>&#128256;</button>
+                          </div>
+                        </div>
+                      ))
+                    )}
+                  </div>
+                )}
+              </>
             )}
           </section>
         ) : activeTab === 'taste' ? (
@@ -3154,7 +3628,7 @@ function channelLabel(channels) {
   return `${channels}ch`;
 }
 
-function YtMusicSettingsSection({ ytMusicConnected, apiBase, onConnected, onDisconnect }) {
+function YtMusicSettingsSection({ ytMusicConnected, apiBase, onConnected, onDisconnect, matchPrewarmStatus }) {
   const [pairing, setPairing] = useState(null); // { verification_url, user_code } while a device-code login is in progress
   const [error, setError] = useState(null);
   const pollRef = useRef(null);
@@ -3199,6 +3673,19 @@ function YtMusicSettingsSection({ ytMusicConnected, apiBase, onConnected, onDisc
     return (
       <>
         <p className="hint">Connected. Discover playlists can be pushed to YouTube Music above.</p>
+        {matchPrewarmStatus && matchPrewarmStatus.status !== 'idle' && (
+          <p className="hint">
+            Resolving Spotify matches for YouTube Music playlist tracks (All Tracks mode): {matchPrewarmStatus.status === 'done'
+              ? `done — ${(matchPrewarmStatus.matched || 0).toLocaleString()} matched of ${(matchPrewarmStatus.processed || 0).toLocaleString()} checked`
+              : matchPrewarmStatus.status === 'waiting_active_use'
+                ? 'paused while the app is in use'
+                : matchPrewarmStatus.status === 'waiting_not_connected'
+                  ? 'paused (Spotify not connected)'
+                  : matchPrewarmStatus.status === 'error'
+                    ? `error: ${matchPrewarmStatus.error}`
+                    : `running — ${(matchPrewarmStatus.matched || 0).toLocaleString()} matched of ${(matchPrewarmStatus.processed || 0).toLocaleString()} checked so far`}
+          </p>
+        )}
         <button type="button" className="scan-btn" onClick={onDisconnect}>Disconnect YouTube Music</button>
       </>
     );
@@ -3230,6 +3717,7 @@ function SettingsPanel({
   spotifyConnected, onSpotifyDisconnect, ytMusicConnected, onYtMusicConnected, onYtMusicDisconnect,
 }) {
   const [prewarmStatus, setPrewarmStatus] = useState(null);
+  const [matchPrewarmStatus, setMatchPrewarmStatus] = useState(null);
 
   useEffect(() => {
     if (!spotifyConnected) return;
@@ -3243,6 +3731,22 @@ function SettingsPanel({
     const intervalId = setInterval(poll, 10000);
     return () => { cancelled = true; clearInterval(intervalId); };
   }, [spotifyConnected, apiBase]);
+
+  // Resolves a Spotify match for cached YouTube Music playlist tracks in the
+  // background (see playlist_match_prewarm.py) - only meaningful once both
+  // are connected, since it needs Spotify to match against.
+  useEffect(() => {
+    if (!spotifyConnected || !ytMusicConnected) return;
+    let cancelled = false;
+    const poll = () => {
+      axios.get(`${apiBase}/playlists/match-prewarm/status`).then((response) => {
+        if (!cancelled) setMatchPrewarmStatus(response.data);
+      }).catch((err) => console.error('Error fetching playlist match pre-warm status:', err));
+    };
+    poll();
+    const intervalId = setInterval(poll, 10000);
+    return () => { cancelled = true; clearInterval(intervalId); };
+  }, [spotifyConnected, ytMusicConnected, apiBase]);
 
   return (
     <div className="settings-overlay" onClick={onClose}>
@@ -3341,6 +3845,7 @@ function SettingsPanel({
             apiBase={apiBase}
             onConnected={onYtMusicConnected}
             onDisconnect={onYtMusicDisconnect}
+            matchPrewarmStatus={matchPrewarmStatus}
           />
         </div>
       </div>
@@ -3428,20 +3933,29 @@ function PlayerBar({
 
   const destinationLabel = outputDevice ? outputDevice.name : 'This Browser';
   const deviceIcon = (d) => (d.type === 'chromecast' ? '📺' : d.type === 'spotify' ? '🟢' : '📡');
-  // Discover suggestions have no known_tracks row, so there's nothing for the
-  // id-based artwork endpoint to serve - only fall back to it for real
-  // library/Spotify tracks.
-  const trackArtworkUrl = (t) => t.artwork_url || (t.source === 'discover' ? '' : `${apiBase}/tracks/${t.id}/artwork`);
-  // track.id is a Spotify uri (not a real local track id) whenever the
-  // current track is a Spotify catalog match - "This Browser" can only ever
-  // stream a real local file, so it needs the *local* id. local_id bridges
-  // that for a track that started life as a local-library match
-  // (mapMatchedLocalTrack); a genuine Spotify playlist/context track (no
-  // local_id) has no local file to fall back to at all - nothing this
-  // browser can play. A discover-preview track (source 'discover') is a
-  // third case, handled separately below via its own preview_url - it was
-  // never a local_id candidate to begin with.
-  const localStreamId = track.source === 'spotify' ? (track.local_id ?? null)
+  // Discover/Spotify/YT-Music-sourced tracks have no known_tracks row of
+  // their own - t.id is a Spotify uri or YouTube video_id for those, not
+  // the integer local track id this endpoint expects (confirmed live: a
+  // guaranteed 422 whenever such a track had no artwork_url of its own).
+  // local_id bridges the cross-referenced case where the same track also
+  // exists locally; otherwise there's nothing to serve.
+  const trackArtworkUrl = (t) => t.artwork_url || (
+    (t.source === 'spotify' || t.source === 'ytmusic') ? (t.local_id != null ? `${apiBase}/tracks/${t.local_id}/artwork` : '')
+      : t.source === 'discover' ? ''
+        : `${apiBase}/tracks/${t.id}/artwork`
+  );
+  // track.id is a Spotify uri or YouTube video_id (not a real local track
+  // id) whenever the current track is a Spotify/YT Music catalog/playlist
+  // track - "This Browser" can only ever stream a real local file, so it
+  // needs the *local* id. local_id bridges that for a track that started
+  // life as a local-library match (mapMatchedLocalTrack) or turned out to
+  // also exist locally via the cross-reference (mapSpotifyTrack/
+  // mapYtMusicTrack's local_track_id passthrough); a genuine
+  // Spotify/YT-only track (no local_id) has no local file to fall back to
+  // at all - nothing this browser can play. A discover-preview track
+  // (source 'discover') is a third case, handled separately below via its
+  // own preview_url - it was never a local_id candidate to begin with.
+  const localStreamId = track.source === 'spotify' || track.source === 'ytmusic' ? (track.local_id ?? null)
     : track.source === 'discover' ? null
     : track.id;
 
@@ -3737,7 +4251,11 @@ function PlayerBar({
             }}
           />
         ) : (
-          <p className="player-no-local-file">This track is only on Spotify - select a Spotify Connect device to play it.</p>
+          <p className="player-no-local-file">
+            {track.source === 'ytmusic'
+              ? 'This track has no local copy - select a Spotify Connect device, or open it on YouTube Music.'
+              : 'This track is only on Spotify - select a Spotify Connect device to play it.'}
+          </p>
         ))}
       </div>
     </div>

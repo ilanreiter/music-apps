@@ -11,6 +11,8 @@ from .database import (
     enqueue_ytmusic_push_job, get_active_ytmusic_push_job, get_next_queued_ytmusic_push_job,
     count_queued_ytmusic_push_jobs, has_pending_ytmusic_push_work,
     list_pending_ytmusic_push_jobs, delete_ytmusic_push_job,
+    get_playlist_track_cache, replace_playlist_track_cache,
+    find_known_track_external_match, backfill_known_track_ids, backfill_ytmusic_cache_match,
 )
 from .library_scanner import run_scan
 from .artwork import get_or_create_thumbnail, check_artwork_presence, cache_key_for, normalize_album_name, normalized_album_sql, save_thumbnail
@@ -27,6 +29,7 @@ from . import ytmusic_connect
 from . import ytmusic_push_job
 from . import external_artwork
 from . import spotify_prewarm
+from . import playlist_match_prewarm
 from . import tag_cleanup
 from . import playback_advancer
 from . import shazam_identify
@@ -123,6 +126,23 @@ external_artwork_progress = {"status": "idle"}
 
 spotify_prewarm_lock = threading.Lock()
 spotify_prewarm_progress = {"status": "idle"}
+
+# Resolves a Spotify match for every cached YouTube Music playlist track that
+# doesn't have one yet (see playlist_match_prewarm.py) - same idle-gated
+# lock+progress-dict shape as spotify_prewarm above, for the same reasons.
+playlist_match_prewarm_lock = threading.Lock()
+playlist_match_prewarm_progress = {"status": "idle"}
+
+# Guards the two /playlists/all-tracks routes' refresh path (fetch-live then
+# replace_playlist_track_cache) - confirmed live this is a real risk, not
+# theoretical: two overlapping refreshes for the same platform each fetch
+# their own snapshot of "every track that should exist" independently, then
+# each deletes any cached row *not* in their own snapshot. Interleaved, the
+# second's delete can wipe out rows the first just wrote (from a playlist the
+# second's own fetch happened to race past), silently truncating the cache
+# well below the real track count with no error anywhere. Serializing the
+# whole fetch+replace per platform behind this lock closes that window.
+_playlist_cache_refresh_locks = {'spotify': threading.Lock(), 'ytmusic': threading.Lock()}
 
 # No in-memory progress dict for this one, unlike the jobs above - its state
 # (status/counters) lives entirely in the ytmusic_push_job Postgres row (see
@@ -264,6 +284,12 @@ class ExternalArtworkStatus(BaseModel):
     error: Optional[str] = None
 
 class SpotifyPrewarmStatus(BaseModel):
+    status: str  # idle | running | waiting_active_use | waiting_not_connected | done | error
+    processed: Optional[int] = None
+    matched: Optional[int] = None
+    error: Optional[str] = None
+
+class PlaylistMatchPrewarmStatus(BaseModel):
     status: str  # idle | running | waiting_active_use | waiting_not_connected | done | error
     processed: Optional[int] = None
     matched: Optional[int] = None
@@ -418,6 +444,14 @@ class SpotifyTrack(BaseModel):
     album: Optional[str] = None
     duration_ms: Optional[int] = None
     artwork_url: Optional[str] = None
+    # Set when this same track also exists as a local file (see
+    # _attach_spotify_track_extras) - lets the frontend play it locally
+    # instead of requiring a Spotify Connect device.
+    local_track_id: Optional[int] = None
+    # Set when this same track is also known to be on YouTube Music (see
+    # _attach_spotify_track_extras) - backs the Playlists tab's
+    # cross-service availability badge.
+    matched_ytmusic_video_id: Optional[str] = None
 
 class SpotifyMatchResult(BaseModel):
     matched: bool
@@ -476,6 +510,22 @@ async def startup_event():
             if remaining > 0:
                 print(f"Resuming Spotify pre-warm in the background ({remaining} tracks not yet checked).")
                 _start_spotify_prewarm_background()
+
+    # Same idea for the YT-Music-to-Spotify match backfill: only useful once
+    # a YT Music "All Tracks" cache actually exists with unmatched rows in it.
+    if spotify_connect.is_connected():
+        conn = get_db_connection()
+        if conn:
+            try:
+                cur = conn.cursor()
+                cur.execute("SELECT COUNT(*) FROM playlist_track_cache WHERE platform = 'ytmusic' AND matched_at IS NULL")
+                remaining = cur.fetchone()[0]
+                cur.close()
+            finally:
+                conn.close()
+            if remaining > 0:
+                print(f"Resuming playlist match pre-warm in the background ({remaining} YouTube Music tracks not yet checked).")
+                _start_playlist_match_prewarm_background()
 
     # Same auto-resume principle for the paced YouTube Music push queue (see
     # ytmusic_push_job.py) - each job's progress lives entirely in its own
@@ -1224,14 +1274,25 @@ def list_spotify_devices():
 @app.post("/api/spotify/devices/{device_id}/play")
 def spotify_play(device_id: str, params: SpotifyPlayRequest):
     _get_spotify_device_or_404(device_id)
-    if not spotify_connect.play(device_id, params.context_uri, params.track_uri, drain_queue=params.clear_queue):
+    result = spotify_connect.play(device_id, params.context_uri, params.track_uri, drain_queue=params.clear_queue)
+    # 'superseded' (a newer play()/play_uris() call for this device already
+    # took over) is not an error - a normal 200 here means the caller's own
+    # stale request simply has nothing further to do, rather than surfacing
+    # a misleading "couldn't reach Spotify" for what was actually just a
+    # race between two of the user's own quick actions.
+    if result == 'superseded':
+        return {"status": "superseded"}
+    if not result:
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Could not reach Spotify")
     return {"status": "playing"}
 
 @app.post("/api/spotify/devices/{device_id}/play-uris")
 def spotify_play_uris(device_id: str, params: SpotifyPlayUrisRequest):
     _get_spotify_device_or_404(device_id)
-    if not spotify_connect.play_uris(device_id, params.uris, drain_queue=params.clear_queue):
+    result = spotify_connect.play_uris(device_id, params.uris, drain_queue=params.clear_queue)
+    if result == 'superseded':
+        return {"status": "superseded"}
+    if not result:
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Could not reach Spotify")
     return {"status": "playing"}
 
@@ -1305,6 +1366,64 @@ def list_spotify_playlists():
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Spotify not connected")
     return spotify_connect.list_playlists()
 
+def _attach_spotify_track_extras(tracks):
+    """Bulk-enriches a live 'By Playlist' Spotify track list with the same
+    two cross-reference signals the cached 'All Tracks' route carries
+    (local_track_id, matched_ytmusic_video_id) - this route reads the live
+    API instead of the cache, so it does the equivalent joins fresh per
+    call. matched_ytmusic_video_id has two possible sources: the
+    known_tracks bridge (this track is also a local file with a resolved
+    YT match), or a reverse lookup against already-resolved ytmusic cache
+    rows (some YT Music playlist track was matched to this exact Spotify
+    id, independent of any local file). Two indexed queries, no external
+    API calls."""
+    ids = [t['uri'].split(':')[-1] for t in tracks]
+    if not ids:
+        return tracks
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT spotify_track_id, id, ytmusic_video_id FROM known_tracks WHERE spotify_track_id = ANY(%s)", (ids,))
+    known_by_id = {r[0]: (r[1], r[2]) for r in cur.fetchall()}
+    cur.execute(
+        "SELECT matched_spotify_uri, track_id FROM playlist_track_cache WHERE platform = 'ytmusic' AND matched_spotify_uri = ANY(%s)",
+        ([f"spotify:track:{i}" for i in ids],),
+    )
+    ytmusic_by_uri = dict(cur.fetchall())
+    cur.close()
+    conn.close()
+    for t, sid in zip(tracks, ids):
+        known = known_by_id.get(sid)
+        t['local_track_id'] = known[0] if known else None
+        t['matched_ytmusic_video_id'] = (known[1] if known else None) or ytmusic_by_uri.get(f"spotify:track:{sid}")
+    return tracks
+
+def _attach_ytmusic_track_extras(tracks):
+    """Mirror of _attach_spotify_track_extras above, for a live 'By
+    Playlist' YouTube Music track list. matched_spotify_uri here can come
+    from the known_tracks bridge or directly from this same track's own
+    playlist_track_cache row (kept fresh by playlist_match_prewarm/
+    discover-match/bulk_backfill_cross_platform_matches)."""
+    ids = [t['video_id'] for t in tracks]
+    if not ids:
+        return tracks
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT ytmusic_video_id, id, spotify_track_id FROM known_tracks WHERE ytmusic_video_id = ANY(%s)", (ids,))
+    known_by_id = {r[0]: (r[1], r[2]) for r in cur.fetchall()}
+    cur.execute(
+        "SELECT track_id, matched_spotify_uri FROM playlist_track_cache WHERE platform = 'ytmusic' AND track_id = ANY(%s)",
+        (ids,),
+    )
+    cached_by_id = dict(cur.fetchall())
+    cur.close()
+    conn.close()
+    for t, vid in zip(tracks, ids):
+        known = known_by_id.get(vid)
+        t['local_track_id'] = known[0] if known else None
+        spotify_from_known = f"spotify:track:{known[1]}" if known and known[1] else None
+        t['matched_spotify_uri'] = cached_by_id.get(vid) or spotify_from_known
+    return tracks
+
 @app.get("/api/spotify/playlists/{playlist_id}/tracks", response_model=List[SpotifyTrack])
 def get_spotify_playlist_tracks(playlist_id: str):
     if not spotify_connect.is_connected():
@@ -1315,7 +1434,33 @@ def get_spotify_playlist_tracks(playlist_id: str):
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Spotify doesn't allow reading the track listing of a playlist you don't own - play it directly instead",
         )
-    return tracks
+    return _attach_spotify_track_extras(tracks)
+
+class PlaylistAllTracksResponse(BaseModel):
+    tracks: List[Dict[str, Any]]
+    skipped_count: int = 0
+    refreshed_at: Optional[str] = None
+
+@app.get("/api/spotify/playlists/all-tracks", response_model=PlaylistAllTracksResponse)
+def get_spotify_all_playlist_tracks(refresh: bool = False):
+    """Backs the Playlists tab's "All Tracks" mode - cached in the database
+    (see database.playlist_track_cache) since flattening every playlist live
+    is an N+1 fetch (one round trip per playlist) that used to make this
+    view slow to open every time. Served from cache unconditionally unless
+    refresh=true is passed (the tab's own Refresh button). Each track also
+    carries isrc/popularity/explicit/release_date/genre - all free off the
+    same playlist-items response except genre, which costs one batched
+    request per ~50 unique artists (see spotify_connect.get_artist_genres)."""
+    if not spotify_connect.is_connected():
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Spotify not connected")
+    if not refresh:
+        cached = get_playlist_track_cache('spotify')
+        if cached:
+            return cached
+    with _playlist_cache_refresh_locks['spotify']:
+        tracks, skipped = spotify_connect.get_all_playlist_tracks()
+        replace_playlist_track_cache('spotify', tracks, skipped)
+    return get_playlist_track_cache('spotify')
 
 def _create_spotify_playlist_from_uris(name, uris, skipped):
     """Shared tail for both playlist-creation routes below - create the
@@ -1419,6 +1564,15 @@ class YtMusicPlaylistTrack(BaseModel):
     track_name: str
     artist_name: Optional[str] = None
     artwork_url: Optional[str] = None
+    # Set when this same track also exists as a local file (see
+    # _attach_ytmusic_track_extras) - lets the frontend play it locally
+    # instead of requiring a live YouTube tab.
+    local_track_id: Optional[int] = None
+    # Set when this same video is already known to match a Spotify catalog
+    # track (see _attach_ytmusic_track_extras) - lets a click skip the live
+    # discover-match search, and backs the Playlists tab's cross-service
+    # availability badge.
+    matched_spotify_uri: Optional[str] = None
 
 @app.get("/api/ytmusic/playlists", response_model=List[YtMusicPlaylist])
 def list_ytmusic_playlists():
@@ -1439,7 +1593,26 @@ def get_ytmusic_playlist_tracks(playlist_id: str):
     tracks = ytmusic_connect.get_playlist_tracks(playlist_id)
     if tracks is None:
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Could not read this playlist's tracks")
-    return tracks
+    return _attach_ytmusic_track_extras(tracks)
+
+@app.get("/api/ytmusic/playlists/all-tracks", response_model=PlaylistAllTracksResponse)
+def get_ytmusic_all_playlist_tracks(refresh: bool = False):
+    """Same caching approach as the Spotify equivalent above. A refresh here
+    can introduce new unmatched rows (new/changed playlist tracks), so it
+    kicks the Spotify-match background job in case it's gone idle/done -
+    _start_playlist_match_prewarm_background is a no-op if one's already
+    running."""
+    if not ytmusic_connect.is_connected():
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="YouTube Music not connected")
+    if not refresh:
+        cached = get_playlist_track_cache('ytmusic')
+        if cached:
+            return cached
+    with _playlist_cache_refresh_locks['ytmusic']:
+        tracks, skipped = ytmusic_connect.get_all_playlist_tracks()
+        replace_playlist_track_cache('ytmusic', tracks, skipped)
+    _start_playlist_match_prewarm_background()
+    return get_playlist_track_cache('ytmusic')
 
 @app.post("/api/ytmusic/auth/start")
 def ytmusic_auth_start():
@@ -1550,7 +1723,7 @@ def _match_track_to_spotify(db, track_id):
     SpotifyMatchResult, or None if track_id doesn't exist in known_tracks."""
     cur = db.cursor()
     cur.execute(
-        "SELECT track_name, artist_name, spotify_track_id, spotify_checked, spotify_album_art_url, file_path, isrc "
+        "SELECT track_name, artist_name, spotify_track_id, spotify_checked, spotify_album_art_url, file_path, isrc, ytmusic_video_id "
         "FROM known_tracks WHERE id = %s",
         (track_id,),
     )
@@ -1558,13 +1731,33 @@ def _match_track_to_spotify(db, track_id):
     if not row:
         cur.close()
         return None
-    track_name, artist_name, cached_id, checked, cached_art, file_path, isrc = row
+    track_name, artist_name, cached_id, checked, cached_art, file_path, isrc, ytmusic_video_id = row
 
     if checked:
         cur.close()
         if not cached_id:
             return {"matched": False, "reason": "no_match"}
         return {"matched": True, "uri": f"spotify:track:{cached_id}", "artwork_url": cached_art}
+
+    # Exact-id cross-reference before a live search - if this same track was
+    # already matched to Spotify via a YT Music playlist (playlist_match_prewarm
+    # or the discover-match route below), reuse that instead of searching
+    # again. Symmetric to playlist_match_prewarm's own known_tracks check.
+    if ytmusic_video_id:
+        cur.execute(
+            "SELECT matched_spotify_uri, artwork_url FROM playlist_track_cache WHERE platform = 'ytmusic' AND track_id = %s",
+            (ytmusic_video_id,),
+        )
+        cache_row = cur.fetchone()
+        if cache_row and cache_row[0]:
+            spotify_id = cache_row[0].split(':')[-1]
+            cur.execute(
+                "UPDATE known_tracks SET spotify_track_id = %s, spotify_url = %s, spotify_album_art_url = %s, spotify_checked = TRUE WHERE id = %s",
+                (spotify_id, f"https://open.spotify.com/track/{spotify_id}", cache_row[1], track_id),
+            )
+            db.commit()
+            cur.close()
+            return {"matched": True, "uri": cache_row[0], "artwork_url": cache_row[1]}
 
     result, match, identified = spotify_connect.search_track(track_name, artist_name, file_path=file_path, known_isrc=isrc)
     if identified:
@@ -1630,6 +1823,12 @@ def _match_track_to_spotify(db, track_id):
     db.commit()
     cur.close()
 
+    if match and ytmusic_video_id:
+        # Completes the cross-reference from this direction too - a YT Music
+        # playlist track sharing this exact video_id never has to search
+        # Spotify itself now (see playlist_match_prewarm.py).
+        backfill_ytmusic_cache_match(ytmusic_video_id, match['uri'])
+
     if not match:
         return {"matched": False, "reason": "no_match"}
     return {"matched": True, "uri": match['uri'], "artwork_url": match['artwork_url']}
@@ -1648,14 +1847,45 @@ class DiscoverTrackMatchRequest(BaseModel):
     artist_name: str
     native_track_name: Optional[str] = None
     native_artist_name: Optional[str] = None
+    # Set only for a YouTube Music playlist track (never a pure-text Discover
+    # suggestion, which has no such id) - lets this route do an exact-id
+    # cross-reference before falling back to fuzzy search, and write the
+    # result back to known_tracks/playlist_track_cache so it's never
+    # searched for again from any path.
+    ytmusic_video_id: Optional[str] = None
 
 @app.post("/api/spotify/discover-match", response_model=SpotifyMatchResult)
 def match_discovered_track_to_spotify(params: DiscoverTrackMatchRequest):
     """Same catalog search as the local-library matcher above, but for a
-    Discover-tab suggestion that has no known_tracks row to read from or
-    cache into - nothing to persist, it's a one-off ephemeral lookup."""
+    Discover-tab suggestion or a YouTube Music playlist track - neither has
+    a known_tracks row of its own to read a cached match from directly, but
+    a YT Music track (ytmusic_video_id given) can still short-circuit via an
+    exact-id cross-reference against known_tracks/playlist_track_cache
+    before ever searching. Pure-text Discover suggestions (no
+    ytmusic_video_id) have no id to cross-reference and stay a one-off
+    ephemeral lookup, same as before."""
     if not spotify_connect.is_connected():
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Spotify not connected")
+
+    known_match = None
+    if params.ytmusic_video_id:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT matched_spotify_uri FROM playlist_track_cache WHERE platform = 'ytmusic' AND track_id = %s",
+            (params.ytmusic_video_id,),
+        )
+        cache_row = cur.fetchone()
+        cur.close()
+        conn.close()
+        if cache_row and cache_row[0]:
+            return {"matched": True, "uri": cache_row[0], "artwork_url": None}
+        known_match = find_known_track_external_match(ytmusic_video_id=params.ytmusic_video_id)
+        if known_match and known_match['spotify_track_id']:
+            uri = f"spotify:track:{known_match['spotify_track_id']}"
+            backfill_ytmusic_cache_match(params.ytmusic_video_id, uri)
+            return {"matched": True, "uri": uri, "artwork_url": None}
+
     # Confirmed empirically against iTunes/Deezer (both back the same catalog
     # data Spotify draws from) for Hebrew: an artist with an established
     # international presence is indexed under their *romanized* name (e.g.
@@ -1676,7 +1906,16 @@ def match_discovered_track_to_spotify(params: DiscoverTrackMatchRequest):
         if result == 'unavailable':
             return {"matched": False, "reason": "unavailable"}
         if match:
+            if params.ytmusic_video_id:
+                backfill_ytmusic_cache_match(params.ytmusic_video_id, match['uri'])
+                if known_match:
+                    backfill_known_track_ids(known_match['id'], spotify_track_id=match['uri'].split(':')[-1])
             return {"matched": True, "uri": match['uri'], "artwork_url": match.get('artwork_url')}
+    if params.ytmusic_video_id:
+        # A settled "no match" is still worth recording - so the background
+        # prewarm job (which treats matched_at IS NULL as "not tried yet")
+        # doesn't redundantly re-search this same track later.
+        backfill_ytmusic_cache_match(params.ytmusic_video_id, None)
     return {"matched": False, "reason": "no_match"}
 
 class DiscoverPreviewRequest(BaseModel):
@@ -1746,6 +1985,48 @@ async def get_spotify_prewarm_stats(db: psycopg2.extensions.connection = Depends
     cur.execute("SELECT COUNT(*) FROM known_tracks WHERE spotify_checked IS TRUE")
     checked = cur.fetchone()[0]
     cur.execute("SELECT COUNT(*) FROM known_tracks WHERE spotify_track_id IS NOT NULL")
+    matched = cur.fetchone()[0]
+    cur.close()
+    return {"total": total, "checked": checked, "matched": matched}
+
+def _start_playlist_match_prewarm_background():
+    """Kicks off the background YT-Music-to-Spotify match job if one isn't
+    already running - same non-blocking-lock pattern as
+    _start_spotify_prewarm_background, for the same reason (a run interrupted
+    by a container rebuild needs to auto-resume, since the in-memory
+    lock/progress don't survive the process exiting)."""
+    if not playlist_match_prewarm_lock.acquire(blocking=False):
+        return False
+    try:
+        playlist_match_prewarm_progress.clear()
+        playlist_match_prewarm_progress.update(status="running")
+
+        def _run():
+            try:
+                playlist_match_prewarm.run(playlist_match_prewarm_progress, _is_idle)
+            finally:
+                playlist_match_prewarm_lock.release()
+
+        threading.Thread(target=_run, daemon=True).start()
+        return True
+    except Exception:
+        playlist_match_prewarm_lock.release()
+        raise
+
+@app.get("/api/playlists/match-prewarm/status", response_model=PlaylistMatchPrewarmStatus)
+async def get_playlist_match_prewarm_status():
+    return playlist_match_prewarm_progress
+
+@app.get("/api/playlists/match-prewarm/stats")
+async def get_playlist_match_prewarm_stats(db: psycopg2.extensions.connection = Depends(get_db)):
+    # Same "cumulative across restarts" reasoning as get_spotify_prewarm_stats
+    # above - playlist_match_prewarm_progress only tracks this run's own counts.
+    cur = db.cursor()
+    cur.execute("SELECT COUNT(*) FROM playlist_track_cache WHERE platform = 'ytmusic'")
+    total = cur.fetchone()[0]
+    cur.execute("SELECT COUNT(*) FROM playlist_track_cache WHERE platform = 'ytmusic' AND matched_at IS NOT NULL")
+    checked = cur.fetchone()[0]
+    cur.execute("SELECT COUNT(*) FROM playlist_track_cache WHERE platform = 'ytmusic' AND matched_spotify_uri IS NOT NULL")
     matched = cur.fetchone()[0]
     cur.close()
     return {"total": total, "checked": checked, "matched": matched}

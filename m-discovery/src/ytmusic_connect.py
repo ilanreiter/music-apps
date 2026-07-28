@@ -1,4 +1,5 @@
 import os
+import re
 import time
 
 import requests
@@ -442,8 +443,16 @@ def get_playlist_tracks(playlist_id):
         snippet = entry.get('snippet') or {}
         video_id = (snippet.get('resourceId') or {}).get('videoId')
         title = snippet.get('title')
-        if not video_id or not title:
-            continue  # a deleted/private video still occupies a position but has nothing playable
+        # A deleted/private video still occupies a position but has nothing
+        # playable - confirmed live this is NOT always an empty title as the
+        # `not title` check below assumes: YouTube returns the literal string
+        # "Private video"/"Deleted video" as snippet.title for these, which
+        # is truthy. Caught this because it was polluting the Playlists tab's
+        # "All Tracks" cache (296 of ~5,257 tracks on this account) and would
+        # have wasted that many pointless Spotify searches in
+        # playlist_match_prewarm on titles with no artist to match against.
+        if not video_id or not title or title in ('Private video', 'Deleted video'):
+            continue
         # snippet.channelTitle is the *playlist's own owner* (this account),
         # not the video's channel - confirmed live this is a real gotcha.
         # videoOwnerChannelTitle is the video's actual channel, which for a
@@ -461,3 +470,77 @@ def get_playlist_tracks(playlist_id):
             'artwork_url': thumbnail.get('url'),
         })
     return tracks
+
+
+_ISO8601_DURATION_RE = re.compile(r'^PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?$')
+
+
+def _iso8601_duration_to_ms(duration):
+    """YouTube's contentDetails.duration is ISO 8601 ('PT3M45S') - there's no
+    stdlib parser for this, and pulling in a dependency for one regex isn't
+    worth it."""
+    if not duration:
+        return None
+    match = _ISO8601_DURATION_RE.match(duration)
+    if not match:
+        return None
+    hours, minutes, seconds = (int(g) if g else 0 for g in match.groups())
+    return ((hours * 3600) + (minutes * 60) + seconds) * 1000
+
+
+def get_video_durations(video_ids):
+    """Batched duration lookup - videos.list accepts up to 50 ids per call
+    (same 1-unit-per-call cost as any other list operation), so this costs
+    one request per ~50 unique videos rather than one per track. Returns
+    {video_id: duration_ms}."""
+    tokens = _get_valid_token()
+    if not tokens:
+        return {}
+    durations = {}
+    unique_ids = list(dict.fromkeys(video_ids))
+    for i in range(0, len(unique_ids), 50):
+        batch = unique_ids[i:i + 50]
+        data = _api_request(
+            'GET', '/videos',
+            tokens['access_token'], params={'part': 'contentDetails', 'id': ','.join(batch)},
+        )
+        if not data:
+            continue
+        for item in data.get('items') or []:
+            video_id = item.get('id')
+            duration = (item.get('contentDetails') or {}).get('duration')
+            if video_id:
+                durations[video_id] = _iso8601_duration_to_ms(duration)
+    return durations
+
+
+def get_all_playlist_tracks():
+    """Every track across every playlist, deduped by video_id (the same video
+    in two playlists is genuinely the same track, not two rows) - backs the
+    Playlists tab's "All Tracks" mode. No 403-style restriction to skip here
+    (see get_playlist_tracks), so no skipped count - kept in the return shape
+    anyway for a uniform contract with spotify_connect.get_all_playlist_tracks.
+    Enriched with duration (batched lookup) - YouTube's public Data API has
+    no genre or ISRC for either platform to backfill, so those stay None;
+    album likewise doesn't exist for a YT Music playlist item at all."""
+    seen = {}
+    for p in list_playlists() or []:
+        tracks = get_playlist_tracks(p['id']) or []
+        for t in tracks:
+            if t['video_id'] not in seen:
+                seen[t['video_id']] = t
+    unique_tracks = list(seen.values())
+    durations = get_video_durations([t['video_id'] for t in unique_tracks])
+    return [{
+        'track_id': t['video_id'],
+        'track_name': t['track_name'],
+        'artist_name': t['artist_name'],
+        'album': None,
+        'artwork_url': t['artwork_url'],
+        'isrc': None,
+        'duration_ms': durations.get(t['video_id']),
+        'popularity': None,
+        'explicit': None,
+        'release_date': None,
+        'genre': None,
+    } for t in unique_tracks], 0
