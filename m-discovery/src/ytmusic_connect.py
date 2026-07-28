@@ -376,3 +376,88 @@ def create_playlist_and_push(name, tracks):
         'added': added,
         'skipped': len(tracks) - added,
     }
+
+
+def _paginate(path, params, token):
+    """YouTube Data API v3 pages via a pageToken param (not a full 'next'
+    URL the way Spotify's does) - reused by list_playlists/get_playlist_tracks
+    below. Both underlying calls (playlists.list, playlistItems.list) cost
+    just 1 quota unit each, unlike the 100/50-unit search/insert calls the
+    push feature has to ration carefully - no budget concern here even for a
+    playlist with hundreds of tracks."""
+    items = []
+    page_token = None
+    while True:
+        request_params = dict(params)
+        if page_token:
+            request_params['pageToken'] = page_token
+        data = _api_request('GET', path, token, params=request_params)
+        if not data:
+            break
+        items.extend(data.get('items', []))
+        page_token = data.get('nextPageToken')
+        if not page_token:
+            break
+    return items
+
+
+def list_playlists():
+    """The connected account's own YouTube playlists (includes ones this app
+    itself created via create_playlist_and_push/the paced push queue) -
+    mirrors spotify_connect.list_playlists's return shape."""
+    tokens = _get_valid_token()
+    if not tokens:
+        return None
+    raw = _paginate('/playlists', {'part': 'snippet,contentDetails', 'mine': 'true', 'maxResults': 50}, tokens['access_token'])
+    playlists = []
+    for p in raw:
+        snippet = p.get('snippet') or {}
+        thumbnails = snippet.get('thumbnails') or {}
+        thumbnail = thumbnails.get('medium') or thumbnails.get('default') or {}
+        playlists.append({
+            'id': p['id'],
+            'name': snippet.get('title'),
+            'track_count': (p.get('contentDetails') or {}).get('itemCount', 0),
+            'artwork_url': thumbnail.get('url'),
+        })
+    return playlists
+
+
+def get_playlist_tracks(playlist_id):
+    """List of track dicts for a playlist the connected account owns, or
+    None if not connected. Unlike Spotify, there's no "can't read a playlist
+    you don't own" restriction here - playlistItems.list on your own
+    playlist has no such gate, so (unlike spotify_connect.get_playlist_tracks)
+    this never needs to return None to signal a blocked read."""
+    tokens = _get_valid_token()
+    if not tokens:
+        return None
+    raw = _paginate(
+        '/playlistItems',
+        {'part': 'snippet,contentDetails', 'playlistId': playlist_id, 'maxResults': 50},
+        tokens['access_token'],
+    )
+    tracks = []
+    for entry in raw:
+        snippet = entry.get('snippet') or {}
+        video_id = (snippet.get('resourceId') or {}).get('videoId')
+        title = snippet.get('title')
+        if not video_id or not title:
+            continue  # a deleted/private video still occupies a position but has nothing playable
+        # snippet.channelTitle is the *playlist's own owner* (this account),
+        # not the video's channel - confirmed live this is a real gotcha.
+        # videoOwnerChannelTitle is the video's actual channel, which for a
+        # real release is normally the "<Artist> - Topic" auto-generated
+        # channel - same suffix-stripping _score_candidates already applies
+        # when scoring search results.
+        channel = snippet.get('videoOwnerChannelTitle') or ''
+        artist_name = channel[:-len(' - Topic')] if channel.endswith(' - Topic') else (channel or None)
+        thumbnails = snippet.get('thumbnails') or {}
+        thumbnail = thumbnails.get('medium') or thumbnails.get('default') or {}
+        tracks.append({
+            'video_id': video_id,
+            'track_name': title,
+            'artist_name': artist_name,
+            'artwork_url': thumbnail.get('url'),
+        })
+    return tracks

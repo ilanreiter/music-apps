@@ -1408,6 +1408,39 @@ def create_spotify_playlist_from_discovered(params: CreatePlaylistFromDiscovered
 def ytmusic_auth_status():
     return {"connected": ytmusic_connect.is_connected()}
 
+class YtMusicPlaylist(BaseModel):
+    id: str
+    name: Optional[str] = None
+    track_count: int = 0
+    artwork_url: Optional[str] = None
+
+class YtMusicPlaylistTrack(BaseModel):
+    video_id: str
+    track_name: str
+    artist_name: Optional[str] = None
+    artwork_url: Optional[str] = None
+
+@app.get("/api/ytmusic/playlists", response_model=List[YtMusicPlaylist])
+def list_ytmusic_playlists():
+    if not ytmusic_connect.is_connected():
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="YouTube Music not connected")
+    playlists = ytmusic_connect.list_playlists()
+    if playlists is None:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Could not read YouTube Music playlists")
+    return playlists
+
+@app.get("/api/ytmusic/playlists/{playlist_id}/tracks", response_model=List[YtMusicPlaylistTrack])
+def get_ytmusic_playlist_tracks(playlist_id: str):
+    """Unlike the Spotify equivalent, there's no "can't read a playlist you
+    don't own" restriction to handle here - playlistItems.list on your own
+    playlist has no such gate, so this never needs a 403 branch."""
+    if not ytmusic_connect.is_connected():
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="YouTube Music not connected")
+    tracks = ytmusic_connect.get_playlist_tracks(playlist_id)
+    if tracks is None:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Could not read this playlist's tracks")
+    return tracks
+
 @app.post("/api/ytmusic/auth/start")
 def ytmusic_auth_start():
     """Kicks off Google's device-code flow - unlike Spotify's redirect-based

@@ -4,11 +4,11 @@ import './App.css';
 
 const LIBRARY_PAGE_SIZE = 100;
 const GROUP_QUEUE_LIMIT = 500;
-const VIEW_MODES = ['all', 'album', 'genre', 'decade', 'quality', 'format', 'favorite', 'length', 'playlist'];
+const VIEW_MODES = ['all', 'album', 'genre', 'decade', 'quality', 'format', 'favorite', 'length', 'playlist', 'ytmusic-playlist'];
 const BACK_LABELS = {
   album: 'Albums', genre: 'Genres', decade: 'Decades',
   quality: 'Quality Tiers', format: 'Formats', favorite: 'Favorites', length: 'Lengths',
-  playlist: 'Playlists',
+  playlist: 'Playlists', 'ytmusic-playlist': 'YouTube Music Playlists',
 };
 
 // Adapts a Spotify API track into the same shape renderTrackCard/queue/now-playing
@@ -36,6 +36,23 @@ function mapSpotifyTrack(t) {
     artist_name: t.artists,
     album_name: t.album,
     duration_seconds: t.duration_ms != null ? t.duration_ms / 1000 : null,
+    artwork_url: t.artwork_url,
+  };
+}
+
+// Adapts a YouTube Music playlist item into the same card shape
+// renderTrackCard/queue/now-playing expect. video_id (not a Spotify uri or a
+// local numeric id) is what handleTrackPlayClick's 'ytmusic' branch and the
+// embedded player use to actually play it - matching/playing on Spotify
+// instead (also handled by that branch) resolves track_name/artist_name
+// through the existing text-only Spotify matching pipeline, same as Discover.
+function mapYtMusicTrack(t) {
+  return {
+    id: t.video_id,
+    source: 'ytmusic',
+    video_id: t.video_id,
+    track_name: t.track_name,
+    artist_name: t.artist_name,
     artwork_url: t.artwork_url,
   };
 }
@@ -1167,6 +1184,10 @@ function App() {
       if (drill) fetchSpotifyPlaylistTracks(drill.key); else fetchSpotifyPlaylistsAsGroups();
       return;
     }
+    if (libraryMode === 'ytmusic-playlist') {
+      if (drill) fetchYtMusicPlaylistTracks(drill.key); else fetchYtMusicPlaylistsAsGroups();
+      return;
+    }
     if (drill || libraryMode === 'all') {
       // If a shuffle mode is already active, a filter change re-shuffles the
       // new matching set rather than silently reverting to alphabetical
@@ -1439,6 +1460,41 @@ function App() {
       } else {
         console.error('Error fetching Spotify playlist tracks:', err);
       }
+      setLibraryTracks([]);
+      setLibraryTotal(0);
+      setLibraryAlbumCount(0);
+      setLibraryArtistCount(0);
+    } finally {
+      setLibraryLoading(false);
+    }
+  };
+
+  const fetchYtMusicPlaylistsAsGroups = async () => {
+    setGroupsLoading(true);
+    try {
+      const response = await axios.get(`${API_BASE_URL}/ytmusic/playlists`);
+      setGroups(response.data.map((p) => ({
+        key: p.id, label: p.name, count: p.track_count, artwork_url: p.artwork_url,
+      })));
+    } catch (err) {
+      console.error('Error fetching YouTube Music playlists:', err);
+      setGroups([]);
+    } finally {
+      setGroupsLoading(false);
+    }
+  };
+
+  const fetchYtMusicPlaylistTracks = async (playlistId) => {
+    setLibraryLoading(true);
+    try {
+      const response = await axios.get(`${API_BASE_URL}/ytmusic/playlists/${playlistId}/tracks`);
+      const tracks = response.data.map((t) => mapYtMusicTrack(t));
+      setLibraryTracks(tracks);
+      setLibraryTotal(tracks.length);
+      setLibraryAlbumCount(0); // YT Music playlist items carry no album metadata
+      setLibraryArtistCount(countDistinct(tracks, artistGroupKey));
+    } catch (err) {
+      console.error('Error fetching YouTube Music playlist tracks:', err);
       setLibraryTracks([]);
       setLibraryTotal(0);
       setLibraryAlbumCount(0);
@@ -1867,6 +1923,63 @@ function App() {
     }
   };
 
+  // Same shape as matchAndQueueDiscoveredTracksOnSpotify above, for YouTube
+  // Music playlist tracks - reuses the identical /api/spotify/discover-match
+  // endpoint (it's already generic text-in/match-out, no Discover-specific
+  // coupling) since a YT Music playlist item is the same
+  // title/channel-derived-artist text shape a Discover suggestion is.
+  const matchAndQueueYtMusicPlaylistTracksOnSpotify = async (candidates) => {
+    if (candidates.length === 0) return;
+    destNeedsInitialCastRef.current = false;
+    const requestId = ++spotifyMatchRequestIdRef.current;
+    let firstStarted = false;
+    let hitRateLimit = false;
+    setSpotifyPlayHint(`Searching Spotify for "${candidates[0].track_name}"…`);
+    for (const candidate of candidates) {
+      if (spotifyMatchRequestIdRef.current !== requestId) return;
+      setMatchingTrackId(candidate.id);
+      let matched, uri, artworkUrl, reason;
+      try {
+        const response = await axios.post(`${API_BASE_URL}/spotify/discover-match`, {
+          track_name: candidate.track_name, artist_name: candidate.artist_name,
+        });
+        ({ matched, uri, artwork_url: artworkUrl, reason } = response.data);
+      } catch (err) {
+        console.error('Error matching YouTube Music track to Spotify:', err);
+        break;
+      }
+      if (spotifyMatchRequestIdRef.current !== requestId) return;
+      if (!matched) {
+        if (reason === 'unavailable') {
+          hitRateLimit = true;
+          break;
+        }
+        continue;
+      }
+      const queueEntry = {
+        // ytmusic_id (not local_id/discover_id) carries the playlist card's
+        // own id back through, same bridging role discover_id plays for
+        // Discover suggestions - a YT Music playlist track has no local file
+        // to fall back to either, so it should behave like a genuine
+        // Spotify-only track once matched.
+        id: uri, source: 'spotify', uri, context_uri: null, ytmusic_id: candidate.id,
+        track_name: candidate.track_name, artist_name: candidate.artist_name, artwork_url: artworkUrl,
+      };
+      if (!firstStarted) {
+        startQueue([queueEntry]);
+        firstStarted = true;
+      } else {
+        setQueue((prev) => [...prev, queueEntry]);
+      }
+    }
+    if (spotifyMatchRequestIdRef.current === requestId) setMatchingTrackId(null);
+    if (!firstStarted && spotifyMatchRequestIdRef.current === requestId) {
+      setSpotifyPlayHint(hitRateLimit
+        ? "Spotify's search is temporarily rate-limited - try again later."
+        : `No Spotify match found for "${candidates[0].track_name}"${candidates.length > 1 ? ' or the tracks after it' : ''}.`);
+    }
+  };
+
   // Same shape as above, but for the 30-second-preview fallback (This
   // Browser only - previews never cast to a real device). Usually resolves
   // near-instantly since handleDiscoverFromLibrary already eagerly prefetched
@@ -2032,6 +2145,33 @@ function App() {
       }
       return;
     }
+    // YouTube Music playlist tracks: with a Spotify Connect destination,
+    // match+play (+queue the rest) on Spotify, same pipeline Discover uses.
+    // With This Browser selected, open the real video on music.youtube.com in
+    // a new tab instead of playing it in-app - an embedded IFrame player was
+    // tried and confirmed (live testing) to always fail with "Video
+    // unavailable" for every track even though the Data API reports them all
+    // embeddable=true and they play fine directly on YouTube; this points to
+    // YouTube's bot/integrity verification rejecting the embed context itself
+    // (this app runs on a plain-HTTP LAN IP, not a normal registered domain),
+    // not a per-video restriction, so there's no in-app fix. WiiM/Chromecast
+    // can do neither (same reasoning as Discover suggestions).
+    if (track.source === 'ytmusic') {
+      if (outputDevice?.type === 'spotify') {
+        const startIndex = list.findIndex((t) => t.id === track.id);
+        const candidates = startIndex >= 0 ? list.slice(startIndex) : [track];
+        matchAndQueueYtMusicPlaylistTracksOnSpotify(candidates);
+      } else if (!outputDevice) {
+        const playlistId = libraryMode === 'ytmusic-playlist' ? drill?.key : null;
+        const url = playlistId
+          ? `https://music.youtube.com/watch?v=${track.video_id}&list=${playlistId}`
+          : `https://music.youtube.com/watch?v=${track.video_id}`;
+        window.open(url, '_blank', 'noopener,noreferrer');
+      } else {
+        setSpotifyPlayHint('Select a Spotify Connect device, or switch to This Browser, to play YouTube Music playlist tracks.');
+      }
+      return;
+    }
     // Spotify tracks stream from Spotify's own servers to a Spotify Connect
     // device - there's no local file to hand to WiiM/Chromecast/this browser,
     // and the reverse (a local file to Spotify Connect) doesn't work either.
@@ -2060,7 +2200,7 @@ function App() {
     // highlights the right card either way. A previewing discover track
     // doesn't need bridging at all - its nowPlaying.id already equals the
     // card's own id (see sampleQueueDiscoveredTracks).
-    const nowPlayingId = nowPlaying && (nowPlaying.local_id ?? nowPlaying.discover_id ?? nowPlaying.id);
+    const nowPlayingId = nowPlaying && (nowPlaying.local_id ?? nowPlaying.discover_id ?? nowPlaying.ytmusic_id ?? nowPlaying.id);
     const isDiscover = track.source === 'discover';
     const isCurrent = nowPlayingId === track.id;
     const isCardPlaying = isCurrent && effectiveIsPlaying;
@@ -2268,6 +2408,35 @@ function App() {
       }
       return;
     }
+    // YouTube Music playlists were previously falling through to the generic
+    // local-library branch below (paramsForGroupKey has no 'ytmusic-playlist'
+    // case, so it silently queued nothing) - confirmed live this is why "Play
+    // All" did nothing. With a Spotify Connect destination, match+queue the
+    // whole playlist the same way an individual track does. With This Browser
+    // selected, there's no in-app playback path anymore (see the ytmusic
+    // branch of handleTrackPlayClick) - instead open the playlist's first
+    // video on music.youtube.com with list= set to this playlist's id, so
+    // YouTube's own player drives playback through the rest of the playlist
+    // from there.
+    if (group.by === 'ytmusic-playlist') {
+      if (outputDevice && outputDevice.type !== 'spotify') {
+        setSpotifyPlayHint('Select a Spotify Connect device, or switch to This Browser, to play YouTube Music playlists.');
+        return;
+      }
+      try {
+        const response = await axios.get(`${API_BASE_URL}/ytmusic/playlists/${group.key}/tracks`);
+        const tracks = (shuffle ? shuffleArray(response.data) : response.data).map((t) => mapYtMusicTrack(t));
+        if (tracks.length === 0) return;
+        if (outputDevice?.type === 'spotify') {
+          matchAndQueueYtMusicPlaylistTracksOnSpotify(tracks);
+        } else {
+          window.open(`https://music.youtube.com/watch?v=${tracks[0].video_id}&list=${group.key}`, '_blank', 'noopener,noreferrer');
+        }
+      } catch (err) {
+        console.error('Error queuing YouTube Music playlist playback:', err);
+      }
+      return;
+    }
     try {
       const params = { ...buildAmbientFilterParams(), ...paramsForGroupKey(group.by, group.key) };
       const tracks = shuffle
@@ -2461,6 +2630,7 @@ function App() {
   const viewLabel = (mode) => {
     if (mode === 'all') return 'All Tracks';
     if (mode === 'playlist') return 'Playlists';
+    if (mode === 'ytmusic-playlist') return 'YT Music Playlists';
     return `By ${mode.charAt(0).toUpperCase()}${mode.slice(1)}`;
   };
   const backLabel = drill && BACK_LABELS[drill.by];
@@ -2793,8 +2963,10 @@ function App() {
                   <p className="empty-state">Loading…</p>
                 ) : libraryMode === 'playlist' && !spotifyConnected ? (
                   <p className="empty-state">Connect Spotify in Settings to browse your playlists.</p>
+                ) : libraryMode === 'ytmusic-playlist' && !ytMusicConnected ? (
+                  <p className="empty-state">Connect YouTube Music in Settings to browse your playlists.</p>
                 ) : groups.length === 0 ? (
-                  <p className="empty-state">No {libraryMode}s found.</p>
+                  <p className="empty-state">No {libraryMode === 'ytmusic-playlist' ? 'YouTube Music playlist' : libraryMode}s found.</p>
                 ) : (
                   groups.map((g) => (
                     <div key={g.key} className="group-card">
@@ -3269,7 +3441,9 @@ function PlayerBar({
   // browser can play. A discover-preview track (source 'discover') is a
   // third case, handled separately below via its own preview_url - it was
   // never a local_id candidate to begin with.
-  const localStreamId = track.source === 'spotify' ? (track.local_id ?? null) : (track.source === 'discover' ? null : track.id);
+  const localStreamId = track.source === 'spotify' ? (track.local_id ?? null)
+    : track.source === 'discover' ? null
+    : track.id;
 
   return (
     <div className="player-root">
