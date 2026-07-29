@@ -215,6 +215,12 @@ class Track(BaseModel):
     artwork_source_url: Optional[str] = None
     is_favorite: Optional[bool] = False
     last_played: Optional[str] = None # Will be datetime string
+    # Cached cross-service matches (see spotify_prewarm.py / ytmusic_push_job.py)
+    # - drives the Spotify/YT Music availability badges on library track cards,
+    # the same way matched_spotify_uri/matched_ytmusic_video_id drive them on
+    # playlist track cards.
+    spotify_track_id: Optional[str] = None
+    ytmusic_video_id: Optional[str] = None
     # Was populated for Discover-tab suggestions on non-English tracks back
     # when Discover was Gemini-based (international catalogs index these
     # under their native-script name, not a romanized transliteration, so
@@ -646,7 +652,8 @@ async def get_known_tracks(
             from_sql = f"""
                 (SELECT DISTINCT ON ({DEDUP_NORM_TITLE_SQL}, {DEDUP_NORM_ARTIST_SQL}, {DEDUP_NORM_ALBUM_SQL})
                         id, track_name, artist_name, album_name, genre, year, duration_seconds,
-                        bitrate, sample_rate, channels, file_size_bytes, file_path, artwork_source_url, is_favorite, last_played
+                        bitrate, sample_rate, channels, file_size_bytes, file_path, artwork_source_url, is_favorite, last_played,
+                        spotify_track_id, ytmusic_video_id
                  FROM known_tracks {where_sql}
                  ORDER BY {DEDUP_NORM_TITLE_SQL}, {DEDUP_NORM_ARTIST_SQL}, {DEDUP_NORM_ALBUM_SQL},
                           {QUALITY_TIER_RANK_SQL} ASC, bitrate DESC NULLS LAST, id ASC
@@ -679,7 +686,8 @@ async def get_known_tracks(
         order_sql = "ORDER BY RANDOM()" if shuffle else "ORDER BY artist_name, album_name, track_name"
         cur.execute(f"""
             SELECT id, track_name, artist_name, album_name, genre, year, duration_seconds,
-                   bitrate, sample_rate, channels, file_size_bytes, file_path, artwork_source_url, is_favorite, last_played
+                   bitrate, sample_rate, channels, file_size_bytes, file_path, artwork_source_url, is_favorite, last_played,
+                   spotify_track_id, ytmusic_video_id
             FROM {from_sql}
             {order_sql}
             LIMIT %(limit)s OFFSET %(offset)s
@@ -714,7 +722,8 @@ async def get_tracks_by_ids(params: TrackIdsRequest, db: psycopg2.extensions.con
     cur = db.cursor(cursor_factory=RealDictCursor)
     cur.execute("""
         SELECT id, track_name, artist_name, album_name, genre, year, duration_seconds,
-               bitrate, sample_rate, channels, file_size_bytes, file_path, artwork_source_url, is_favorite, last_played
+               bitrate, sample_rate, channels, file_size_bytes, file_path, artwork_source_url, is_favorite, last_played,
+               spotify_track_id, ytmusic_video_id
         FROM known_tracks WHERE id = ANY(%s)
     """, (id_list,))
     rows_by_id = {row['id']: row for row in cur.fetchall()}

@@ -2484,16 +2484,20 @@ function App() {
     // 'spotify' for a matched-and-playing-in-full discover suggestion.
     const isPreviewingThis = isCurrent && nowPlaying?.source === 'discover';
     const isMatching = matchingTrackId === track.id;
-    // Cross-service availability badges - only ever meaningful for a
-    // Playlists-tab track (source 'spotify'/'ytmusic'; a matched-local-track
-    // queue entry from mapMatchedLocalTrack never gets rendered as its own
-    // card, so this never misfires elsewhere). matched_spotify_uri/
-    // matched_ytmusic_video_id come from the cross-reference built into the
-    // playlist cache/live routes (see main.py's _attach_spotify_track_extras/
-    // _attach_ytmusic_track_extras).
+    // Cross-service availability badges - meaningful for a Playlists-tab
+    // track (source 'spotify'/'ytmusic') and for a genuine Library-tab track
+    // (no source at all - a matched-local-track queue entry from
+    // mapMatchedLocalTrack never gets rendered as its own card, so this never
+    // misfires there). matched_spotify_uri/matched_ytmusic_video_id come from
+    // the playlist cache/live routes' cross-reference (see main.py's
+    // _attach_spotify_track_extras/_attach_ytmusic_track_extras);
+    // spotify_track_id/ytmusic_video_id are the same cross-reference read
+    // straight off the known_tracks row for a library track (see main.py's
+    // get_known_tracks/get_tracks_by_ids).
     const isPlaylistTrack = track.source === 'spotify' || track.source === 'ytmusic';
-    const availableOnSpotify = track.source === 'spotify' || Boolean(track.matched_spotify_uri);
-    const availableOnYtMusic = track.source === 'ytmusic' || Boolean(track.matched_ytmusic_video_id);
+    const isLibraryTrack = !track.source;
+    const availableOnSpotify = track.source === 'spotify' || Boolean(track.matched_spotify_uri) || (isLibraryTrack && Boolean(track.spotify_track_id));
+    const availableOnYtMusic = track.source === 'ytmusic' || Boolean(track.matched_ytmusic_video_id) || (isLibraryTrack && Boolean(track.ytmusic_video_id));
     // WiiM (and Chromecast/This Browser, which share the exact same
     // requirement) can only ever stream a local file - never Spotify or
     // YouTube directly - so this is only ever true when the known_tracks
@@ -2586,7 +2590,7 @@ function App() {
           <p className="artist">{track.artist_name}</p>
           {isDiscover && track.album_name && <p className="album">{track.album_name}</p>}
           {isPreviewingThis && <p className="preview-label">🎧 Sampling 30s preview</p>}
-          {isPlaylistTrack && (
+          {(isPlaylistTrack || isLibraryTrack) && (
             <div className="track-availability">
               <span
                 className={`availability-icon${availableOnSpotify ? '' : ' unavailable'}`}
@@ -2602,7 +2606,7 @@ function App() {
               </span>
               <span
                 className={`availability-icon${availableOnWiim ? '' : ' unavailable'}`}
-                title={availableOnWiim ? 'Playable on WiiM (also in your local library)' : 'Not in your local library - can\'t play on WiiM'}
+                title={availableOnWiim ? (isLibraryTrack ? 'Local file - playable on WiiM' : 'Playable on WiiM (also in your local library)') : 'Not in your local library - can\'t play on WiiM'}
               >
                 📡
               </span>
