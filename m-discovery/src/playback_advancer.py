@@ -304,6 +304,13 @@ def _advance_spotify(save_session, destination_id, now_playing, queue, match_poo
                     'album_name': result.get('album'),
                     'duration_seconds': (result['duration_ms'] / 1000) if result.get('duration_ms') is not None else None,
                     'artwork_url': result.get('artwork_url'),
+                    # This track fell outside the tracked queue window (e.g. a
+                    # 999-track playlist past the frontend's 200-track queue
+                    # cap), not a genuine change of playlist - still the same
+                    # one the frontend originally started, so carry its name
+                    # forward rather than losing it (see App.js's
+                    # mapSpotifyTrack/PlayerBar's "Source: ..." label).
+                    'playlist_name': (now_playing or {}).get('playlist_name'),
                 }
             save_session(now_playing=now_playing, queue=queue)
             is_context = bool((now_playing or {}).get('context_uri'))

@@ -26,7 +26,7 @@ const BACK_LABELS = {
 // doesn't match what's playing" bug). context_uri-based play still exists,
 // just only for playSpotifyContextDirectly's fallback (playlists this app
 // can't read the track list of at all, so there's no list to build uris from).
-function mapSpotifyTrack(t) {
+function mapSpotifyTrack(t, playlistName = null) {
   return {
     id: t.uri,
     source: 'spotify',
@@ -46,6 +46,12 @@ function mapSpotifyTrack(t) {
     // main.py's _attach_spotify_track_extras) - backs the Playlists tab's
     // cross-service availability badge.
     matched_ytmusic_video_id: t.matched_ytmusic_video_id,
+    // Only ever set when playing/browsing a single specific playlist (a
+    // drill-in view or a Play All/Shuffle click on one playlist card) - the
+    // merged "All Tracks" flat view spans many playlists at once with no
+    // single playlist to attribute a track to, so this stays null there.
+    // Drives the PlayerBar's "Playing from {source} · {playlist}" label.
+    playlist_name: playlistName,
   };
 }
 
@@ -55,7 +61,7 @@ function mapSpotifyTrack(t) {
 // embedded player use to actually play it - matching/playing on Spotify
 // instead (also handled by that branch) resolves track_name/artist_name
 // through the existing text-only Spotify matching pipeline, same as Discover.
-function mapYtMusicTrack(t) {
+function mapYtMusicTrack(t, playlistName = null) {
   return {
     id: t.video_id,
     source: 'ytmusic',
@@ -74,6 +80,8 @@ function mapYtMusicTrack(t) {
     // main.py's _attach_local_track_ids / bulk_backfill_local_track_ids) -
     // lets This Browser stream the local file instead of opening a new tab.
     local_id: t.local_track_id,
+    // See mapSpotifyTrack's playlist_name for what this is/isn't set for.
+    playlist_name: playlistName,
   };
 }
 
@@ -1276,11 +1284,11 @@ function App() {
     // Spotify playlists aren't in known_tracks - can't reuse the SQL-backed
     // /api/tracks/known / /api/library/groups fetches below at all.
     if (libraryMode === 'playlist') {
-      if (drill) fetchSpotifyPlaylistTracks(drill.key); else fetchSpotifyPlaylistsAsGroups();
+      if (drill) fetchSpotifyPlaylistTracks(drill.key, drill.label); else fetchSpotifyPlaylistsAsGroups();
       return;
     }
     if (libraryMode === 'ytmusic-playlist') {
-      if (drill) fetchYtMusicPlaylistTracks(drill.key); else fetchYtMusicPlaylistsAsGroups();
+      if (drill) fetchYtMusicPlaylistTracks(drill.key, drill.label); else fetchYtMusicPlaylistsAsGroups();
       return;
     }
     if (drill || libraryMode === 'all') {
@@ -1548,12 +1556,12 @@ function App() {
     }
   };
 
-  const fetchSpotifyPlaylistTracks = async (playlistId) => {
+  const fetchSpotifyPlaylistTracks = async (playlistId, playlistName = null) => {
     setLibraryLoading(true);
     setPlaylistTracksRestricted(false);
     try {
       const response = await axios.get(`${API_BASE_URL}/spotify/playlists/${playlistId}/tracks`);
-      const tracks = response.data.map((t) => mapSpotifyTrack(t));
+      const tracks = response.data.map((t) => mapSpotifyTrack(t, playlistName));
       setLibraryTracks(tracks);
       setLibraryTotal(tracks.length);
       setLibraryAlbumCount(countDistinct(tracks, albumGroupKey));
@@ -1588,11 +1596,11 @@ function App() {
     }
   };
 
-  const fetchYtMusicPlaylistTracks = async (playlistId) => {
+  const fetchYtMusicPlaylistTracks = async (playlistId, playlistName = null) => {
     setLibraryLoading(true);
     try {
       const response = await axios.get(`${API_BASE_URL}/ytmusic/playlists/${playlistId}/tracks`);
-      const tracks = response.data.map((t) => mapYtMusicTrack(t));
+      const tracks = response.data.map((t) => mapYtMusicTrack(t, playlistName));
       setLibraryTracks(tracks);
       setLibraryTotal(tracks.length);
       setLibraryAlbumCount(0); // YT Music playlist items carry no album metadata
@@ -2716,7 +2724,7 @@ function App() {
     if (group.by === 'playlist') {
       try {
         const response = await axios.get(`${API_BASE_URL}/spotify/playlists/${group.key}/tracks`);
-        const tracks = response.data.map((t) => mapSpotifyTrack(t));
+        const tracks = response.data.map((t) => mapSpotifyTrack(t, group.label));
         if (outputDevice?.type === 'spotify') {
           startQueue(tracks, { shuffle });
         } else if (tracks.some((t) => t.local_id != null)) {
@@ -2770,7 +2778,7 @@ function App() {
     if (group.by === 'ytmusic-playlist') {
       try {
         const response = await axios.get(`${API_BASE_URL}/ytmusic/playlists/${group.key}/tracks`);
-        const tracks = (shuffle ? shuffleArray(response.data) : response.data).map((t) => mapYtMusicTrack(t));
+        const tracks = (shuffle ? shuffleArray(response.data) : response.data).map((t) => mapYtMusicTrack(t, group.label));
         if (tracks.length === 0) return;
         if (outputDevice?.type === 'spotify') {
           matchAndQueueYtMusicPlaylistTracksOnSpotify(tracks);
@@ -4096,6 +4104,29 @@ function PlayerBar({
   };
 
   const destinationLabel = outputDevice ? outputDevice.name : 'This Browser';
+  // What's actually playing right now, as opposed to destinationLabel (where
+  // it's playing to) - track.source is undefined for a genuine local-library
+  // track. playlist_name is only ever set when this came from browsing/
+  // playing one specific Spotify/YT Music playlist (see mapSpotifyTrack/
+  // mapYtMusicTrack) - null for the merged "All Tracks" view (spans many
+  // playlists at once) or a Spotify-Connect-matched track (originated from
+  // Discover/a local track/a YT Music track, not literally a Spotify
+  // playlist), so those just show the bare source name.
+  const sourceLabel = track.source === 'spotify' ? 'Spotify'
+    : track.source === 'ytmusic' ? 'YouTube Music'
+      : track.source === 'discover' ? 'Discover'
+        : 'Your Library';
+  const sourceColor = track.source === 'spotify' ? '#1db954'
+    : track.source === 'ytmusic' ? '#ff0000'
+      : 'var(--accent-hover)';
+  const nowPlayingContext = (
+    <>
+      Source: <span className="player-source-name" style={{ color: sourceColor }}>
+        {sourceLabel}{track.playlist_name ? ` · ${track.playlist_name}` : ''}
+      </span>
+    </>
+  );
+  const nowPlayingContextTitle = track.playlist_name ? `Source: ${sourceLabel} · ${track.playlist_name}` : `Source: ${sourceLabel}`;
   const displayVolume = outputDevice ? (destStatus?.volume ?? 100) : volume;
   const handleVolumeSliderChange = (e) => onSetVolume(Number(e.target.value));
   const deviceIcon = (d) => (d.type === 'chromecast' ? '📺' : d.type === 'spotify' ? '🟢' : '📡');
@@ -4162,6 +4193,7 @@ function PlayerBar({
                     )}
                     <p className="now-playing-artist">{track.artist_name}</p>
                   </div>
+                  <p className="now-playing-source" title={nowPlayingContextTitle}>{nowPlayingContext}</p>
                   {track.album_name && <p className="now-playing-album">{track.album_name}</p>}
                   {metaParts.length > 0 && <p className="now-playing-meta">{metaParts.join(' · ')}</p>}
                   {techParts.length > 0 && <p className="now-playing-tech">{techParts.join(' · ')}</p>}
@@ -4320,9 +4352,18 @@ function PlayerBar({
               <div className="np-progress-handle" style={{ left: `${progressRatio * 100}%` }} />
             </div>
             <span className="player-progress-time">{formatDuration(Math.floor(durationMs / 1000))}</span>
-            <span className="player-destination-label" title={`Playing on ${destinationLabel}`}>
-              Playing on <span className="player-destination-name">{destinationLabel}</span>
-            </span>
+            <div className="player-status-grid">
+              <span className="player-status-label">Source:</span>
+              <span className="player-status-value" title={nowPlayingContextTitle}>
+                <span className="player-source-name" style={{ color: sourceColor }}>
+                  {sourceLabel}{track.playlist_name ? ` · ${track.playlist_name}` : ''}
+                </span>
+              </span>
+              <span className="player-status-label">Playing on:</span>
+              <span className="player-status-value" title={destinationLabel}>
+                <span className="player-destination-name">{destinationLabel}</span>
+              </span>
+            </div>
           </div>
 
           <div className="player-controls">

@@ -1580,6 +1580,35 @@ main.with-player {
   gap: 4px;
 }
 
+.player-status-grid {
+  flex-shrink: 0;
+  display: grid;
+  grid-template-columns: auto auto;
+  column-gap: 6px;
+  row-gap: 2px;
+  font-size: 0.9rem;
+}
+
+.player-status-label {
+  color: var(--text-muted);
+  opacity: 0.85;
+  text-align: right;
+  white-space: nowrap;
+}
+
+.player-status-value {
+  max-width: 160px;
+  color: var(--text-muted);
+  opacity: 0.85;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.player-source-name {
+  font-weight: 600;
+}
+
 .player-progress-row {
   display: flex;
   align-items: center;
@@ -1595,17 +1624,6 @@ main.with-player {
   flex-shrink: 0;
   font-size: 0.72rem;
   color: var(--text-muted);
-  white-space: nowrap;
-}
-
-.player-destination-label {
-  flex-shrink: 0;
-  max-width: 220px;
-  font-size: 0.95rem;
-  color: var(--text-muted);
-  opacity: 0.85;
-  overflow: hidden;
-  text-overflow: ellipsis;
   white-space: nowrap;
 }
 
@@ -1855,6 +1873,12 @@ main.with-player {
 .now-playing-artist {
   font-size: clamp(1.1rem, 1.6vw, 1.4rem);
   color: var(--text-muted);
+}
+
+.now-playing-source {
+  font-size: 0.85rem;
+  color: var(--accent-hover);
+  font-weight: 600;
 }
 
 .now-playing-album {
@@ -2568,12 +2592,13 @@ main.with-player {
     width: auto;
   }
 
-  .player-destination-label {
-    order: 1;
+  .player-status-grid {
     flex-basis: 100%;
-    max-width: none;
-    text-align: left;
     font-size: 0.78rem;
+  }
+
+  .player-status-value {
+    max-width: 140px;
   }
 
   .player-controls {
