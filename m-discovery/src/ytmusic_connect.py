@@ -373,7 +373,11 @@ def create_playlist_and_push(name, tracks):
     added = sum(1 for video_id in unique_video_ids if _add_video_to_playlist(token, playlist_id, video_id))
 
     return {
-        'playlist_url': f'https://www.youtube.com/playlist?list={playlist_id}',
+        # music.youtube.com (not www.youtube.com) - same playlist object
+        # either way (both APIs sit on the same YouTube Data API playlist),
+        # but opening the plain youtube.com link puts it in the regular
+        # YouTube web/app player instead of YouTube Music.
+        'playlist_url': f'https://music.youtube.com/playlist?list={playlist_id}',
         'added': added,
         'skipped': len(tracks) - added,
     }

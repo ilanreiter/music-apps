@@ -237,6 +237,36 @@ def create_tables():
             """)
             print("Table 'playback_session' checked/created successfully.")
 
+            # One row per running Radio session (track/artist/playlist-seeded
+            # continuous similar-music stream) - unlike playback_session
+            # above, this isn't a single-row mirror: multiple past sessions
+            # are kept around (status='stopped') rather than overwritten, so
+            # there's a natural history, though only one is ever 'active' at
+            # a time in practice (starting a new one just leaves the old row
+            # stopped rather than deleting it). seen_track_keys is this
+            # session's own anti-repeat set (lowercased "track|||artist"
+            # keys) - lastfm.discover_tracks has no memory across calls, so
+            # without this a long-running radio would eventually start
+            # repeating itself. ytmusic_push_job_id links to the dedicated
+            # playlist job backing a 'ytmusic'-destination session (see
+            # append_tracks_to_ytmusic_push_job below).
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS radio_session (
+                    id SERIAL PRIMARY KEY,
+                    seed_type TEXT NOT NULL,
+                    seed_description TEXT,
+                    seed_artists JSONB NOT NULL,
+                    seen_track_keys JSONB DEFAULT '[]'::jsonb,
+                    destination_type TEXT,
+                    ytmusic_playlist_id TEXT,
+                    ytmusic_push_job_id INTEGER REFERENCES ytmusic_push_job(id),
+                    status TEXT DEFAULT 'active',
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    updated_at TIMESTAMP DEFAULT NOW()
+                );
+            """)
+            print("Table 'radio_session' checked/created successfully.")
+
             # Cache for the Playlists tab's "All Tracks" mode - flattening
             # every playlist's tracks live (N+1 calls to Spotify/YouTube, one
             # per playlist) is what made that view slow to open every time.
@@ -933,6 +963,177 @@ def clear_playback_session():
     finally:
         if conn:
             conn.close()
+
+
+# Cap on radio_session.seen_track_keys - a session left running for hours
+# would otherwise grow this JSONB array unboundedly; only the most recent
+# entries are ever useful for anti-repeat purposes anyway.
+RADIO_SEEN_TRACK_KEYS_CAP = 500
+
+
+def create_radio_session(seed_type, seed_description, seed_artists, destination_type, seen_track_keys):
+    """Starts a new radio_session row. seen_track_keys is the caller's
+    already-lowercased list of "track|||artist" keys for the first batch of
+    tracks it just generated, so a subsequent /more call's dedup starts from
+    a non-empty set rather than repeating the very first batch."""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO radio_session (seed_type, seed_description, seed_artists, seen_track_keys, destination_type, status)
+            VALUES (%s, %s, %s, %s, %s, 'active')
+            RETURNING id
+        """, (seed_type, seed_description, Json(seed_artists), Json(seen_track_keys[-RADIO_SEEN_TRACK_KEYS_CAP:]), destination_type))
+        session_id = cur.fetchone()[0]
+        conn.commit()
+        cur.close()
+        return session_id
+    except Error as e:
+        print(f"Error creating radio session: {e}")
+        return None
+    finally:
+        if conn:
+            conn.close()
+
+
+def get_radio_session(session_id):
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT id, seed_type, seed_description, seed_artists, seen_track_keys, destination_type,
+                   ytmusic_playlist_id, ytmusic_push_job_id, status
+            FROM radio_session WHERE id = %s
+        """, (session_id,))
+        row = cur.fetchone()
+        cur.close()
+        if not row:
+            return None
+        return {
+            'id': row[0], 'seed_type': row[1], 'seed_description': row[2], 'seed_artists': row[3],
+            'seen_track_keys': row[4], 'destination_type': row[5], 'ytmusic_playlist_id': row[6],
+            'ytmusic_push_job_id': row[7], 'status': row[8],
+        }
+    except Error as e:
+        print(f"Error reading radio session {session_id}: {e}")
+        return None
+    finally:
+        if conn:
+            conn.close()
+
+
+def append_seen_track_keys(session_id, new_keys):
+    """Read-merge-write, same idiom as save_playback_session - merges
+    new_keys into the session's anti-repeat set and caps it at
+    RADIO_SEEN_TRACK_KEYS_CAP (keeping the most recent), rather than letting
+    it grow forever across a long-running session."""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT seen_track_keys FROM radio_session WHERE id = %s", (session_id,))
+        row = cur.fetchone()
+        if not row:
+            cur.close()
+            return
+        existing = row[0] or []
+        merged = existing + [k for k in new_keys if k not in existing]
+        merged = merged[-RADIO_SEEN_TRACK_KEYS_CAP:]
+        cur.execute(
+            "UPDATE radio_session SET seen_track_keys = %s, updated_at = NOW() WHERE id = %s",
+            (Json(merged), session_id),
+        )
+        conn.commit()
+        cur.close()
+    except Error as e:
+        print(f"Error appending seen track keys for radio session {session_id}: {e}")
+    finally:
+        if conn:
+            conn.close()
+
+
+def set_radio_session_ytmusic_job(session_id, ytmusic_playlist_id, ytmusic_push_job_id):
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE radio_session SET ytmusic_playlist_id = %s, ytmusic_push_job_id = %s, updated_at = NOW() WHERE id = %s",
+            (ytmusic_playlist_id, ytmusic_push_job_id, session_id),
+        )
+        conn.commit()
+        cur.close()
+    except Error as e:
+        print(f"Error setting radio session {session_id}'s YouTube Music job: {e}")
+    finally:
+        if conn:
+            conn.close()
+
+
+def stop_radio_session(session_id):
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("UPDATE radio_session SET status = 'stopped', updated_at = NOW() WHERE id = %s", (session_id,))
+        conn.commit()
+        cur.close()
+    except Error as e:
+        print(f"Error stopping radio session {session_id}: {e}")
+    finally:
+        if conn:
+            conn.close()
+
+
+def append_tracks_to_ytmusic_push_job(job_id, tracks):
+    """Appends more tracks to an already-enqueued YouTube Music push job -
+    used by radio's continuous ytmusic-destination refill instead of
+    enqueue_ytmusic_push_job (which always creates a brand new job/playlist).
+    Inserts new ytmusic_push_job_tracks rows at the next available
+    positions, bumps the job's total, and - the one real behavioral
+    difference from a normal enqueue - revives a job that had already
+    reached 'done' back to 'running' so ytmusic_push_job.run's queue-empty
+    exit (get_next_pending_push_track returning None) doesn't leave these new
+    rows stranded forever; get_active_ytmusic_push_job only ever picks up
+    'running'/'waiting_quota' jobs, so a 'done' job needs this flip before
+    the worker thread (which the caller must separately restart, since the
+    worker exits its loop once the queue empties) will look at it again."""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT COALESCE(MAX(position), -1) FROM ytmusic_push_job_tracks WHERE job_id = %s", (job_id,))
+        next_position = cur.fetchone()[0] + 1
+        cur.executemany(
+            """
+            INSERT INTO ytmusic_push_job_tracks
+                (job_id, position, track_name, artist_name, native_track_name, native_artist_name, known_track_id)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            """,
+            [
+                (job_id, next_position + i, t['track_name'], t['artist_name'], t.get('native_track_name'), t.get('native_artist_name'), t.get('known_track_id'))
+                for i, t in enumerate(tracks)
+            ],
+        )
+        cur.execute("""
+            UPDATE ytmusic_push_job SET
+                total = total + %s,
+                status = CASE WHEN status = 'done' THEN 'running' ELSE status END,
+                updated_at = NOW()
+            WHERE id = %s
+        """, (len(tracks), job_id))
+        conn.commit()
+        cur.close()
+        return True
+    except Error as e:
+        print(f"Error appending tracks to YouTube Music push job {job_id}: {e}")
+        return False
+    finally:
+        if conn:
+            conn.close()
+
 
 def replace_playlist_track_cache(platform, tracks, skipped_count):
     """Upserts every track's metadata for this platform, then drops any

@@ -13,6 +13,8 @@ from .database import (
     list_pending_ytmusic_push_jobs, delete_ytmusic_push_job,
     get_playlist_track_cache, replace_playlist_track_cache,
     find_known_track_external_match, backfill_known_track_ids, backfill_ytmusic_cache_match,
+    create_radio_session, get_radio_session, append_seen_track_keys,
+    set_radio_session_ytmusic_job, stop_radio_session, append_tracks_to_ytmusic_push_job,
 )
 from .library_scanner import run_scan
 from .artwork import get_or_create_thumbnail, check_artwork_presence, cache_key_for, normalize_album_name, normalized_album_sql, save_thumbnail
@@ -34,6 +36,7 @@ from . import tag_cleanup
 from . import playback_advancer
 from . import shazam_identify
 from . import lastfm
+from . import radio_engine
 import logging
 import os
 import json
@@ -258,6 +261,31 @@ class DiscoveryParameters(BaseModel):
     # artist's actual top tracks) instead of one track per artist - see
     # lastfm.discover_tracks' tracks_per_artist param.
     group_by_artist: Optional[bool] = False
+
+class RadioStartRequest(BaseModel):
+    # 'track' | 'artist' | 'playlist' - purely descriptive (drives
+    # seed_description/UI labeling), the actual seeding logic only ever
+    # looks at seed_artists below, same "always artist names" shape
+    # DiscoveryParameters.seed_tracks already uses.
+    seed_type: str
+    seed_description: Optional[str] = None
+    seed_artists: List[str]
+    # 'browser' | 'spotify' | 'ytmusic' - decides whether this session's
+    # /more calls return tracks to play (browser/spotify) or push into a
+    # YouTube Music playlist instead (ytmusic, see append_tracks_to_ytmusic_push_job).
+    destination_type: str
+    # The literal track/artist's-track/playlist's-track the user actually
+    # picked, when the frontend has one - so the picked track can play
+    # first, before radio's own similar-track suggestions. Both required
+    # together; excluded from the returned suggestion batch (see
+    # start_radio) so it's never immediately re-suggested right after
+    # playing, and folded into seen_track_keys so a later /more call won't
+    # suggest it either.
+    seed_track_name: Optional[str] = None
+    seed_artist_name: Optional[str] = None
+
+class RadioMoreRequest(BaseModel):
+    count: Optional[int] = 10
 
 class LibraryScanRequest(BaseModel):
     root_path: str
@@ -2108,7 +2136,11 @@ async def get_ytmusic_push_job_status():
     return {
         "status": job["status"],
         "name": job["name"],
-        "playlist_url": f"https://www.youtube.com/playlist?list={job['playlist_id']}" if job["playlist_id"] else None,
+        # music.youtube.com, not www.youtube.com - same playlist object
+        # either way, but the plain youtube.com link opens the regular
+        # YouTube player instead of YouTube Music (see create_playlist_and_push
+        # in ytmusic_connect.py for the same fix on the one-shot push path).
+        "playlist_url": f"https://music.youtube.com/playlist?list={job['playlist_id']}" if job["playlist_id"] else None,
         "total": job["total"],
         "matched": job["matched"],
         "inserted": job["inserted"],
@@ -2209,11 +2241,21 @@ class PlaybackSessionUpdate(BaseModel):
     queue: Optional[List[Dict[str, Any]]] = None
     shuffle_enabled: bool = False
     # Only ever sent right after a fresh Spotify match attempt (see
-    # matchAndPlayLocalTracksOnSpotify in App.js) - the remaining
+    # startQueue's spotifyMatchPool option in App.js) - the remaining
     # not-yet-tried candidate pool for playback_advancer's lookahead refill
-    # to keep working through. Omitted on routine syncs (Next/Prev, a plain
-    # queue reorder), in which case the backend's own tracked pool is kept.
+    # to keep working through (a plain {candidates, cursor} for library-cast,
+    # or the same shape plus a radio_session_id for a Radio-fed pool, see
+    # radio_engine.py/playback_advancer.py). Omitted on routine syncs (Next/
+    # Prev, a plain queue reorder), in which case the backend's own tracked
+    # pool is kept.
     spotify_match_pool: Optional[Dict[str, Any]] = None
+    # Explicit "drop whatever pool is there now" signal - a bare
+    # spotify_match_pool: null in JSON is indistinguishable from the field
+    # being omitted entirely (both parse to None), so an omitted pool can't
+    # double as "clear it": this flag disambiguates a genuine clear (e.g.
+    # stopRadio, or starting something on Spotify with nothing to hand off)
+    # from "no opinion, preserve whatever's already stored."
+    clear_spotify_match_pool: bool = False
 
 @app.post("/api/playback-session")
 async def post_playback_session(params: PlaybackSessionUpdate):
@@ -2242,8 +2284,9 @@ async def post_playback_session(params: PlaybackSessionUpdate):
         now_playing=params.now_playing,
         queue=params.queue,
         shuffle_enabled=params.shuffle_enabled,
-        spotify_match_pool=params.spotify_match_pool if params.spotify_match_pool is not None
-            else (existing.get('spotify_match_pool') if same_destination else None),
+        spotify_match_pool=None if params.clear_spotify_match_pool
+            else (params.spotify_match_pool if params.spotify_match_pool is not None
+                else (existing.get('spotify_match_pool') if same_destination else None)),
         chromecast_pushed_count=existing.get('chromecast_pushed_count') if same_destination else None,
         last_status=existing.get('last_status') if same_destination else None,
     )
@@ -2591,3 +2634,107 @@ def discover_music(params: DiscoveryParameters, db: psycopg2.extensions.connecti
         db.rollback() # Rollback in case of error
 
     return final_tracks
+
+class RadioStartResponse(BaseModel):
+    session_id: int
+    tracks: List[Track]
+    # Set only for a 'ytmusic'-destination session - the frontend has
+    # nothing to queue/play itself for that destination, it just polls
+    # /api/ytmusic/push-job/status using this id's job.
+    ytmusic_push_job_id: Optional[int] = None
+
+class RadioMoreResponse(BaseModel):
+    tracks: List[Track]
+    # True when this call (after retrying a couple of rounds against the
+    # session's own seed) still found nothing new - the seed artist pool has
+    # run dry, not a transient blip. Doesn't stop the session server-side;
+    # the frontend decides whether to surface "this station is running low"
+    # and/or stop polling.
+    exhausted: bool = False
+
+@app.post("/api/radio/start", response_model=RadioStartResponse)
+def start_radio(params: RadioStartRequest, db: psycopg2.extensions.connection = Depends(get_db)):
+    if not lastfm.is_configured():
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Last.fm not configured - set LASTFM_API_KEY")
+    if not params.seed_artists:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No seed artists to start radio from")
+    if params.destination_type not in ('browser', 'spotify', 'ytmusic'):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="destination_type must be 'browser', 'spotify', or 'ytmusic'")
+
+    seed_description = params.seed_description or f"Radio from {', '.join(params.seed_artists[:3])}"
+    has_seed_track = bool(params.seed_track_name and params.seed_artist_name)
+    seed_key = radio_engine.radio_track_key(params.seed_track_name, params.seed_artist_name) if has_seed_track else None
+
+    # Excludes the seed track itself from the generated batch (via the
+    # initial seen-keys arg) so it's never immediately re-suggested right
+    # after playing - the frontend plays it separately, first, using the
+    # richer object it already has (a real local file, a cached Spotify
+    # match, or a native playlist track) rather than this plain
+    # track_name/artist_name reconstruction.
+    track_dicts = radio_engine.generate_fresh_radio_tracks(
+        params.seed_artists, params.destination_type, [seed_key] if seed_key else [], 15, db,
+    )
+    seen_keys = [radio_engine.radio_track_key(t['track_name'], t['artist_name']) for t in track_dicts]
+    if seed_key:
+        seen_keys.append(seed_key)
+
+    session_id = create_radio_session(
+        seed_type=params.seed_type,
+        seed_description=seed_description,
+        seed_artists=params.seed_artists,
+        destination_type=params.destination_type,
+        seen_track_keys=seen_keys,
+    )
+    if session_id is None:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Could not start a radio session")
+
+    if params.destination_type == 'ytmusic':
+        if not ytmusic_connect.is_connected():
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="YouTube Music not connected")
+        # Unlike browser/spotify (where the frontend plays the seed track
+        # itself, separately, first), there's no in-app playback for a
+        # ytmusic-destination session - the seed track's only chance to lead
+        # off the actual result is being the first track physically pushed
+        # into the playlist.
+        push_tracks = track_dicts
+        if has_seed_track:
+            push_tracks = [{"track_name": params.seed_track_name, "artist_name": params.seed_artist_name}] + track_dicts
+        job_id = enqueue_ytmusic_push_job(seed_description, push_tracks)
+        if job_id is None:
+            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Could not start the YouTube Music radio playlist")
+        set_radio_session_ytmusic_job(session_id, None, job_id)
+        _start_ytmusic_push_job_background()
+        return {"session_id": session_id, "tracks": [], "ytmusic_push_job_id": job_id}
+
+    return {"session_id": session_id, "tracks": [Track(**t) for t in track_dicts]}
+
+@app.post("/api/radio/{session_id}/more", response_model=RadioMoreResponse)
+def get_more_radio_tracks(session_id: int, params: RadioMoreRequest, db: psycopg2.extensions.connection = Depends(get_db)):
+    session = get_radio_session(session_id)
+    if session is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No radio session with that id")
+    if session['status'] != 'active':
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="This radio session has been stopped")
+
+    count = max(1, min(params.count or 10, 30))
+    track_dicts = radio_engine.generate_fresh_radio_tracks(
+        session['seed_artists'], session['destination_type'], session['seen_track_keys'] or [], count, db,
+    )
+    if track_dicts:
+        append_seen_track_keys(session_id, [radio_engine.radio_track_key(t['track_name'], t['artist_name']) for t in track_dicts])
+
+    if session['destination_type'] == 'ytmusic':
+        if track_dicts and session['ytmusic_push_job_id']:
+            append_tracks_to_ytmusic_push_job(session['ytmusic_push_job_id'], track_dicts)
+            _start_ytmusic_push_job_background()
+        return {"tracks": [], "exhausted": len(track_dicts) == 0}
+
+    return {"tracks": [Track(**t) for t in track_dicts], "exhausted": len(track_dicts) == 0}
+
+@app.post("/api/radio/{session_id}/stop")
+def stop_radio(session_id: int):
+    session = get_radio_session(session_id)
+    if session is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No radio session with that id")
+    stop_radio_session(session_id)
+    return {"status": "stopped"}

@@ -727,6 +727,25 @@ function App() {
   const outputDevices = [...wiimDevices, ...chromecastDevices, ...spotifyDevices];
   const [outputDevice, setOutputDevice] = useState(() => loadSession()?.outputDevice || null);
   const [destStatus, setDestStatus] = useState(null);
+
+  // Radio: a continuous, auto-refilling similar-music stream seeded from a
+  // track/artist/playlist. radioSessionId is the backend's radio_session id
+  // (null = no radio active); radioDestination is deliberately separate from
+  // the app-wide outputDevice, since YouTube Music has no live remote-play
+  // device to select there - it's a Radio-tab-local choice that otherwise
+  // mirrors whatever outputDevice already is (This Browser or a Spotify
+  // Connect device).
+  const [radioSessionId, setRadioSessionId] = useState(null);
+  const [radioSeed, setRadioSeed] = useState(null); // { type: 'track'|'artist'|'playlist', description }
+  const [radioDestination, setRadioDestination] = useState('inherit'); // 'inherit' | 'ytmusic' - the Radio tab's own picker
+  // Locked in at the moment a session actually starts (unlike
+  // radioDestination/outputDevice above, which the user is free to keep
+  // changing afterward to set up the *next* session) - 'browser' | 'spotify'
+  // | 'ytmusic'. What the refill effects below dispatch against.
+  const [radioDestinationType, setRadioDestinationType] = useState(null);
+  const [radioStatus, setRadioStatus] = useState(null); // transient hint/error text
+  const RADIO_REFILL_THRESHOLD = 3;
+  const RADIO_BATCH_SIZE = 10;
   const [volume, setVolume] = useState(() => {
     const saved = Number(localStorage.getItem('playerVolume'));
     return Number.isFinite(saved) && saved >= 0 && saved <= 100 ? saved : 100;
@@ -1003,7 +1022,10 @@ function App() {
         const skippedIds = pool.candidates
           .slice(0, pool.cursor)
           .map((c) => c.id)
-          .filter((id) => id !== currentLocalId && !queuedLocalIds.has(id));
+          // A Radio candidate has no id at all (a Last.fm text suggestion,
+          // not a known_tracks row) - null/undefined ids aren't a real
+          // track to badge as skipped.
+          .filter((id) => id != null && id !== currentLocalId && !queuedLocalIds.has(id));
         if (skippedIds.length) {
           setSkippedTrackIds((prev) => {
             const next = new Set(prev);
@@ -1854,7 +1876,7 @@ function App() {
   // back to opening YouTube directly for a source:'ytmusic' track) can.
   const resolveLocalTrackId = (t) => (
     t.local_id != null ? t.local_id
-      : (t.source === 'spotify' || t.source === 'ytmusic' || t.source === 'discover') ? null
+      : (t.source === 'spotify' || t.source === 'ytmusic' || t.source === 'discover' || t.source === 'radio') ? null
         : t.id
   );
 
@@ -1876,7 +1898,7 @@ function App() {
       .catch((err) => console.error('Error casting to device:', err));
   };
 
-  const startQueue = (tracks, { shuffle = false } = {}) => {
+  const startQueue = (tracks, { shuffle = false, spotifyMatchPool = null } = {}) => {
     if (!tracks || tracks.length === 0) return;
     // Central guard for every "Play All"/"Shuffle" entry point (library flat
     // view, album/genre/etc. groups, playlist tracks, single-track clicks) -
@@ -1911,6 +1933,21 @@ function App() {
     // it fresh, so togglePlay's separate "cast the restored session" fallback
     // is no longer applicable.
     destNeedsInitialCastRef.current = false;
+    // Centralized pool invalidation: every fresh startQueue on a Spotify
+    // destination stamps a new spotify_match_pool truth - a real pool if the
+    // caller is handing one off (matchAndPlayLocalTracksOnSpotify, Radio),
+    // null otherwise. This is what stops a stale pool from an earlier flow
+    // (a previous Radio session, a matched-local-track lookahead) from
+    // silently surviving into whatever's starting now - confirmed live that
+    // without this, e.g. clicking a Spotify playlist track directly while a
+    // Radio session was driving the same device never touched the pool at
+    // all, so playback_advancer kept feeding old Radio picks into the new
+    // queue. Callers that don't pass spotifyMatchPool get null by default,
+    // which is the fix for exactly that case.
+    if (outputDevice?.type === 'spotify') {
+      spotifyLookaheadRef.current = spotifyMatchPool;
+      spotifyMatchPoolDirtyRef.current = true;
+    }
   };
 
   // For a Spotify playlist we can't read the track listing of (not owned by
@@ -2052,8 +2089,10 @@ function App() {
     // had nothing to do with the shuffled list on screen).
     destNeedsInitialCastRef.current = false;
     const requestId = ++spotifyMatchRequestIdRef.current;
+    // findNextSpotifyMatch walks/mutates this ref's cursor as it searches -
+    // its final value (whatever's left untried) is what gets handed to the
+    // server pool below, once a match is found.
     spotifyLookaheadRef.current = { candidates: tracks, cursor: 0 };
-    spotifyMatchPoolDirtyRef.current = true;
     try {
       const { found, rateLimited } = await findNextSpotifyMatch(requestId);
       if (spotifyMatchRequestIdRef.current !== requestId) return; // superseded by a newer click
@@ -2064,7 +2103,7 @@ function App() {
         return;
       }
       setSpotifyPlayHint(null);
-      startQueue([found]);
+      startQueue([found], { spotifyMatchPool: spotifyLookaheadRef.current });
     } finally {
       if (spotifyMatchRequestIdRef.current === requestId) setMatchingTrackId(null);
     }
@@ -2140,7 +2179,10 @@ function App() {
       };
       if (!firstStarted) {
         setSpotifyMatchProgress(null);
-        startQueue([queueEntry]);
+        // Discover's own pool is small/one-shot and already fully resolved
+        // client-side - nothing to hand off, and clearing here is what
+        // stops a leftover Radio pool from surviving a switch to Discover.
+        startQueue([queueEntry], { spotifyMatchPool: null });
         firstStarted = true;
       } else {
         setQueue((prev) => [...prev, queueEntry]);
@@ -2230,7 +2272,7 @@ function App() {
       };
       if (!firstStarted) {
         setSpotifyMatchProgress(null);
-        startQueue([queueEntry]);
+        startQueue([queueEntry], { spotifyMatchPool: null });
         firstStarted = true;
       } else {
         setQueue((prev) => [...prev, queueEntry]);
@@ -2295,6 +2337,344 @@ function App() {
       setSpotifyPlayHint(`No preview available for "${candidates[0].track_name}"${candidates.length > 1 ? ' or the tracks after it' : ''}.`);
     }
   };
+
+  // Radio: a continuous Last.fm-similarity stream (see /api/radio/* in
+  // main.py), seeded from a track/artist/playlist. For This Browser only -
+  // Spotify-destination radio hands its candidates off to the server-side
+  // playback_advancer instead (see handleStartRadio), so it survives the
+  // tab backgrounding/closing; This Browser previews have no such device for
+  // a background job to drive, so they stay client-driven exactly as before.
+  const sampleQueueRadioTracks = async (candidates, { isInitial = false } = {}) => {
+    if (candidates.length === 0) return;
+    const requestId = ++spotifyMatchRequestIdRef.current;
+    let firstStarted = !isInitial;
+    for (const candidate of candidates) {
+      if (spotifyMatchRequestIdRef.current !== requestId) return;
+      let url, artworkUrl;
+      try {
+        const response = await axios.post(`${API_BASE_URL}/discover/preview`, {
+          track_name: candidate.track_name, artist_name: candidate.artist_name,
+        });
+        url = response.data.preview_url;
+        artworkUrl = response.data.artwork_url;
+      } catch (err) {
+        console.error('Error fetching preview for radio track:', err);
+        continue;
+      }
+      if (spotifyMatchRequestIdRef.current !== requestId) return;
+      if (!url) continue; // no preview found for this one - try the next candidate
+      const queueEntry = {
+        id: candidate.id, source: 'radio', radio_session_id: candidate.radio_session_id,
+        track_name: candidate.track_name, artist_name: candidate.artist_name,
+        album_name: candidate.album_name, artwork_url: artworkUrl, preview_url: url,
+      };
+      if (!firstStarted) {
+        startQueue([queueEntry]);
+        firstStarted = true;
+      } else {
+        setQueue((prev) => [...prev, queueEntry]);
+      }
+    }
+    if (isInitial && !firstStarted && spotifyMatchRequestIdRef.current === requestId) {
+      setRadioStatus('No playable preview found for this radio seed - try a different one.');
+    }
+  };
+
+  // Resolves the destination Radio should actually use right now: the Radio
+  // tab's own 'ytmusic' choice wins outright (it's independent of
+  // outputDevice, which has no YouTube Music device concept); otherwise it
+  // mirrors the app-wide destination picker exactly like Discover does -
+  // Spotify Connect selected plays there, This Browser (no outputDevice)
+  // samples previews, anything else (WiiM/Chromecast) can't play Radio at
+  // all, same limitation Discover already has.
+  const resolveRadioDestinationType = () => {
+    if (radioDestination === 'ytmusic') return 'ytmusic';
+    if (outputDevice?.type === 'spotify') return 'spotify';
+    if (!outputDevice) return 'browser';
+    return null;
+  };
+
+  let radioSeedCounter = 0;
+  const mapRadioTracks = (sessionId, tracks) => tracks.map((t) => ({
+    id: `radio-${sessionId}-${Date.now()}-${radioSeedCounter++}`,
+    radio_session_id: sessionId,
+    track_name: t.track_name, artist_name: t.artist_name, album_name: t.album_name,
+  }));
+
+  // Resolves whatever track the user actually picked (or a representative
+  // track for the artist/playlist they picked - see handleStartRadio's
+  // callers) into something playable on the destination radio is about to
+  // use, so radio can open with it instead of starting cold on a similar-
+  // track suggestion. Returns a queueEntry ready for startQueue, or null if
+  // this destination has no way to play it (handleStartRadio falls back to
+  // starting directly on radio's own suggestions in that case).
+  const resolveSeedTrackForPlayback = async (seedTrack, destinationType) => {
+    if (!seedTrack) return null;
+    if (destinationType === 'browser') {
+      if (!seedTrack.source) return seedTrack; // plain local library track - streams directly
+      if (seedTrack.local_id != null) return { ...seedTrack, id: seedTrack.local_id }; // has a local match - stream that instead
+      return null; // a bare Spotify/YT Music playlist track has no preview mechanism of its own
+    }
+    if (destinationType === 'spotify') {
+      if (seedTrack.source === 'spotify') return seedTrack; // already Spotify-native (has its own uri)
+      if (!seedTrack.source) {
+        // Genuine local library track - the real cached local-track match
+        // endpoint (keyed by known_tracks.id, caches its result there),
+        // same one a direct library-tab click would use.
+        try {
+          const response = await axios.post(`${API_BASE_URL}/spotify/tracks/${seedTrack.id}/match`);
+          if (response.data.matched) return mapMatchedLocalTrack(seedTrack, response.data);
+        } catch (err) {
+          console.error('Error matching radio seed track to Spotify:', err);
+        }
+        return null;
+      }
+      if (seedTrack.source === 'ytmusic') {
+        try {
+          const response = await axios.post(`${API_BASE_URL}/spotify/discover-match`, {
+            track_name: seedTrack.track_name, artist_name: seedTrack.artist_name, ytmusic_video_id: seedTrack.video_id,
+          });
+          if (response.data.matched) {
+            return {
+              id: response.data.uri, source: 'spotify', uri: response.data.uri, context_uri: null,
+              ytmusic_id: seedTrack.id, track_name: seedTrack.track_name, artist_name: seedTrack.artist_name,
+              artwork_url: response.data.artwork_url,
+            };
+          }
+        } catch (err) {
+          console.error('Error matching radio seed track to Spotify:', err);
+        }
+      }
+    }
+    return null;
+  };
+
+  // Builds the spotify_match_pool payload handed to the server (via
+  // startQueue's spotifyMatchPool option) so playback_advancer keeps
+  // matching/queueing this radio session on its own - candidates have no
+  // `id` (Last.fm text suggestions, not local library rows), which is what
+  // tells the advancer to search them directly instead of using the
+  // known_tracks cache-first path library-cast candidates use. null when
+  // there's nothing left to hand off (an empty starting batch) - that's
+  // still meaningful, since passing it clears any pool from a previous
+  // session/flow rather than silently preserving one.
+  const buildRadioSpotifyPool = (sessionId, remaining) => (
+    remaining.length > 0 ? {
+      candidates: remaining.map((t) => ({ id: null, track_name: t.track_name, artist_name: t.artist_name, album_name: t.album_name })),
+      cursor: 0,
+      radio_session_id: sessionId,
+    } : null
+  );
+
+  const handleStartRadio = async (seed) => {
+    // seed: { type: 'track'|'artist'|'playlist', description, seedArtists: string[], seedTrack? }
+    const destinationType = resolveRadioDestinationType();
+    if (!destinationType) {
+      setRadioStatus('Select a Spotify Connect device, This Browser, or YouTube Music (below) to use Radio.');
+      return;
+    }
+    if (destinationType === 'ytmusic' && !ytMusicConnected) {
+      setRadioStatus('Connect YouTube Music in Settings to use Radio there.');
+      return;
+    }
+    if (!seed.seedArtists || seed.seedArtists.length === 0) {
+      setRadioStatus('Could not find an artist to seed radio from.');
+      return;
+    }
+    setRadioStatus(null);
+    try {
+      const response = await axios.post(`${API_BASE_URL}/radio/start`, {
+        seed_type: seed.type,
+        seed_description: seed.description,
+        seed_artists: seed.seedArtists,
+        destination_type: destinationType,
+        seed_track_name: seed.seedTrack?.track_name || null,
+        seed_artist_name: seed.seedTrack?.artist_name || null,
+      });
+      const { session_id, tracks } = response.data;
+      setRadioSessionId(session_id);
+      setRadioSeed({ type: seed.type, description: seed.description });
+      setRadioDestinationType(destinationType);
+      // No in-app playback for a ytmusic-destination session - the backend
+      // already put the seed track first in what it pushed to the playlist
+      // (see start_radio), so there's nothing left to queue here.
+      if (destinationType === 'ytmusic') return;
+
+      const mapped = mapRadioTracks(session_id, tracks);
+      const seedEntry = await resolveSeedTrackForPlayback(seed.seedTrack, destinationType);
+
+      if (destinationType === 'spotify') {
+        if (seedEntry) {
+          // The seed already resolved to something directly playable -
+          // hand off every suggested track as the server-side pool, no
+          // client-side matching needed at all for this session.
+          startQueue([seedEntry], { spotifyMatchPool: buildRadioSpotifyPool(session_id, mapped) });
+          return;
+        }
+        // No seed track resolved - synchronously try suggestions one at a
+        // time until the first one matches (same low-latency-first start
+        // Discover/library-cast already use), then hand the rest off to
+        // the server pool instead of continuing to resolve them all here.
+        for (let i = 0; i < mapped.length; i++) {
+          const candidate = mapped[i];
+          let matchResult;
+          try {
+            const matchResponse = await axios.post(`${API_BASE_URL}/spotify/discover-match`, {
+              track_name: candidate.track_name, artist_name: candidate.artist_name,
+            });
+            matchResult = matchResponse.data;
+          } catch (err) {
+            console.error('Error matching radio track to Spotify:', err);
+            break;
+          }
+          if (matchResult.reason === 'unavailable') {
+            setRadioStatus("Spotify's search is temporarily rate-limited - try again later.");
+            return;
+          }
+          if (!matchResult.matched) continue;
+          const firstEntry = {
+            id: matchResult.uri, source: 'spotify', uri: matchResult.uri, context_uri: null,
+            radio_id: candidate.id, radio_session_id: session_id,
+            track_name: candidate.track_name, artist_name: candidate.artist_name,
+            album_name: candidate.album_name, artwork_url: matchResult.artwork_url,
+          };
+          startQueue([firstEntry], { spotifyMatchPool: buildRadioSpotifyPool(session_id, mapped.slice(i + 1)) });
+          return;
+        }
+        setRadioStatus('No Spotify match found for this radio seed - try a different one.');
+        return;
+      }
+
+      // This Browser: unchanged client-driven preview sampling.
+      if (seedEntry) {
+        startQueue([seedEntry]);
+        if (mapped.length > 0) sampleQueueRadioTracks(mapped);
+        return;
+      }
+      if (mapped.length === 0) {
+        setRadioStatus('No recommendations found for this seed - try a different one.');
+        return;
+      }
+      sampleQueueRadioTracks(mapped, { isInitial: true });
+    } catch (err) {
+      console.error('Error starting radio:', err);
+      setRadioStatus('Failed to start radio. Please try again.');
+    }
+  };
+
+  const stopRadio = () => {
+    if (radioSessionId) {
+      axios.post(`${API_BASE_URL}/radio/${radioSessionId}/stop`).catch((err) => console.error('Error stopping radio session:', err));
+    }
+    // Proactively tell the server to stop feeding this pool right now,
+    // rather than waiting for the advancer to notice the session was
+    // stopped (it only checks on its next refill, once whatever's already
+    // loaded runs out) or for some other action to naturally replace it.
+    // Whatever's currently playing/already queued keeps playing out - this
+    // only stops *future* refilling.
+    if (outputDevice?.type === 'spotify') {
+      spotifyLookaheadRef.current = null;
+      axios.post(`${API_BASE_URL}/playback-session`, {
+        destination_type: outputDevice.type,
+        destination_id: outputDevice.id,
+        now_playing: nowPlaying,
+        queue: queue.slice(0, QUEUE_PERSIST_CAP),
+        shuffle_enabled: shuffleEnabled,
+        clear_spotify_match_pool: true,
+      }).catch((err) => console.error('Error clearing radio pool:', err));
+    }
+    setRadioSessionId(null);
+    setRadioSeed(null);
+    setRadioDestinationType(null);
+    setRadioStatus(null);
+  };
+
+  // Samples up to this many distinct artist names from a playlist's tracks
+  // to seed Radio - shared by the Radio tab's own playlist picker and the
+  // "Start Radio" button on a Playlists-tab group card (see
+  // group-card-actions below). Mirrors DISCOVER_SEED_ARTIST_LIMIT's
+  // reasoning: keeps the seed a sane size even for a huge playlist.
+  const RADIO_PLAYLIST_ARTIST_LIMIT = 8;
+
+  const startRadioFromPlaylist = async (platform, playlistId, playlistName) => {
+    try {
+      const endpoint = platform === 'spotify'
+        ? `${API_BASE_URL}/spotify/playlists/${playlistId}/tracks`
+        : `${API_BASE_URL}/ytmusic/playlists/${playlistId}/tracks`;
+      const response = await axios.get(endpoint);
+      const tracks = response.data || [];
+      const seenArtists = new Set();
+      const artists = [];
+      for (const t of tracks) {
+        // Spotify tracks carry a comma-joined "artists" display string; YT
+        // Music tracks already have a clean artist_name - handle both.
+        const names = t.artist_name ? [t.artist_name] : (t.artists ? t.artists.split(',').map((n) => n.trim()) : []);
+        for (const name of names) {
+          if (name && !seenArtists.has(name)) {
+            seenArtists.add(name);
+            artists.push(name);
+          }
+        }
+        if (artists.length >= RADIO_PLAYLIST_ARTIST_LIMIT) break;
+      }
+      // First track in the playlist stands in for "a track from this
+      // playlist" - mapped into the app's normal playable-track shape
+      // (mapSpotifyTrack/mapYtMusicTrack), same as playGroup already uses
+      // for playing/queuing this same platform's playlist tracks elsewhere.
+      const seedTrack = tracks.length > 0
+        ? (platform === 'spotify' ? mapSpotifyTrack(tracks[0], playlistName) : mapYtMusicTrack(tracks[0], playlistName))
+        : null;
+      await handleStartRadio({ type: 'playlist', description: `Radio from ${playlistName}`, seedArtists: artists, seedTrack });
+    } catch (err) {
+      console.error('Error reading playlist tracks for radio seed:', err);
+      setRadioStatus('Could not read this playlist to start radio.');
+    }
+  };
+
+  // Two jobs, both gated on radio still being what's actually driving
+  // nowPlaying/queue (nowPlaying/queue no longer tagged with this session's
+  // id means the user started something else - a direct library track, a
+  // fresh Discover batch, or a new radio session - which naturally
+  // overwrote the queue the same way startQueue always has):
+  //  1. Clear this tab's own Radio UI state (the "Now streaming" banner,
+  //     Stop button) the moment that happens - runs for every destination,
+  //     including Spotify, purely for UI accuracy.
+  //  2. Client-driven refill via /api/radio/{id}/more - This Browser only.
+  //     Spotify-destination radio hands its candidates to the server-side
+  //     playback_advancer at start time (see handleStartRadio/
+  //     buildRadioSpotifyPool) and keeps refilling itself from there
+  //     indefinitely, surviving this tab backgrounding/closing; reconciling
+  //     what it did once this tab wakes back up needs no special handling
+  //     here - the existing destStatus/playback-session poll
+  //     (reconcileFromServerSession) already generically trusts whatever
+  //     now_playing/queue the server reports, regardless of origin.
+  useEffect(() => {
+    if (!radioSessionId || radioDestinationType === 'ytmusic') return;
+    const stillActive = nowPlaying?.radio_session_id === radioSessionId
+      || queue.some((t) => t.radio_session_id === radioSessionId);
+    if (!stillActive) {
+      setRadioSessionId(null);
+      setRadioSeed(null);
+      setRadioDestinationType(null);
+      return;
+    }
+    if (radioDestinationType !== 'browser') return;
+    if (queue.length > RADIO_REFILL_THRESHOLD) return;
+    const requestSessionId = radioSessionId;
+    axios.post(`${API_BASE_URL}/radio/${radioSessionId}/more`, { count: RADIO_BATCH_SIZE })
+      .then((response) => {
+        if (requestSessionId !== radioSessionId) return; // superseded while this was in flight
+        const { tracks, exhausted } = response.data;
+        if (exhausted) {
+          setRadioStatus('This station is running low on new suggestions for this seed - try a different one for more variety.');
+        }
+        if (tracks.length === 0) return;
+        const mapped = mapRadioTracks(requestSessionId, tracks);
+        sampleQueueRadioTracks(mapped);
+      })
+      .catch((err) => console.error('Error refilling radio queue:', err));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [queue, nowPlaying, radioSessionId, radioDestinationType]);
 
   // Toggle shuffling of the *remaining* queue, keeping the currently-playing
   // track fixed. Remembers the pre-shuffle order so toggling back off restores
@@ -2569,6 +2949,28 @@ function App() {
         {isPreviewingThis ? '◼' : '🎧'}
       </button>
     );
+    // Seeds a new Radio session from this track's artist (see
+    // handleStartRadio) - offered for genuine Library tracks and
+    // Spotify/YT Music playlist tracks, same set sampleButton's availability
+    // badges above already cover, not Discover suggestions (those are
+    // already a similar-music stream themselves).
+    const radioButton = (isLibraryTrack || isPlaylistTrack) && (
+      <button
+        className="play-btn radio-seed"
+        onClick={(e) => {
+          e.stopPropagation();
+          // A playlist track's artist_name can be a comma-joined display
+          // string (see mapSpotifyTrack) - Last.fm's similar-artist lookup
+          // wants one name, so just the primary artist.
+          const primaryArtist = track.artist_name.split(',')[0].trim();
+          handleStartRadio({ type: 'track', description: `Radio from "${track.track_name}"`, seedArtists: [primaryArtist], seedTrack: track });
+        }}
+        aria-label="Start Radio from this track"
+        title="Start Radio from this track"
+      >
+        📻
+      </button>
+    );
     const thumb = (
       <div className="track-thumb-wrap">
         <span className="track-thumb-fallback">{track.track_name.charAt(0).toUpperCase()}</span>
@@ -2607,6 +3009,7 @@ function App() {
           </button>
         )}
         {trackViewStyle !== 'grid' && sampleButton}
+        {trackViewStyle !== 'grid' && radioButton}
         {thumb}
         <div className="track-info">
           <h3>{track.track_name}</h3>
@@ -2637,6 +3040,7 @@ function App() {
           )}
         </div>
         {trackViewStyle === 'grid' && sampleButton}
+        {trackViewStyle === 'grid' && radioButton}
       </div>
     );
   };
@@ -3136,6 +3540,12 @@ function App() {
             }}
           >
             Playlists
+          </button>
+          <button
+            className={activeTab === 'radio' ? 'active' : ''}
+            onClick={() => setActiveTab('radio')}
+          >
+            Radio
           </button>
           <button
             className={activeTab === 'cleanup' ? 'active' : ''}
@@ -3681,6 +4091,12 @@ function App() {
                           <div className="group-card-actions">
                             <button title="Play all" onClick={() => playGroup({ by: libraryMode, key: g.key })}>&#9654;</button>
                             <button title="Shuffle" onClick={() => playGroup({ by: libraryMode, key: g.key }, { shuffle: true })}>&#128256;</button>
+                            <button
+                              title="Start Radio from this playlist"
+                              onClick={() => startRadioFromPlaylist(libraryMode === 'ytmusic-playlist' ? 'ytmusic' : 'spotify', g.key, g.label)}
+                            >
+                              &#128246;
+                            </button>
                           </div>
                         </div>
                       ))
@@ -3723,6 +4139,22 @@ function App() {
               </>
             )}
           </section>
+        ) : activeTab === 'radio' ? (
+          <RadioTab
+            apiBase={API_BASE_URL}
+            outputDevice={outputDevice}
+            ytMusicConnected={ytMusicConnected}
+            radioDestination={radioDestination}
+            setRadioDestination={setRadioDestination}
+            radioDestinationType={radioDestinationType}
+            radioSessionId={radioSessionId}
+            radioSeed={radioSeed}
+            radioStatus={radioStatus}
+            onDismissRadioStatus={() => setRadioStatus(null)}
+            onStartRadio={handleStartRadio}
+            onStartRadioFromPlaylist={startRadioFromPlaylist}
+            onStopRadio={stopRadio}
+          />
         ) : (
           <CleanupTab
             apiBase={API_BASE_URL}
@@ -4131,7 +4563,8 @@ function PlayerBar({
     : track.source === 'spotify' ? 'Spotify'
       : track.source === 'ytmusic' ? 'YouTube Music'
         : track.source === 'discover' ? 'Discover'
-          : 'Your Library';
+          : track.source === 'radio' ? 'Radio'
+            : 'Your Library';
   const sourceColor = track.origin_library ? 'var(--accent-hover)'
     : track.source === 'spotify' ? '#1db954'
       : track.source === 'ytmusic' ? '#ff0000'
@@ -4163,7 +4596,7 @@ function PlayerBar({
   // exists locally; otherwise there's nothing to serve.
   const trackArtworkUrl = (t) => t.artwork_url || (
     (t.source === 'spotify' || t.source === 'ytmusic') ? (t.local_id != null ? `${apiBase}/tracks/${t.local_id}/artwork` : '')
-      : t.source === 'discover' ? ''
+      : (t.source === 'discover' || t.source === 'radio') ? ''
         : `${apiBase}/tracks/${t.id}/artwork`
   );
   // track.id is a Spotify uri or YouTube video_id (not a real local track
@@ -4178,7 +4611,7 @@ function PlayerBar({
   // (source 'discover') is a third case, handled separately below via its
   // own preview_url - it was never a local_id candidate to begin with.
   const localStreamId = track.source === 'spotify' || track.source === 'ytmusic' ? (track.local_id ?? null)
-    : track.source === 'discover' ? null
+    : (track.source === 'discover' || track.source === 'radio') ? null
     : track.id;
 
   return (
@@ -4469,7 +4902,7 @@ function PlayerBar({
           {techParts.length > 0 && <p className="player-tech">{techParts.join(' · ')}</p>}
         </div>
 
-        {!outputDevice && (track.source === 'discover' ? (
+        {!outputDevice && ((track.source === 'discover' || track.source === 'radio') ? (
           track.preview_url ? (
             <audio
               key={track.id}
@@ -4541,6 +4974,292 @@ function BarChart({ title, entries }) {
         ))}
       </div>
     </div>
+  );
+}
+
+// Track/artist/playlist-seeded continuous radio. Picking a seed (or clicking
+// "Start Radio" on a Library/Playlists track or group card - see
+// renderTrackCard/group-card-actions) calls onStartRadio; the actual
+// matching/queueing/refilling lives in App itself (handleStartRadio and the
+// two functions/effect around it), since that needs direct access to
+// queue/startQueue/outputDevice the same way Discover's does - this
+// component is just the picker + status display, same division of labor as
+// CleanupTab being handed onTrackPlayClick rather than owning playback logic.
+function RadioTab({
+  apiBase, outputDevice, ytMusicConnected,
+  radioDestination, setRadioDestination, radioDestinationType,
+  radioSessionId, radioSeed, radioStatus, onDismissRadioStatus,
+  onStartRadio, onStartRadioFromPlaylist, onStopRadio,
+}) {
+  const [seedMode, setSeedMode] = useState('track');
+  const [trackQuery, setTrackQuery] = useState('');
+  const [trackResults, setTrackResults] = useState([]);
+  const [artistQuery, setArtistQuery] = useState('');
+  const [artistResults, setArtistResults] = useState([]);
+  const [playlists, setPlaylists] = useState([]);
+  const [playlistsLoaded, setPlaylistsLoaded] = useState(false);
+  const [playlistsLoading, setPlaylistsLoading] = useState(false);
+  const [startingSeedKey, setStartingSeedKey] = useState(null);
+  const [ytJobStatus, setYtJobStatus] = useState(null);
+
+  useEffect(() => {
+    const q = trackQuery.trim();
+    if (q.length < 2) { setTrackResults([]); return; }
+    const handle = setTimeout(() => {
+      axios.get(`${apiBase}/tracks/known`, { params: { search: q, limit: 10 } })
+        .then((r) => setTrackResults(r.data.tracks || []))
+        .catch(() => setTrackResults([]));
+    }, 300);
+    return () => clearTimeout(handle);
+  }, [trackQuery, apiBase]);
+
+  useEffect(() => {
+    const q = artistQuery.trim();
+    if (q.length < 2) { setArtistResults([]); return; }
+    const handle = setTimeout(() => {
+      axios.get(`${apiBase}/library/artists/search`, { params: { q, limit: 8 } })
+        .then((r) => setArtistResults(r.data || []))
+        .catch(() => setArtistResults([]));
+    }, 300);
+    return () => clearTimeout(handle);
+  }, [artistQuery, apiBase]);
+
+  useEffect(() => {
+    if (seedMode !== 'playlist' || playlistsLoaded || playlistsLoading) return;
+    setPlaylistsLoading(true);
+    Promise.all([
+      axios.get(`${apiBase}/spotify/playlists`).then((r) => r.data.map((p) => ({ ...p, platform: 'spotify' }))).catch(() => []),
+      axios.get(`${apiBase}/ytmusic/playlists`).then((r) => r.data.map((p) => ({ ...p, platform: 'ytmusic' }))).catch(() => []),
+    ]).then(([spotifyPlaylists, ytPlaylists]) => {
+      setPlaylists([...spotifyPlaylists, ...ytPlaylists]);
+      setPlaylistsLoaded(true);
+    }).finally(() => setPlaylistsLoading(false));
+  }, [seedMode, playlistsLoaded, playlistsLoading, apiBase]);
+
+  // Shows this session's YouTube Music playlist job progress - same status
+  // route the existing YtMusicPushPanel polls, just read here too since
+  // radio's ytmusic destination has no in-app queue/PlayerBar of its own to
+  // show progress through.
+  useEffect(() => {
+    if (radioDestinationType !== 'ytmusic' || !radioSessionId) { setYtJobStatus(null); return; }
+    let cancelled = false;
+    const poll = () => {
+      axios.get(`${apiBase}/ytmusic/push-job/status`).then((r) => { if (!cancelled) setYtJobStatus(r.data); }).catch(() => {});
+    };
+    poll();
+    const intervalId = setInterval(poll, 5000);
+    return () => { cancelled = true; clearInterval(intervalId); };
+  }, [radioDestinationType, radioSessionId, apiBase]);
+
+  // Keeps the YouTube Music playlist job topped up with fresh tracks while
+  // this tab is open - a conservative interval/batch size given the shared
+  // daily quota (DAILY_SAFE_BUDGET in ytmusic_push_job.py) every other YTM
+  // push on the account draws from too.
+  useEffect(() => {
+    if (radioDestinationType !== 'ytmusic' || !radioSessionId) return;
+    const intervalId = setInterval(() => {
+      axios.post(`${apiBase}/radio/${radioSessionId}/more`, { count: 5 })
+        .catch((err) => console.error('Error refilling YouTube Music radio playlist:', err));
+    }, 90000);
+    return () => clearInterval(intervalId);
+  }, [radioDestinationType, radioSessionId, apiBase]);
+
+  const startFromTrack = (track) => {
+    // track already came from /tracks/known - the exact plain library-track
+    // shape onStartRadio/resolveSeedTrackForPlayback expects to play first.
+    onStartRadio({ type: 'track', description: `Radio from "${track.track_name}"`, seedArtists: [track.artist_name], seedTrack: track });
+  };
+
+  const startFromArtist = async (artistName) => {
+    const key = `artist-${artistName}`;
+    setStartingSeedKey(key);
+    // Finds one real library track by this artist to play first - the
+    // artist box itself only ever suggests names already present in the
+    // library (see /api/library/artists/search), so this is expected to
+    // succeed almost always; falls back to starting cold on suggestions if
+    // it doesn't (see resolveSeedTrackForPlayback's null case).
+    let seedTrack = null;
+    try {
+      const response = await axios.get(`${apiBase}/tracks/known`, { params: { search: artistName, limit: 10 } });
+      const candidates = response.data.tracks || [];
+      seedTrack = candidates.find((t) => t.artist_name?.toLowerCase() === artistName.toLowerCase()) || candidates[0] || null;
+    } catch (err) {
+      console.error('Error finding a track for this artist:', err);
+    }
+    try {
+      await onStartRadio({ type: 'artist', description: `Radio from ${artistName}`, seedArtists: [artistName], seedTrack });
+    } finally {
+      setStartingSeedKey(null);
+    }
+  };
+
+  const startFromPlaylist = async (playlist) => {
+    const key = `${playlist.platform}-${playlist.id}`;
+    setStartingSeedKey(key);
+    try {
+      await onStartRadioFromPlaylist(playlist.platform, playlist.id, playlist.name);
+    } finally {
+      setStartingSeedKey(null);
+    }
+  };
+
+  const destinationLabel = radioDestination === 'ytmusic' ? 'YouTube Music (playlist)'
+    : outputDevice ? outputDevice.name
+      : 'This Browser';
+
+  return (
+    <section className="radio-section">
+      <InfoPopup message={radioStatus} onClose={onDismissRadioStatus} />
+
+      <div className="radio-header">
+        <h2>Radio</h2>
+        <p className="radio-subtitle">Pick a track, artist, or playlist below and Radio keeps playing similar music continuously.</p>
+      </div>
+
+      <div className="radio-destination-row">
+        <span className="radio-destination-label">Destination:</span>
+        <button
+          className={radioDestination !== 'ytmusic' && !outputDevice ? 'active' : ''}
+          onClick={() => setRadioDestination('inherit')}
+        >
+          🔊 This Browser
+        </button>
+        {outputDevice && outputDevice.type === 'spotify' && (
+          <button className={radioDestination !== 'ytmusic' ? 'active' : ''} onClick={() => setRadioDestination('inherit')}>
+            🟢 {outputDevice.name}
+          </button>
+        )}
+        {ytMusicConnected && (
+          <button className={radioDestination === 'ytmusic' ? 'active' : ''} onClick={() => setRadioDestination('ytmusic')}>
+            ▶️ YouTube Music playlist
+          </button>
+        )}
+        {outputDevice && outputDevice.type !== 'spotify' && (
+          <span className="radio-destination-hint">
+            {outputDevice.name} can't play Radio directly - pick This Browser, a Spotify Connect device, or YouTube Music above.
+          </span>
+        )}
+      </div>
+
+      {radioSessionId && (
+        <div className="radio-now-streaming">
+          <div>
+            <strong>Now streaming:</strong> {radioSeed?.description || 'Radio'}
+            <span className="radio-destination-tag"> → {destinationLabel}</span>
+          </div>
+          <button className="scan-btn" onClick={onStopRadio}>Stop Radio</button>
+        </div>
+      )}
+
+      {radioDestinationType === 'ytmusic' && radioSessionId && (
+        <div className="radio-ytmusic-status">
+          {ytJobStatus && ytJobStatus.status !== 'idle' ? (
+            <>
+              <p>
+                {ytJobStatus.status === 'waiting_quota'
+                  ? 'Paused - daily YouTube quota reached, resumes automatically.'
+                  : `Building "${ytJobStatus.name}" - ${ytJobStatus.tracks_processed_total || 0}/${ytJobStatus.total || 0} tracks processed.`}
+              </p>
+              {ytJobStatus.playlist_url && (
+                <a href={ytJobStatus.playlist_url} target="_blank" rel="noopener noreferrer" className="scan-btn">
+                  Open in YouTube Music
+                </a>
+              )}
+            </>
+          ) : (
+            <p className="empty-state">Starting the YouTube Music playlist…</p>
+          )}
+        </div>
+      )}
+
+      <div className="radio-seed-picker">
+        <div className="radio-seed-tabs">
+          <button className={seedMode === 'track' ? 'active' : ''} onClick={() => setSeedMode('track')}>Track</button>
+          <button className={seedMode === 'artist' ? 'active' : ''} onClick={() => setSeedMode('artist')}>Artist</button>
+          <button className={seedMode === 'playlist' ? 'active' : ''} onClick={() => setSeedMode('playlist')}>Playlist</button>
+        </div>
+
+        {seedMode === 'track' && (
+          <div className="radio-seed-panel">
+            <input
+              type="text"
+              className="search-input"
+              placeholder="Search your library for a track…"
+              value={trackQuery}
+              onChange={(e) => setTrackQuery(e.target.value)}
+            />
+            <div className="radio-seed-results">
+              {trackResults.map((t) => (
+                <div className="radio-seed-row" key={t.id}>
+                  <div className="radio-seed-row-info">
+                    <span className="radio-seed-row-title">{t.track_name}</span>
+                    <span className="radio-seed-row-subtitle">{t.artist_name}</span>
+                  </div>
+                  <button className="scan-btn" onClick={() => startFromTrack(t)}>Start Radio</button>
+                </div>
+              ))}
+              {trackQuery.trim().length >= 2 && trackResults.length === 0 && (
+                <p className="empty-state">No matching tracks.</p>
+              )}
+            </div>
+          </div>
+        )}
+
+        {seedMode === 'artist' && (
+          <div className="radio-seed-panel">
+            <input
+              type="text"
+              className="search-input"
+              placeholder="Search for an artist…"
+              value={artistQuery}
+              onChange={(e) => setArtistQuery(e.target.value)}
+            />
+            <div className="radio-seed-results">
+              {artistResults.map((a) => (
+                <div className="radio-seed-row" key={a.key}>
+                  <div className="radio-seed-row-info">
+                    <span className="radio-seed-row-title">{a.key}</span>
+                  </div>
+                  <button className="scan-btn" disabled={startingSeedKey === `artist-${a.key}`} onClick={() => startFromArtist(a.key)}>
+                    {startingSeedKey === `artist-${a.key}` ? 'Starting…' : 'Start Radio'}
+                  </button>
+                </div>
+              ))}
+              {artistQuery.trim().length >= 2 && artistResults.length === 0 && (
+                <p className="empty-state">No matching artists.</p>
+              )}
+            </div>
+          </div>
+        )}
+
+        {seedMode === 'playlist' && (
+          <div className="radio-seed-panel">
+            {playlistsLoading ? (
+              <p className="empty-state">Loading playlists…</p>
+            ) : playlists.length === 0 ? (
+              <p className="empty-state">No Spotify or YouTube Music playlists found.</p>
+            ) : (
+              <div className="radio-seed-results">
+                {playlists.map((p) => {
+                  const key = `${p.platform}-${p.id}`;
+                  return (
+                    <div className="radio-seed-row" key={key}>
+                      <div className="radio-seed-row-info">
+                        <span className="radio-seed-row-title">{p.name}</span>
+                        <span className="radio-seed-row-subtitle">{p.platform === 'spotify' ? 'Spotify' : 'YouTube Music'}</span>
+                      </div>
+                      <button className="scan-btn" disabled={startingSeedKey === key} onClick={() => startFromPlaylist(p)}>
+                        {startingSeedKey === key ? 'Starting…' : 'Start Radio'}
+                      </button>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+    </section>
   );
 }
 

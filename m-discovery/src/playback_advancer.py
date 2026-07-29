@@ -5,7 +5,8 @@ import time
 from . import wiim
 from . import chromecast
 from . import spotify_connect
-from .database import get_db_connection
+from . import radio_engine
+from .database import get_db_connection, get_radio_session, append_seen_track_keys
 
 PUBLIC_BASE_URL = os.environ.get('PUBLIC_BASE_URL', 'http://localhost:8001')
 
@@ -47,6 +48,12 @@ CHROMECAST_REFILL_BATCH = 20
 # before giving up for this tick, so one unlucky dry streak in the shuffle
 # order can't burn requests unboundedly.
 SPOTIFY_MATCH_CONSECUTIVE_CAP = 20
+
+# How many fresh Last.fm suggestions to pull in one go when a Radio-fed pool
+# runs dry mid-tick - mirrors the frontend's own RADIO_BATCH_SIZE. Fetched at
+# most once per tick (see _advance_spotify) regardless of this size, so this
+# only bounds how much a single refill grows the pool by, not how often.
+RADIO_ADVANCER_REFILL_BATCH = 10
 
 
 def _track_to_cast_item(track):
@@ -249,6 +256,21 @@ def _match_local_track_cached(track_id, track_name, artist_name):
         conn.close()
 
 
+def _match_text_candidate(track_name, artist_name):
+    """Matches a Radio-suggested track directly against Spotify's catalog -
+    Last.fm text suggestions have no known_tracks row, so unlike
+    _match_local_track_cached above there's no cache to check or write, just
+    a one-off search. Same call main.py's match_discovered_track_to_spotify
+    makes for a pure-text Discover suggestion, just invoked from this
+    background thread's own call site instead of an HTTP request."""
+    result, match, _identified = spotify_connect.search_track(track_name, artist_name)
+    if result == 'unavailable':
+        return {"matched": False, "reason": "unavailable"}
+    if not match:
+        return {"matched": False, "reason": "no_match"}
+    return {"matched": True, "uri": match['uri'], "artwork_url": match.get('artwork_url')}
+
+
 def _advance_spotify(save_session, destination_id, now_playing, queue, match_pool):
     """For an ad-hoc (non-context_uri) session with a lookahead track already
     queued, drives the transition explicitly near end-of-track via play_uris
@@ -325,43 +347,101 @@ def _advance_spotify(save_session, destination_id, now_playing, queue, match_poo
 
     candidates = match_pool.get('candidates') or []
     cursor = match_pool.get('cursor', 0)
+    # Only set for a Radio-fed pool (see App.js's handleStartRadio) - a
+    # library-cast pool's candidates are a finite array to walk through
+    # (backed by a real, bounded local library), nothing to fetch more of.
+    radio_session_id = match_pool.get('radio_session_id')
     consecutive_misses = 0
-    while cursor < len(candidates) and consecutive_misses < SPOTIFY_MATCH_CONSECUTIVE_CAP:
-        candidate = candidates[cursor]
-        cursor += 1
-        match_result = _match_local_track_cached(candidate.get('id'), candidate.get('track_name'), candidate.get('artist_name'))
-        if match_result.get('reason') == 'unavailable':
-            # Don't stall the whole refill over one not-yet-checked candidate
-            # - anything further ahead that's already cached (spotify_prewarm.py,
-            # a previous session, a YT Music cross-reference) resolves
-            # straight from the DB with no live search at all, so it's worth
-            # trying rather than leaving playback stuck. Doesn't count toward
-            # consecutive_misses (a rate-limited stretch isn't the same
-            # signal as a genuine run of "not on Spotify" tracks), and this
-            # candidate simply won't get retried by this pool again -
-            # spotify_prewarm.py's own independent, library-wide sweep still
-            # picks it up eventually, so "keep something playing" wins over
-            # "guarantee every candidate gets tried in order."
-            continue
-        if match_result.get('matched'):
-            found = {
-                'id': match_result['uri'], 'source': 'spotify', 'uri': match_result['uri'], 'context_uri': None,
-                'local_id': candidate.get('id'),
-                'track_name': candidate.get('track_name'), 'artist_name': candidate.get('artist_name'),
-                'album_name': candidate.get('album_name'), 'duration_seconds': candidate.get('duration_seconds'),
-                'artwork_url': match_result.get('artwork_url'),
-                # Still a Library track as far as the "Source: ..." label is
-                # concerned, same as App.js's mapMatchedLocalTrack - this is
-                # just the server-side equivalent of that same match+play.
-                'origin_library': True,
-            }
-            spotify_connect.add_to_queue(destination_id, match_result['uri'])
-            match_pool = {'candidates': candidates, 'cursor': cursor}
-            save_session(queue=[found], spotify_match_pool=match_pool)
-            return match_pool
-        consecutive_misses += 1
+    refilled_from_radio = False
+
+    while True:
+        while cursor < len(candidates) and consecutive_misses < SPOTIFY_MATCH_CONSECUTIVE_CAP:
+            candidate = candidates[cursor]
+            cursor += 1
+            candidate_id = candidate.get('id')
+            # A real known_tracks id (library-cast) uses the cache-first
+            # matcher; a Radio candidate (Last.fm text suggestion, no local
+            # row - id is None) has nothing to cache against, so it's
+            # searched directly.
+            if candidate_id is not None:
+                match_result = _match_local_track_cached(candidate_id, candidate.get('track_name'), candidate.get('artist_name'))
+            else:
+                match_result = _match_text_candidate(candidate.get('track_name'), candidate.get('artist_name'))
+            if match_result.get('reason') == 'unavailable':
+                # Don't stall the whole refill over one not-yet-checked candidate
+                # - anything further ahead that's already cached (spotify_prewarm.py,
+                # a previous session, a YT Music cross-reference) resolves
+                # straight from the DB with no live search at all, so it's worth
+                # trying rather than leaving playback stuck. Doesn't count toward
+                # consecutive_misses (a rate-limited stretch isn't the same
+                # signal as a genuine run of "not on Spotify" tracks), and this
+                # candidate simply won't get retried by this pool again -
+                # spotify_prewarm.py's own independent, library-wide sweep still
+                # picks it up eventually, so "keep something playing" wins over
+                # "guarantee every candidate gets tried in order."
+                continue
+            if match_result.get('matched'):
+                found = {
+                    'id': match_result['uri'], 'source': 'spotify', 'uri': match_result['uri'], 'context_uri': None,
+                    'track_name': candidate.get('track_name'), 'artist_name': candidate.get('artist_name'),
+                    'album_name': candidate.get('album_name'), 'duration_seconds': candidate.get('duration_seconds'),
+                    'artwork_url': match_result.get('artwork_url'),
+                }
+                if candidate_id is not None:
+                    found['local_id'] = candidate_id
+                    # Still a Library track as far as the "Source: ..." label
+                    # is concerned, same as App.js's mapMatchedLocalTrack -
+                    # this is just the server-side equivalent of that same
+                    # match+play.
+                    found['origin_library'] = True
+                elif radio_session_id is not None:
+                    # Bridges back to the Radio session that suggested this
+                    # track - App.js's continuous-refill effect uses this to
+                    # tell "radio is still what's playing" apart from
+                    # anything else, same role it plays for a client-resolved
+                    # radio match.
+                    found['radio_session_id'] = radio_session_id
+                spotify_connect.add_to_queue(destination_id, match_result['uri'])
+                match_pool = {'candidates': candidates, 'cursor': cursor}
+                if radio_session_id is not None:
+                    match_pool['radio_session_id'] = radio_session_id
+                save_session(queue=[found], spotify_match_pool=match_pool)
+                return match_pool
+            consecutive_misses += 1
+
+        # The inner loop stopped either because it ran out of candidates
+        # (cursor caught up to len(candidates) - genuinely exhausted) or hit
+        # the consecutive-miss cap (candidates remain, just giving up for
+        # this tick). Only the first case is worth refilling for, and only
+        # once per tick - a genuinely dry seed shouldn't turn into a tight
+        # retry loop, and consecutive_misses is deliberately NOT reset after
+        # a refill, so the total real-search-call budget for this tick stays
+        # at SPOTIFY_MATCH_CONSECUTIVE_CAP regardless of how many batches it
+        # spans - same pacing guarantee as before, just now shared across an
+        # old pool's tail and a freshly-fetched one.
+        if refilled_from_radio or cursor < len(candidates) or radio_session_id is None:
+            break
+        session = get_radio_session(radio_session_id)
+        if session is None or session.get('status') != 'active':
+            break
+        conn = get_db_connection()
+        if conn is None:
+            break
+        try:
+            new_tracks = radio_engine.generate_fresh_radio_tracks(
+                session['seed_artists'], 'spotify', session.get('seen_track_keys') or [], RADIO_ADVANCER_REFILL_BATCH, conn,
+            )
+        finally:
+            conn.close()
+        refilled_from_radio = True
+        if not new_tracks:
+            break
+        append_seen_track_keys(radio_session_id, [radio_engine.radio_track_key(t['track_name'], t['artist_name']) for t in new_tracks])
+        candidates = candidates + [{'id': None, 'track_name': t['track_name'], 'artist_name': t['artist_name']} for t in new_tracks]
 
     match_pool = {'candidates': candidates, 'cursor': cursor}
+    if radio_session_id is not None:
+        match_pool['radio_session_id'] = radio_session_id
     save_session(spotify_match_pool=match_pool)
     return match_pool
 
