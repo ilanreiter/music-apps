@@ -311,6 +311,11 @@ def _advance_spotify(save_session, destination_id, now_playing, queue, match_poo
                     # forward rather than losing it (see App.js's
                     # mapSpotifyTrack/PlayerBar's "Source: ..." label).
                     'playlist_name': (now_playing or {}).get('playlist_name'),
+                    # Same reasoning - a Library track matched to Spotify's
+                    # catalog for Connect playback (see App.js's
+                    # mapMatchedLocalTrack) is still a Library track as far as
+                    # the "Source: ..." label is concerned.
+                    'origin_library': (now_playing or {}).get('origin_library'),
                 }
             save_session(now_playing=now_playing, queue=queue)
             is_context = bool((now_playing or {}).get('context_uri'))

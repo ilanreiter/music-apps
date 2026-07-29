@@ -1953,6 +1953,13 @@ function App() {
       track_name: localTrack.track_name, artist_name: localTrack.artist_name,
       album_name: localTrack.album_name, duration_seconds: localTrack.duration_seconds,
       artwork_url: matchResult.artwork_url || localTrack.artwork_url,
+      // source has to stay 'spotify' (a lot of gating logic depends on it -
+      // needsSpotifyConnect, resolveLocalTrackId, etc.), but this is still
+      // fundamentally a Library track that only got matched to Spotify's
+      // catalog so a Connect device could stream it - the PlayerBar's
+      // "Source: ..." label should say Your Library, not Spotify, since
+      // that's genuinely where the user picked it from.
+      origin_library: true,
     };
   }
 
@@ -4112,13 +4119,15 @@ function PlayerBar({
   // playlists at once) or a Spotify-Connect-matched track (originated from
   // Discover/a local track/a YT Music track, not literally a Spotify
   // playlist), so those just show the bare source name.
-  const sourceLabel = track.source === 'spotify' ? 'Spotify'
-    : track.source === 'ytmusic' ? 'YouTube Music'
-      : track.source === 'discover' ? 'Discover'
-        : 'Your Library';
-  const sourceColor = track.source === 'spotify' ? '#1db954'
-    : track.source === 'ytmusic' ? '#ff0000'
-      : 'var(--accent-hover)';
+  const sourceLabel = track.origin_library ? 'Your Library'
+    : track.source === 'spotify' ? 'Spotify'
+      : track.source === 'ytmusic' ? 'YouTube Music'
+        : track.source === 'discover' ? 'Discover'
+          : 'Your Library';
+  const sourceColor = track.origin_library ? 'var(--accent-hover)'
+    : track.source === 'spotify' ? '#1db954'
+      : track.source === 'ytmusic' ? '#ff0000'
+        : 'var(--accent-hover)';
   const nowPlayingContext = (
     <>
       Source: <span className="player-source-name" style={{ color: sourceColor }}>
