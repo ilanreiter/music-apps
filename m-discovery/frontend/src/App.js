@@ -1995,6 +1995,7 @@ function App() {
   const findNextSpotifyMatch = async (requestId) => {
     const pool = spotifyLookaheadRef.current;
     let consecutiveMisses = 0;
+    let sawRateLimit = false;
     while (pool.cursor < pool.candidates.length && consecutiveMisses < SPOTIFY_MATCH_CONSECUTIVE_CAP) {
       if (spotifyMatchRequestIdRef.current !== requestId) return { found: null, rateLimited: false };
       const candidate = pool.candidates[pool.cursor];
@@ -2007,13 +2008,20 @@ function App() {
           return { found: mapMatchedLocalTrack(candidate, { uri, artwork_url: artworkUrl }), rateLimited: false };
         }
         if (reason === 'unavailable') {
-          // Leave the cursor pointing at this same candidate rather than past
-          // it - it genuinely wasn't checked (a rate-limit, not a real
-          // no-match), so it should get a real retry next time instead of
-          // being silently skipped forever (same fix as
-          // playback_advancer._advance_spotify's identical loop).
-          pool.cursor -= 1;
-          return { found: null, rateLimited: true };
+          // The search itself is down for *this* not-yet-checked candidate,
+          // but that doesn't mean every remaining one needs a live search
+          // too - anything already matched before (spotify_prewarm.py, a
+          // prior session, a YT Music cross-reference) resolves straight
+          // from the DB cache with no live search at all (see main.py's
+          // _match_track_to_spotify), so it's worth trying rather than
+          // stalling playback entirely on the first rate-limited track.
+          // Doesn't count toward consecutiveMisses - a rate-limited stretch
+          // isn't the same signal as a genuine run of "not on Spotify"
+          // tracks - and this candidate simply won't get retried by this
+          // pool again, same trade-off playback_advancer._advance_spotify
+          // makes for its own identical loop.
+          sawRateLimit = true;
+          continue;
         }
         setSkippedTrackIds((prev) => (prev.has(candidate.id) ? prev : new Set(prev).add(candidate.id)));
         consecutiveMisses += 1;
@@ -2022,7 +2030,7 @@ function App() {
         return { found: null, rateLimited: false };
       }
     }
-    return { found: null, rateLimited: false };
+    return { found: null, rateLimited: sawRateLimit };
   };
 
   // Shared by every "play these local tracks via Spotify" entry point -
@@ -4139,6 +4147,14 @@ function PlayerBar({
   const displayVolume = outputDevice ? (destStatus?.volume ?? 100) : volume;
   const handleVolumeSliderChange = (e) => onSetVolume(Number(e.target.value));
   const deviceIcon = (d) => (d.type === 'chromecast' ? '📺' : d.type === 'spotify' ? '🟢' : '📡');
+  // Same idea as deviceIcon (destination-menu rows) but for the "Playing on"
+  // status grid - Spotify gets its real brand mark (SpotifyIcon, same as the
+  // availability badges) since we have one; WiiM/Chromecast/This Browser
+  // don't have a brand SVG in this app, so they stay emoji.
+  const destinationIcon = !outputDevice ? '🔊'
+    : outputDevice.type === 'spotify' ? <SpotifyIcon />
+      : outputDevice.type === 'chromecast' ? '📺'
+        : '📡';
   // Discover/Spotify/YT-Music-sourced tracks have no known_tracks row of
   // their own - t.id is a Spotify uri or YouTube video_id for those, not
   // the integer local track id this endpoint expects (confirmed live: a
@@ -4370,6 +4386,7 @@ function PlayerBar({
               </span>
               <span className="player-status-label">Playing on:</span>
               <span className="player-status-value" title={destinationLabel}>
+                <span className="player-destination-icon">{destinationIcon}</span>
                 <span className="player-destination-name">{destinationLabel}</span>
               </span>
             </div>

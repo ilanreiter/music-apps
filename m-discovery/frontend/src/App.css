@@ -1627,6 +1627,13 @@ main.with-player {
   white-space: nowrap;
 }
 
+.player-destination-icon {
+  display: inline-flex;
+  align-items: center;
+  margin-right: 4px;
+  vertical-align: middle;
+}
+
 .player-destination-name {
   color: #1db954;
   font-weight: 600;

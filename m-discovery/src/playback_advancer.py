@@ -331,18 +331,18 @@ def _advance_spotify(save_session, destination_id, now_playing, queue, match_poo
         cursor += 1
         match_result = _match_local_track_cached(candidate.get('id'), candidate.get('track_name'), candidate.get('artist_name'))
         if match_result.get('reason') == 'unavailable':
-            # Leave the cursor pointing at this same candidate rather than
-            # past it - confirmed live: a rate-limited stretch mid-session
-            # permanently orphaned whatever candidate was current at the
-            # time, since cursor had already advanced before the rate-limit
-            # was discovered, and cursor only ever moves forward. This
-            # candidate genuinely wasn't checked (spotify_checked stays
-            # False), so it should get a real retry once the block clears,
-            # not be skipped forever. Safe to retry every tick now that
-            # spotify_connect's cooldown makes a still-blocked retry free
-            # (no real API call) instead of hammering the same 429.
-            cursor -= 1
-            break
+            # Don't stall the whole refill over one not-yet-checked candidate
+            # - anything further ahead that's already cached (spotify_prewarm.py,
+            # a previous session, a YT Music cross-reference) resolves
+            # straight from the DB with no live search at all, so it's worth
+            # trying rather than leaving playback stuck. Doesn't count toward
+            # consecutive_misses (a rate-limited stretch isn't the same
+            # signal as a genuine run of "not on Spotify" tracks), and this
+            # candidate simply won't get retried by this pool again -
+            # spotify_prewarm.py's own independent, library-wide sweep still
+            # picks it up eventually, so "keep something playing" wins over
+            # "guarantee every candidate gets tried in order."
+            continue
         if match_result.get('matched'):
             found = {
                 'id': match_result['uri'], 'source': 'spotify', 'uri': match_result['uri'], 'context_uri': None,
@@ -350,6 +350,10 @@ def _advance_spotify(save_session, destination_id, now_playing, queue, match_poo
                 'track_name': candidate.get('track_name'), 'artist_name': candidate.get('artist_name'),
                 'album_name': candidate.get('album_name'), 'duration_seconds': candidate.get('duration_seconds'),
                 'artwork_url': match_result.get('artwork_url'),
+                # Still a Library track as far as the "Source: ..." label is
+                # concerned, same as App.js's mapMatchedLocalTrack - this is
+                # just the server-side equivalent of that same match+play.
+                'origin_library': True,
             }
             spotify_connect.add_to_queue(destination_id, match_result['uri'])
             match_pool = {'candidates': candidates, 'cursor': cursor}
