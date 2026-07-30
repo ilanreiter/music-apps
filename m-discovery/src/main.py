@@ -16,7 +16,8 @@ from .database import (
     create_radio_session, get_radio_session, append_seen_track_keys,
     set_radio_session_ytmusic_job, stop_radio_session, append_tracks_to_ytmusic_push_job,
     has_active_spotify_radio_session, count_searches_since_ny_midnight, get_spotify_quota_state,
-    set_prewarm_paused, is_prewarm_paused,
+    set_prewarm_paused, is_prewarm_paused, upsert_radio_discovered_track,
+    get_radio_cooldown_days, set_radio_cooldown_days,
 )
 from .library_scanner import run_scan
 from .artwork import get_or_create_thumbnail, check_artwork_presence, cache_key_for, normalize_album_name, normalized_album_sql, save_thumbnail
@@ -507,6 +508,13 @@ class SpotifyMatchResult(BaseModel):
     uri: Optional[str] = None
     artwork_url: Optional[str] = None
     reason: Optional[str] = None  # "no_match" | "unavailable", set when matched=False
+    # Set only for a track with no known_tracks row at all (not part of the
+    # library) - see upsert_radio_discovered_track/radio_discovered_tracks.
+    # The frontend carries this onto the queued track (radio_track_id) the
+    # same way a library match's own id already rides along as local_id, so
+    # database._record_track_played can stamp last_played_at on the right
+    # row regardless of source.
+    radio_track_id: Optional[int] = None
 
 class NativeRadioSeedRequest(BaseModel):
     track_uri: str
@@ -1968,7 +1976,18 @@ def match_discovered_track_to_spotify(params: DiscoverTrackMatchRequest):
                 backfill_ytmusic_cache_match(params.ytmusic_video_id, match['uri'])
                 if known_match:
                     backfill_known_track_ids(known_match['id'], spotify_track_id=match['uri'].split(':')[-1])
-            return {"matched": True, "uri": match['uri'], "artwork_url": match.get('artwork_url')}
+            radio_track_id = None
+            if not known_match:
+                # No known_tracks row at all for this one (not part of the
+                # library) - worth remembering for a *future* radio
+                # session's own cache tiers regardless of whether Discover
+                # or Radio's own client-side fallback is what searched for
+                # it just now - see upsert_radio_discovered_track.
+                radio_track_id = upsert_radio_discovered_track(
+                    match.get('track_name') or track_name, match.get('artist_name') or artist_name,
+                    None, match['uri'], match.get('artwork_url'),
+                )
+            return {"matched": True, "uri": match['uri'], "artwork_url": match.get('artwork_url'), "radio_track_id": radio_track_id}
     if params.ytmusic_video_id:
         # A settled "no match" is still worth recording - so the background
         # prewarm job (which treats matched_at IS NULL as "not tried yet")
@@ -2059,6 +2078,24 @@ async def set_spotify_prewarm_paused(params: PrewarmPauseRequest):
     on their own to stop consuming budget right now."""
     set_prewarm_paused(params.paused)
     return {"paused": params.paused}
+
+@app.get("/api/radio/cooldown-days")
+async def get_radio_cooldown_days_route():
+    """How many days a track Radio itself played sits out of its own
+    candidate tiers before it's eligible to be suggested again - see
+    radio_engine.py's find_cached_artist_tracks/find_any_cached_tracks/
+    _index_cached_tracks_by_key."""
+    return {"cooldown_days": get_radio_cooldown_days()}
+
+class RadioCooldownRequest(BaseModel):
+    cooldown_days: int
+
+@app.post("/api/radio/cooldown-days")
+async def set_radio_cooldown_days_route(params: RadioCooldownRequest):
+    if params.cooldown_days < 0:
+        raise HTTPException(status_code=400, detail="cooldown_days must be >= 0")
+    set_radio_cooldown_days(params.cooldown_days)
+    return {"cooldown_days": params.cooldown_days}
 
 @app.get("/api/spotify/prewarm/stats")
 async def get_spotify_prewarm_stats(db: psycopg2.extensions.connection = Depends(get_db)):

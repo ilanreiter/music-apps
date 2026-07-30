@@ -6,7 +6,7 @@ from . import wiim
 from . import chromecast
 from . import spotify_connect
 from . import radio_engine
-from .database import get_db_connection, get_radio_session, append_seen_track_keys
+from .database import get_db_connection, get_radio_session, append_seen_track_keys, upsert_radio_discovered_track
 
 PUBLIC_BASE_URL = os.environ.get('PUBLIC_BASE_URL', 'http://localhost:8001')
 
@@ -509,14 +509,25 @@ def _advance_spotify(save_session, destination_id, now_playing, queue, match_poo
             candidate = candidates[cursor]
             cursor += 1
             candidate_id = candidate.get('id')
-            # A real known_tracks id (library-cast) uses the cache-first
-            # matcher; a Radio candidate (Last.fm text suggestion, no local
-            # row - id is None) has nothing to cache against, so it's
-            # searched directly.
-            if candidate_id is not None:
+            discovered_uri = candidate.get('spotify_uri')
+            new_discovery = False
+            # A pre-resolved spotify_uri (radio_engine.find_cached_artist_tracks/
+            # find_any_cached_tracks' radio_discovered_tracks entries) is
+            # already a confirmed match - nothing to look up at all. Otherwise
+            # a real known_tracks id (library-cast) uses the cache-first
+            # matcher; a genuine fresh discovery (a Last.fm text suggestion
+            # with neither) has nothing to cache against, so it's searched
+            # directly - and, if this is the first time it's ever matched,
+            # persisted to radio_discovered_tracks so a *future* radio
+            # session can pull it back up the same free way (see
+            # new_discovery below).
+            if discovered_uri is not None:
+                match_result = {"matched": True, "uri": discovered_uri, "artwork_url": candidate.get('artwork_url')}
+            elif candidate_id is not None:
                 match_result = _match_local_track_cached(candidate_id, candidate.get('track_name'), candidate.get('artist_name'))
             else:
                 match_result = _match_text_candidate(candidate.get('track_name'), candidate.get('artist_name'))
+                new_discovery = match_result.get('matched', False)
             if match_result.get('reason') == 'unavailable':
                 # Don't stall the whole refill over one not-yet-checked candidate
                 # - anything further ahead that's already cached (spotify_prewarm.py,
@@ -546,6 +557,28 @@ def _advance_spotify(save_session, destination_id, now_playing, queue, match_poo
                         # / sourceLabel, which already prefers radio_session_id
                         # over origin_library whenever both could apply.
                         found['origin_library'] = True
+                elif discovered_uri is not None:
+                    # Already a radio_discovered_tracks row (a previous
+                    # session's own discovery) - carry its id forward so
+                    # last_played_at tracking (database._record_track_played)
+                    # can stamp the right row, same role local_id plays for
+                    # a genuine library track.
+                    found['radio_track_id'] = candidate.get('radio_track_id')
+                elif new_discovery:
+                    # The first time this exact track has ever been
+                    # confirmed, from any source - persist it so a *future*
+                    # radio session's own cache tiers
+                    # (radio_engine.find_cached_artist_tracks/find_any_cached_tracks)
+                    # can pull it back up for free instead of needing
+                    # another live search, same "discover new music" goal
+                    # this search already served once, without paying for it
+                    # again every time it comes up.
+                    remembered_id = upsert_radio_discovered_track(
+                        candidate.get('track_name'), candidate.get('artist_name'), candidate.get('album_name'),
+                        match_result['uri'], match_result.get('artwork_url'),
+                    )
+                    if remembered_id is not None:
+                        found['radio_track_id'] = remembered_id
                 if radio_session_id is not None:
                     # Bridges back to the Radio session that suggested this
                     # track - App.js's continuous-refill effect uses this to

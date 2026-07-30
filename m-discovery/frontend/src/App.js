@@ -2177,13 +2177,13 @@ function App() {
     for (const candidate of candidates) {
       if (spotifyMatchRequestIdRef.current !== requestId) return; // superseded
       setMatchingTrackId(candidate.id);
-      let matched, uri, artworkUrl, reason;
+      let matched, uri, artworkUrl, reason, radioTrackId;
       try {
         const response = await axios.post(`${API_BASE_URL}/spotify/discover-match`, {
           track_name: candidate.track_name, artist_name: candidate.artist_name,
           native_track_name: candidate.native_track_name, native_artist_name: candidate.native_artist_name,
         });
-        ({ matched, uri, artwork_url: artworkUrl, reason } = response.data);
+        ({ matched, uri, artwork_url: artworkUrl, reason, radio_track_id: radioTrackId } = response.data);
       } catch (err) {
         console.error('Error matching discovered track to Spotify:', err);
         break;
@@ -2208,6 +2208,12 @@ function App() {
         id: uri, source: 'spotify', uri, context_uri: null, discover_id: candidate.id,
         track_name: candidate.track_name, artist_name: candidate.artist_name,
         album_name: candidate.album_name, artwork_url: artworkUrl,
+        // Set only when this track has no known_tracks row at all - lets
+        // database._record_track_played stamp last_played_at on
+        // radio_discovered_tracks instead, and makes it a free candidate
+        // for a *future* radio session too (see
+        // radio_engine.find_cached_artist_tracks/find_any_cached_tracks).
+        radio_track_id: radioTrackId ?? null,
       };
       if (!firstStarted) {
         setSpotifyMatchProgress(null);
@@ -2258,7 +2264,7 @@ function App() {
     for (const candidate of candidates) {
       if (spotifyMatchRequestIdRef.current !== requestId) return;
       setMatchingTrackId(candidate.id);
-      let matched, uri, artworkUrl, reason;
+      let matched, uri, artworkUrl, reason, radioTrackId;
       if (candidate.matched_spotify_uri) {
         // Already resolved by playlist_match_prewarm.py (see the Playlists
         // tab's "All Tracks" cache) - skip the live search entirely.
@@ -2275,7 +2281,7 @@ function App() {
             // main.py's match_discovered_track_to_spotify.
             ytmusic_video_id: candidate.video_id,
           });
-          ({ matched, uri, artwork_url: artworkUrl, reason } = response.data);
+          ({ matched, uri, artwork_url: artworkUrl, reason, radio_track_id: radioTrackId } = response.data);
         } catch (err) {
           console.error('Error matching YouTube Music track to Spotify:', err);
           break;
@@ -2301,6 +2307,7 @@ function App() {
         // card.
         id: uri, source: 'spotify', uri, context_uri: null, ytmusic_id: candidate.id,
         track_name: candidate.track_name, artist_name: candidate.artist_name, artwork_url: artworkUrl,
+        radio_track_id: radioTrackId ?? null,
       };
       if (!firstStarted) {
         setSpotifyMatchProgress(null);
@@ -2485,6 +2492,7 @@ function App() {
               ytmusic_id: seedTrack.id, radio_session_id: sessionId,
               track_name: seedTrack.track_name, artist_name: seedTrack.artist_name,
               artwork_url: response.data.artwork_url,
+              radio_track_id: response.data.radio_track_id ?? null,
             };
           }
         } catch (err) {
@@ -2619,6 +2627,7 @@ function App() {
         radio_id: candidate.id, radio_session_id: sessionId,
         track_name: candidate.track_name, artist_name: candidate.artist_name,
         album_name: candidate.album_name, artwork_url: matchResult.artwork_url,
+        radio_track_id: matchResult.radio_track_id ?? null,
       };
       commitRadioSession(sessionId, seed, destinationType);
       startQueue([firstEntry], { spotifyMatchPool: buildRadioSpotifyPool(sessionId, candidates.slice(i + 1)) });
@@ -2656,6 +2665,7 @@ function App() {
         radio_session_id: sessionId,
         track_name: candidate.track_name, artist_name: candidate.artist_name,
         album_name: candidate.album_name, artwork_url: matchResult.artwork_url,
+        radio_track_id: matchResult.radio_track_id ?? null,
       };
     }
     return null;

@@ -77,7 +77,8 @@ def create_tables():
                     ADD COLUMN IF NOT EXISTS original_artist_name TEXT,
                     ADD COLUMN IF NOT EXISTS isrc TEXT,
                     ADD COLUMN IF NOT EXISTS ytmusic_video_id TEXT,
-                    ADD COLUMN IF NOT EXISTS ytmusic_checked BOOLEAN DEFAULT FALSE;
+                    ADD COLUMN IF NOT EXISTS ytmusic_checked BOOLEAN DEFAULT FALSE,
+                    ADD COLUMN IF NOT EXISTS last_played_at TIMESTAMP;
             """)
             cur.execute("""
                 ALTER TABLE known_tracks
@@ -407,6 +408,61 @@ def create_tables():
                 );
             """)
             print("Table 'spotify_search_cache' checked/created successfully.")
+
+            # Confirmed Spotify matches for tracks that aren't part of this
+            # user's own library at all - a Radio "fresh discovery" (a
+            # Last.fm suggestion with no known_tracks row) or a Discover
+            # suggestion, successfully matched at least once. Deliberately a
+            # separate table from known_tracks rather than inserting a
+            # fileless row there - known_tracks represents the user's real
+            # local file collection (has_artwork, file scanning, quality
+            # tiers etc. all assume a real file backs each row), and mixing
+            # in tracks the user doesn't actually own would make the
+            # Library tab start showing things that aren't really there.
+            # radio_engine.py's own cache tiers (find_cached_artist_tracks/
+            # find_any_cached_tracks) pull from this table alongside
+            # known_tracks, so a track discovered once - by Radio or
+            # Discover, on any past day - becomes a free, zero-search
+            # candidate for every *future* radio session too, the same
+            # "discover new music" goal a fresh search serves the first
+            # time, without paying for it again every time it comes up.
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS radio_discovered_tracks (
+                    id SERIAL PRIMARY KEY,
+                    track_key TEXT NOT NULL UNIQUE,
+                    track_name TEXT NOT NULL,
+                    artist_name TEXT NOT NULL,
+                    album_name TEXT,
+                    spotify_track_id TEXT NOT NULL,
+                    spotify_album_art_url TEXT,
+                    last_played_at TIMESTAMP,
+                    discovered_at TIMESTAMP DEFAULT NOW()
+                );
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS radio_discovered_tracks_artist_idx
+                    ON radio_discovered_tracks (LOWER(artist_name));
+            """)
+            print("Table 'radio_discovered_tracks' checked/created successfully.")
+
+            # Single settable knob for Radio's own play-cooldown - a track
+            # (library or radio_discovered_tracks) that played within the
+            # last cooldown_days is excluded from radio_engine.py's own
+            # candidate tiers (find_cached_artist_tracks/find_any_cached_tracks/
+            # _index_cached_tracks_by_key), per user request, so the same
+            # song doesn't keep resurfacing across sessions - a week by
+            # default, adjustable via the API. Deliberately doesn't touch
+            # the *seed* track/artist the user explicitly picks to start a
+            # session with, or any other play path (Discover, Shuffle All,
+            # a direct library click) - those are deliberate choices, not
+            # Radio's own suggestions repeating themselves.
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS radio_settings (
+                    id INTEGER PRIMARY KEY DEFAULT 1,
+                    cooldown_days INTEGER NOT NULL DEFAULT 7
+                );
+            """)
+            print("Table 'radio_settings' checked/created successfully.")
 
             # Cache for the Playlists tab's "All Tracks" mode - flattening
             # every playlist's tracks live (N+1 calls to Spotify/YouTube, one
@@ -988,6 +1044,53 @@ def delete_ytmusic_push_job(job_id):
             conn.close()
 
 
+def _now_playing_identity(now_playing):
+    """A stable per-track identifier from a now_playing object - its
+    Spotify/YT Music uri when it has one, otherwise its own id (a bare
+    known_tracks id for a genuine local-file play). Used by
+    save_playback_session to tell "the same track is still playing" apart
+    from "playback just advanced to a new one", so last_played_at only gets
+    touched on a genuine change, not every routine sync."""
+    if not now_playing:
+        return None
+    return now_playing.get('uri') or now_playing.get('id')
+
+
+def _record_track_played(cur, now_playing):
+    """Stamps last_played_at (the moment this track started playing, not
+    when this row happened to get written) on whichever row now_playing
+    actually corresponds to - local_id for a library track cast to
+    Spotify/matched from a playlist (see App.js's mapMatchedLocalTrack/
+    mapSpotifyTrack/mapYtMusicTrack), its own bare id for a genuine
+    local-file play (no 'source' key at all), or radio_track_id for a
+    confirmed match with no known_tracks row at all (see
+    upsert_radio_discovered_track - a Radio "fresh discovery" or Discover
+    suggestion not in the user's own library). Genuinely nothing to record
+    only when none of these apply (e.g. a pure Spotify/YT Music playlist
+    track that was never matched to anything). Called from the one place
+    every play - library, playlist, or Radio, whichever destination,
+    whether this tab or playback_advancer's own background thread changed
+    now_playing - already funnels through, so this covers all of them at
+    once rather than needing a hook at every individual play/queue call
+    site."""
+    radio_track_id = now_playing.get('radio_track_id')
+    if radio_track_id is not None:
+        try:
+            cur.execute("UPDATE radio_discovered_tracks SET last_played_at = NOW() WHERE id = %s", (radio_track_id,))
+        except Error as e:
+            print(f"Error recording last played time for discovered track {radio_track_id}: {e}")
+        return
+    known_track_id = now_playing.get('local_id')
+    if known_track_id is None and not now_playing.get('source'):
+        known_track_id = now_playing.get('id')
+    if known_track_id is None:
+        return
+    try:
+        cur.execute("UPDATE known_tracks SET last_played_at = NOW() WHERE id = %s", (known_track_id,))
+    except Error as e:
+        print(f"Error recording last played time for track {known_track_id}: {e}")
+
+
 def save_playback_session(destination_type, destination_id, now_playing, queue,
                            shuffle_enabled=False, spotify_match_pool=None,
                            chromecast_pushed_count=None, last_status=None):
@@ -995,11 +1098,21 @@ def save_playback_session(destination_type, destination_id, now_playing, queue,
     set of fields they want persisted (not a partial patch) - the background
     advancer reads the row with SELECT ... FOR UPDATE before writing it back,
     so it always has the current values in hand for whichever fields it isn't
-    actively changing."""
+    actively changing.
+
+    Also records last_played_at on whatever known_tracks row now_playing
+    corresponds to, whenever it's genuinely a new track (not just this same
+    one being re-saved for an unrelated field change) - see
+    _now_playing_identity/_record_track_played."""
     conn = None
     try:
         conn = get_db_connection()
         cur = conn.cursor()
+        cur.execute("SELECT now_playing FROM playback_session WHERE id = 1")
+        existing_row = cur.fetchone()
+        previous_now_playing = existing_row[0] if existing_row else None
+        if now_playing and _now_playing_identity(now_playing) != _now_playing_identity(previous_now_playing):
+            _record_track_played(cur, now_playing)
         cur.execute("""
             INSERT INTO playback_session (id, destination_type, destination_id, now_playing, queue,
                                            shuffle_enabled, spotify_match_pool, chromecast_pushed_count,
@@ -1192,6 +1305,46 @@ def set_cached_spotify_search(track_key, matched, match):
         cur.close()
     except Error as e:
         print(f"Error caching Spotify search for {track_key!r}: {e}")
+    finally:
+        if conn:
+            conn.close()
+
+
+def upsert_radio_discovered_track(track_name, artist_name, album_name, spotify_uri, artwork_url):
+    """Persists a confirmed Spotify match for a track with no known_tracks
+    row at all - see radio_discovered_tracks' own comment for why this is a
+    separate table. Called whenever a Radio "fresh discovery" candidate or
+    a Discover suggestion gets successfully matched for the first time
+    (playback_advancer.py's matching loop, main.py's discover-match route),
+    regardless of which of those two actually triggered the search - either
+    is equally worth remembering for a *future* radio session's own cache
+    tiers (see radio_engine.find_cached_artist_tracks/find_any_cached_tracks).
+    Returns the row's own id, or None on failure."""
+    # Same normalized shape as radio_engine.radio_track_key - duplicated
+    # rather than imported, since radio_engine imports spotify_connect,
+    # which imports this module, and importing radio_engine here would
+    # make that a circular import.
+    key = f"{track_name.strip().lower()}|||{artist_name.strip().lower()}"
+    spotify_track_id = spotify_uri.split(':')[-1]
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO radio_discovered_tracks (track_key, track_name, artist_name, album_name, spotify_track_id, spotify_album_art_url)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            ON CONFLICT (track_key) DO UPDATE SET
+                spotify_track_id = EXCLUDED.spotify_track_id,
+                spotify_album_art_url = EXCLUDED.spotify_album_art_url
+            RETURNING id
+        """, (key, track_name, artist_name, album_name, spotify_track_id, artwork_url))
+        row = cur.fetchone()
+        conn.commit()
+        cur.close()
+        return row[0] if row else None
+    except Error as e:
+        print(f"Error remembering discovered track {track_name!r} by {artist_name!r}: {e}")
+        return None
     finally:
         if conn:
             conn.close()
@@ -1681,6 +1834,58 @@ def set_prewarm_paused(paused):
         cur.close()
     except Error as e:
         print(f"Error setting prewarm pause state: {e}")
+    finally:
+        if conn:
+            conn.close()
+
+
+RADIO_COOLDOWN_DAYS_DEFAULT = 7
+
+
+def get_radio_cooldown_days():
+    """How long a track that Radio itself played (library or
+    radio_discovered_tracks) sits out of Radio's own candidate tiers before
+    it's eligible again - creates the default row (7 days) on first read.
+    Only radio_engine.py's candidate-selection queries consult this; a
+    user explicitly picking a seed track/artist, a library click, Shuffle
+    All, or Discover are unaffected."""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT cooldown_days FROM radio_settings WHERE id = 1")
+        row = cur.fetchone()
+        if row is None:
+            cur.execute(
+                "INSERT INTO radio_settings (id, cooldown_days) VALUES (1, %s) ON CONFLICT (id) DO NOTHING",
+                (RADIO_COOLDOWN_DAYS_DEFAULT,),
+            )
+            conn.commit()
+            row = (RADIO_COOLDOWN_DAYS_DEFAULT,)
+        cur.close()
+        return row[0]
+    except Error as e:
+        print(f"Error reading radio cooldown days: {e}")
+        return RADIO_COOLDOWN_DAYS_DEFAULT
+    finally:
+        if conn:
+            conn.close()
+
+
+def set_radio_cooldown_days(days):
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO radio_settings (id, cooldown_days)
+            VALUES (1, %s)
+            ON CONFLICT (id) DO UPDATE SET cooldown_days = EXCLUDED.cooldown_days
+        """, (days,))
+        conn.commit()
+        cur.close()
+    except Error as e:
+        print(f"Error setting radio cooldown days: {e}")
     finally:
         if conn:
             conn.close()

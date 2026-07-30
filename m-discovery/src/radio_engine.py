@@ -7,6 +7,7 @@ it. main.py wraps the plain dicts this returns into its own Track pydantic
 model for its response bodies; playback_advancer.py uses them as-is.
 """
 
+from . import database
 from . import lastfm
 from . import spotify_connect
 
@@ -85,35 +86,66 @@ def generate_fresh_radio_tracks(seed_artists, destination_type, seen_keys, count
     return collected
 
 
+def _discovered_track_row(track_id, track_name, artist_name, album_name, spotify_track_id, artwork_url):
+    """Shapes a radio_discovered_tracks row into the same candidate dict
+    known_tracks-sourced ones use, plus a pre-resolved spotify_uri -
+    playback_advancer._advance_spotify's matching loop treats that as an
+    already-confirmed match (no known_tracks id to cache-check, no live
+    search needed either) the same way it already treats a known_tracks
+    cache hit, just without a known_tracks id/local_id/origin_library
+    ("Your Library" wouldn't be true for a track the user doesn't own)."""
+    return {
+        'id': None, 'radio_track_id': track_id, 'track_name': track_name, 'artist_name': artist_name,
+        'album_name': album_name, 'spotify_uri': f'spotify:track:{spotify_track_id}', 'artwork_url': artwork_url,
+    }
+
+
 def find_cached_artist_tracks(artist_names, seen_keys, limit, db):
-    """Local library tracks by any of these artists (case-insensitive)
-    already confirmed matched on Spotify (spotify_checked=TRUE with a real
-    spotify_track_id) - zero new Spotify calls to queue, since passing these
-    back with id=known_tracks.id means the existing
-    playback_advancer._match_local_track_cached cache-hit path resolves them
-    instantly. This is the free tier generate_radio_batch_for_spotify always
-    tries first, and the only tier it falls back to once Spotify's search is
-    rate-limited or the self-imposed budget is spent - see that function."""
+    """Already-confirmed-on-Spotify tracks by any of these artists
+    (case-insensitive) - zero new Spotify calls to queue - from two
+    sources: this user's own library (known_tracks, spotify_checked=TRUE
+    with a real spotify_track_id - passing these back with id=known_tracks.id
+    means the existing playback_advancer._match_local_track_cached cache-hit
+    path resolves them instantly), and radio_discovered_tracks (a track
+    Radio or Discover already confirmed once before, not part of the
+    library at all - see that table's own comment and _discovered_track_row).
+    This is the free tier generate_radio_batch_for_spotify always tries
+    first, and the only tier it falls back to once Spotify's search is
+    rate-limited or the self-imposed budget is spent - see that function.
+    Excludes anything played (by Radio itself) within the last
+    database.get_radio_cooldown_days() days, so the same handful of cached
+    tracks doesn't keep resurfacing session after session."""
     if not artist_names:
         return []
     seen = set(seen_keys)
     lowered = list({a.lower() for a in artist_names})
+    cooldown_days = database.get_radio_cooldown_days()
     try:
         cur = db.cursor()
         cur.execute("""
             SELECT id, track_name, artist_name, album_name, spotify_album_art_url
             FROM known_tracks
             WHERE LOWER(artist_name) = ANY(%s) AND spotify_checked IS TRUE AND spotify_track_id IS NOT NULL
+                AND (last_played_at IS NULL OR last_played_at < NOW() - (%s * INTERVAL '1 day'))
             ORDER BY random()
             LIMIT %s
-        """, (lowered, max(limit * 3, limit)))  # over-fetch - seen_keys will drop some
-        rows = cur.fetchall()
+        """, (lowered, cooldown_days, max(limit * 3, limit)))  # over-fetch - seen_keys will drop some
+        known_rows = cur.fetchall()
+        cur.execute("""
+            SELECT id, track_name, artist_name, album_name, spotify_track_id, spotify_album_art_url
+            FROM radio_discovered_tracks
+            WHERE LOWER(artist_name) = ANY(%s)
+                AND (last_played_at IS NULL OR last_played_at < NOW() - (%s * INTERVAL '1 day'))
+            ORDER BY random()
+            LIMIT %s
+        """, (lowered, cooldown_days, max(limit * 3, limit)))
+        discovered_rows = cur.fetchall()
         cur.close()
     except Exception as e:
-        print(f"Error finding cached library tracks for radio: {e}")
+        print(f"Error finding cached tracks for radio: {e}")
         return []
     results = []
-    for track_id, track_name, artist_name, album_name, artwork_url in rows:
+    for track_id, track_name, artist_name, album_name, artwork_url in known_rows:
         key = radio_track_key(track_name, artist_name)
         if key in seen:
             continue
@@ -124,38 +156,57 @@ def find_cached_artist_tracks(artist_names, seen_keys, limit, db):
         })
         if len(results) >= limit:
             break
+    for row in discovered_rows:
+        if len(results) >= limit:
+            break
+        track_id, track_name, artist_name, album_name, spotify_track_id, artwork_url = row
+        key = radio_track_key(track_name, artist_name)
+        if key in seen:
+            continue
+        seen.add(key)
+        results.append(_discovered_track_row(track_id, track_name, artist_name, album_name, spotify_track_id, artwork_url))
     return results
 
 
 def find_any_cached_tracks(seen_keys, limit, db):
-    """Absolute last resort: any already-Spotify-matched library track at
-    all, no artist filter - confirmed live this tier was actually needed: a
-    seed with a small library/genre footprint (an obscure artist plus a
-    handful of Last.fm-similar ones) can genuinely exhaust every cached track
-    by all of them after just a few played tracks, especially while rate-
-    limited (no live search to discover anything beyond that fixed set).
-    generate_radio_batch_for_spotify only reaches for this once artist-scoped
-    find_cached_artist_tracks (even widened to similar artists) comes up
-    short - keeping *something* playing wins over staying on-theme, per the
-    same "Radio must never just stop" requirement the rest of this tiering
-    already follows."""
+    """Absolute last resort: any already-Spotify-confirmed track at all
+    (library or previously-discovered, no artist filter) - confirmed live
+    this tier was actually needed: a seed with a small library/genre
+    footprint (an obscure artist plus a handful of Last.fm-similar ones)
+    can genuinely exhaust every cached track by all of them after just a
+    few played tracks, especially while rate-limited (no live search to
+    discover anything beyond that fixed set). generate_radio_batch_for_spotify
+    only reaches for this once artist-scoped find_cached_artist_tracks
+    (even widened to similar artists) comes up short - keeping *something*
+    playing wins over staying on-theme, per the same "Radio must never just
+    stop" requirement the rest of this tiering already follows."""
     seen = set(seen_keys)
+    cooldown_days = database.get_radio_cooldown_days()
     try:
         cur = db.cursor()
         cur.execute("""
             SELECT id, track_name, artist_name, album_name, spotify_album_art_url
             FROM known_tracks
             WHERE spotify_checked IS TRUE AND spotify_track_id IS NOT NULL
+                AND (last_played_at IS NULL OR last_played_at < NOW() - (%s * INTERVAL '1 day'))
             ORDER BY random()
             LIMIT %s
-        """, (max(limit * 3, limit),))  # over-fetch - seen_keys will drop some
-        rows = cur.fetchall()
+        """, (cooldown_days, max(limit * 3, limit)))  # over-fetch - seen_keys will drop some
+        known_rows = cur.fetchall()
+        cur.execute("""
+            SELECT id, track_name, artist_name, album_name, spotify_track_id, spotify_album_art_url
+            FROM radio_discovered_tracks
+            WHERE (last_played_at IS NULL OR last_played_at < NOW() - (%s * INTERVAL '1 day'))
+            ORDER BY random()
+            LIMIT %s
+        """, (cooldown_days, max(limit * 3, limit)))
+        discovered_rows = cur.fetchall()
         cur.close()
     except Exception as e:
-        print(f"Error finding any cached library track for radio: {e}")
+        print(f"Error finding any cached track for radio: {e}")
         return []
     results = []
-    for track_id, track_name, artist_name, album_name, artwork_url in rows:
+    for track_id, track_name, artist_name, album_name, artwork_url in known_rows:
         key = radio_track_key(track_name, artist_name)
         if key in seen:
             continue
@@ -166,32 +217,57 @@ def find_any_cached_tracks(seen_keys, limit, db):
         })
         if len(results) >= limit:
             break
+    for row in discovered_rows:
+        if len(results) >= limit:
+            break
+        track_id, track_name, artist_name, album_name, spotify_track_id, artwork_url = row
+        key = radio_track_key(track_name, artist_name)
+        if key in seen:
+            continue
+        seen.add(key)
+        results.append(_discovered_track_row(track_id, track_name, artist_name, album_name, spotify_track_id, artwork_url))
     return results
 
 
 def _index_cached_tracks_by_key(artist_names, db):
-    """{(track_name.lower(), artist_name.lower()): {...}} for every locally
-    cached, Spotify-matched track by these artists - one batched query so
-    generate_radio_batch_for_spotify can check a whole list of Last.fm
-    recommendations against the library at once, instead of one query per
-    candidate."""
+    """{(track_name.lower(), artist_name.lower()): {...}} for every
+    already-Spotify-confirmed track (library or previously-discovered) by
+    these artists - one batched query so generate_radio_batch_for_spotify
+    can check a whole list of Last.fm recommendations at once, instead of
+    one query per candidate. known_tracks entries win a key collision
+    (checked first) - a genuine library match is always at least as good
+    as a previously-discovered one for the exact same track."""
     if not artist_names:
         return {}
     lowered = list({a.lower() for a in artist_names})
+    cooldown_days = database.get_radio_cooldown_days()
     try:
         cur = db.cursor()
         cur.execute("""
             SELECT id, track_name, artist_name, album_name, spotify_album_art_url
             FROM known_tracks
             WHERE LOWER(artist_name) = ANY(%s) AND spotify_checked IS TRUE AND spotify_track_id IS NOT NULL
-        """, (lowered,))
-        rows = cur.fetchall()
+                AND (last_played_at IS NULL OR last_played_at < NOW() - (%s * INTERVAL '1 day'))
+        """, (lowered, cooldown_days))
+        known_rows = cur.fetchall()
+        cur.execute("""
+            SELECT id, track_name, artist_name, album_name, spotify_track_id, spotify_album_art_url
+            FROM radio_discovered_tracks
+            WHERE LOWER(artist_name) = ANY(%s)
+                AND (last_played_at IS NULL OR last_played_at < NOW() - (%s * INTERVAL '1 day'))
+        """, (lowered, cooldown_days))
+        discovered_rows = cur.fetchall()
         cur.close()
     except Exception as e:
         print(f"Error indexing cached tracks for radio: {e}")
         return {}
     index = {}
-    for track_id, track_name, artist_name, album_name, artwork_url in rows:
+    for row in discovered_rows:
+        track_id, track_name, artist_name, album_name, spotify_track_id, artwork_url = row
+        index[(track_name.lower(), artist_name.lower())] = _discovered_track_row(
+            track_id, track_name, artist_name, album_name, spotify_track_id, artwork_url,
+        )
+    for track_id, track_name, artist_name, album_name, artwork_url in known_rows:
         index[(track_name.lower(), artist_name.lower())] = {
             'id': track_id, 'track_name': track_name, 'artist_name': artist_name,
             'album_name': album_name, 'artwork_url': artwork_url,
