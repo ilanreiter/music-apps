@@ -4441,6 +4441,8 @@ function App() {
           <RadioTab
             apiBase={API_BASE_URL}
             outputDevice={outputDevice}
+            setOutputDevice={setOutputDevice}
+            outputDevices={outputDevices}
             ytMusicConnected={ytMusicConnected}
             radioDestination={radioDestination}
             setRadioDestination={setRadioDestination}
@@ -5299,7 +5301,7 @@ function BarChart({ title, entries }) {
 // component is just the picker + status display, same division of labor as
 // CleanupTab being handed onTrackPlayClick rather than owning playback logic.
 function RadioTab({
-  apiBase, outputDevice, ytMusicConnected,
+  apiBase, outputDevice, setOutputDevice, outputDevices, ytMusicConnected,
   radioDestination, setRadioDestination, radioDestinationType,
   radioSessionId, radioSeed, radioStatus, nowPlaying, queue, isPlaying,
   onDismissRadioStatus, onStartRadio, onStartRadioFromPlaylist, onStopRadio,
@@ -5313,6 +5315,11 @@ function RadioTab({
   // cost, but depends on the account/device's own "Autoplay similar songs"
   // setting (Spotify's app, not this one) actually being turned on.
   const [radioEngine, setRadioEngine] = useState('discovery');
+  // Same open/close toggle pattern as the control panel's own destination
+  // picker (PlayerBar's destMenuOpen/.np-destination) - a single trigger
+  // button showing the current pick, opening a dropdown of the other
+  // options rather than always showing every option as its own button.
+  const [radioDestMenuOpen, setRadioDestMenuOpen] = useState(false);
   const [trackQuery, setTrackQuery] = useState('');
   const [trackResults, setTrackResults] = useState([]);
   const [artistQuery, setArtistQuery] = useState('');
@@ -5444,6 +5451,7 @@ function RadioTab({
   const destinationLabel = radioDestination === 'ytmusic' ? 'YouTube Music (playlist)'
     : outputDevice ? outputDevice.name
       : 'This Browser';
+  const destinationIcon = radioDestination === 'ytmusic' ? '▶️' : outputDevice ? '🟢' : '🔊';
 
   // Spotify never exposes real remaining quota - no "requests left" header
   // on success, no way to check capacity in advance. The only authoritative
@@ -5516,22 +5524,44 @@ function RadioTab({
 
       <div className="radio-destination-row">
         <span className="radio-destination-label">Destination:</span>
-        <button
-          className={radioDestination !== 'ytmusic' && !outputDevice ? 'active' : ''}
-          onClick={() => setRadioDestination('inherit')}
-        >
-          🔊 This Browser
-        </button>
-        {outputDevice && outputDevice.type === 'spotify' && (
-          <button className={radioDestination !== 'ytmusic' ? 'active' : ''} onClick={() => setRadioDestination('inherit')}>
-            🟢 {outputDevice.name}
+        <div className="radio-destination-picker">
+          <button className="active" onClick={() => setRadioDestMenuOpen((o) => !o)}>
+            {destinationIcon} {destinationLabel}
           </button>
-        )}
-        {ytMusicConnected && (
-          <button className={radioDestination === 'ytmusic' ? 'active' : ''} onClick={() => setRadioDestination('ytmusic')}>
-            ▶️ YouTube Music playlist
-          </button>
-        )}
+          {radioDestMenuOpen && (
+            <div className="radio-destination-menu">
+              <button
+                className={radioDestination !== 'ytmusic' && !outputDevice ? 'active' : ''}
+                onClick={() => { setRadioDestination('inherit'); setRadioDestMenuOpen(false); }}
+              >
+                🔊 This Browser
+              </button>
+              {outputDevices.filter((d) => d.type === 'spotify').map((d) => (
+                <button
+                  key={d.id}
+                  className={radioDestination !== 'ytmusic' && outputDevice?.id === d.id ? 'active' : ''}
+                  onClick={() => { setOutputDevice(d); setRadioDestination('inherit'); setRadioDestMenuOpen(false); }}
+                >
+                  🟢 {d.name}
+                  {d.status && d.status !== 'unknown' && (
+                    <span
+                      className={`device-status-dot ${d.status}`}
+                      title={d.status === 'failed' ? 'Last playback attempt on this device failed' : 'Last playback attempt on this device succeeded'}
+                    />
+                  )}
+                </button>
+              ))}
+              {ytMusicConnected && (
+                <button
+                  className={radioDestination === 'ytmusic' ? 'active' : ''}
+                  onClick={() => { setRadioDestination('ytmusic'); setRadioDestMenuOpen(false); }}
+                >
+                  ▶️ YouTube Music playlist
+                </button>
+              )}
+            </div>
+          )}
+        </div>
         {outputDevice && outputDevice.type !== 'spotify' && (
           <span className="radio-destination-hint">
             {outputDevice.name} can't play Radio directly - pick This Browser, a Spotify Connect device, or YouTube Music above.
@@ -5986,6 +6016,24 @@ function CleanupTab({ apiBase, activeTab, nowPlaying, isPlaying, onTrackPlayClic
     spotifyPrewarmPollRef.current = setInterval(fetchSpotifyPrewarmInfo, 5000);
   };
 
+  // Manual override for both spotify_prewarm.py and playlist_match_prewarm.py
+  // (they share one switch - see database.is_prewarm_paused) - separate from
+  // and in addition to their existing "only while idle, not during Radio"
+  // auto-pausing, for whenever that isn't reason enough on its own to stop
+  // consuming search budget right now. Optimistic local update so the
+  // switch flips instantly rather than waiting on the next 5s poll.
+  const togglePrewarmPaused = async () => {
+    const next = !(spotifyPrewarmStatus?.paused);
+    setSpotifyPrewarmStatus((s) => (s ? { ...s, paused: next } : s));
+    try {
+      await axios.post(`${apiBase}/spotify/prewarm/pause`, { paused: next });
+    } catch (err) {
+      console.error('Error toggling Spotify matching pause state:', err);
+      setSpotifyPrewarmStatus((s) => (s ? { ...s, paused: !next } : s));
+    }
+    fetchSpotifyPrewarmInfo();
+  };
+
   const fetchTrackIdTracks = async (offset) => {
     try {
       const response = await axios.get(`${apiBase}/library/track-identification/tracks`, { params: { limit: 100, offset } });
@@ -6407,10 +6455,26 @@ function CleanupTab({ apiBase, activeTab, nowPlaying, isPlaying, onTrackPlayClic
           <p className="hint">
             A background job slowly searches the library against Spotify's catalog while the app is
             idle (a small batch every 90 seconds, so it never bursts into Spotify's search rate
-            limit) - this just shows how far it's gotten. No button here since it just runs on its
-            own; see the "Available on Spotify" filter in the Library tab to browse what's matched
-            so far.
+            limit) - this just shows how far it's gotten. It already pauses itself automatically
+            while the app's in use or Radio's playing on Spotify; the switch below is a manual
+            override for whenever you want it stopped regardless. See the "Available on Spotify"
+            filter in the Library tab to browse what's matched so far.
           </p>
+          <div className="prewarm-pause-row">
+            <span className="prewarm-pause-label">
+              Spotify matching {spotifyPrewarmStatus?.paused ? 'paused' : 'active'}
+            </span>
+            <button
+              type="button"
+              role="switch"
+              aria-checked={!spotifyPrewarmStatus?.paused}
+              aria-label="Toggle Spotify matching background job"
+              className={`toggle-switch${!spotifyPrewarmStatus?.paused ? ' on' : ''}`}
+              onClick={togglePrewarmPaused}
+            >
+              <span className="toggle-switch-knob" />
+            </button>
+          </div>
           {spotifyPrewarmStats && (
             <p className="scan-summary">
               {(spotifyPrewarmStats.matched || 0).toLocaleString()} matched &middot;{' '}
@@ -6423,7 +6487,9 @@ function CleanupTab({ apiBase, activeTab, nowPlaying, isPlaying, onTrackPlayClic
           {spotifyPrewarmStatus && (
             <p className="hint">
               Status:{' '}
-              {spotifyPrewarmStatus.status === 'running'
+              {spotifyPrewarmStatus.status === 'paused_manually'
+                ? 'paused (switched off above)'
+                : spotifyPrewarmStatus.status === 'running'
                 ? 'running'
                 : spotifyPrewarmStatus.status === 'waiting_active_use'
                   ? 'paused while the app is in use'

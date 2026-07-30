@@ -16,6 +16,7 @@ from .database import (
     create_radio_session, get_radio_session, append_seen_track_keys,
     set_radio_session_ytmusic_job, stop_radio_session, append_tracks_to_ytmusic_push_job,
     has_active_spotify_radio_session, count_searches_since_ny_midnight, get_spotify_quota_state,
+    set_prewarm_paused, is_prewarm_paused,
 )
 from .library_scanner import run_scan
 from .artwork import get_or_create_thumbnail, check_artwork_presence, cache_key_for, normalize_album_name, normalized_album_sql, save_thumbnail
@@ -327,10 +328,15 @@ class ExternalArtworkStatus(BaseModel):
     error: Optional[str] = None
 
 class SpotifyPrewarmStatus(BaseModel):
-    status: str  # idle | running | waiting_active_use | waiting_not_connected | done | error
+    status: str  # idle | running | waiting_active_use | waiting_radio_active | waiting_not_connected | paused_manually | done | error
     processed: Optional[int] = None
     matched: Optional[int] = None
     error: Optional[str] = None
+    # The manual override's current persisted state (see database.is_prewarm_paused) -
+    # included here (rather than a separate endpoint) so the existing status
+    # poll already picks it up for free. Shared with playlist_match_prewarm,
+    # which draws from the same switch - see PlaylistMatchPrewarmStatus.paused.
+    paused: bool = False
 
 class PlaylistMatchPrewarmStatus(BaseModel):
     status: str  # idle | running | waiting_active_use | waiting_not_connected | done | error
@@ -2038,7 +2044,21 @@ def _start_spotify_prewarm_background():
 
 @app.get("/api/spotify/prewarm/status", response_model=SpotifyPrewarmStatus)
 async def get_spotify_prewarm_status():
-    return spotify_prewarm_progress
+    return {**spotify_prewarm_progress, "paused": is_prewarm_paused()}
+
+class PrewarmPauseRequest(BaseModel):
+    paused: bool
+
+@app.post("/api/spotify/prewarm/pause")
+async def set_spotify_prewarm_paused(params: PrewarmPauseRequest):
+    """Manual, explicit override for both background search-consuming jobs
+    (spotify_prewarm.py, playlist_match_prewarm.py) - shares one switch
+    since both draw against the same daily search budget and there's no
+    reason to pause one without the other. Checked ahead of their existing
+    is_radio_active/is_idle gating, for whenever those aren't reason enough
+    on their own to stop consuming budget right now."""
+    set_prewarm_paused(params.paused)
+    return {"paused": params.paused}
 
 @app.get("/api/spotify/prewarm/stats")
 async def get_spotify_prewarm_stats(db: psycopg2.extensions.connection = Depends(get_db)):
@@ -2341,15 +2361,29 @@ async def post_playback_session(params: PlaybackSessionUpdate):
         existing and existing.get('destination_type') == params.destination_type
         and existing.get('destination_id') == params.destination_id
     )
+    resolved_pool = None if params.clear_spotify_match_pool \
+        else (params.spotify_match_pool if params.spotify_match_pool is not None
+            else (existing.get('spotify_match_pool') if same_destination else None))
+    # TEMPORARY diagnostic logging - tracking down a radio_session_id that
+    # keeps reverting to an older, already-stopped session's tag on some
+    # syncs. Remove once pinpointed. Deliberately print(), not logger, so it
+    # shows up in `docker compose logs app` the same way existing prints do.
+    print(
+        f"[playback-session POST] incoming now_playing.radio_session_id="
+        f"{(params.now_playing or {}).get('radio_session_id')} "
+        f"incoming spotify_match_pool={params.spotify_match_pool} "
+        f"clear_spotify_match_pool={params.clear_spotify_match_pool} "
+        f"same_destination={same_destination} "
+        f"existing.spotify_match_pool={(existing or {}).get('spotify_match_pool')} "
+        f"resolved_pool={resolved_pool}"
+    )
     save_playback_session(
         destination_type=params.destination_type,
         destination_id=params.destination_id,
         now_playing=params.now_playing,
         queue=params.queue,
         shuffle_enabled=params.shuffle_enabled,
-        spotify_match_pool=None if params.clear_spotify_match_pool
-            else (params.spotify_match_pool if params.spotify_match_pool is not None
-                else (existing.get('spotify_match_pool') if same_destination else None)),
+        spotify_match_pool=resolved_pool,
         chromecast_pushed_count=existing.get('chromecast_pushed_count') if same_destination else None,
         last_status=existing.get('last_status') if same_destination else None,
     )

@@ -286,10 +286,17 @@ def _match_text_candidate(track_name, artist_name):
     """Matches a Radio-suggested track directly against Spotify's catalog -
     Last.fm text suggestions have no known_tracks row, so unlike
     _match_local_track_cached above there's no cache to check or write, just
-    a one-off search. Same call main.py's match_discovered_track_to_spotify
-    makes for a pure-text Discover suggestion, just invoked from this
-    background thread's own call site instead of an HTTP request."""
-    result, match, _identified = spotify_connect.search_track(track_name, artist_name)
+    a one-off search.
+
+    Uses search_track_direct (a single /search, no bridging), not the full
+    search_track main.py's match_discovered_track_to_spotify calls -
+    confirmed live a single miss here was quietly costing 2 real searches
+    (the direct attempt, then a YouTube Music bridge retry) for a track
+    that, being sourced straight from Last.fm's own catalog data rather
+    than a possibly-garbled local file tag, was never going to be rescued
+    by that bridge anyway - it exists for messy local tags, not clean
+    third-party recommendation text."""
+    result, match = spotify_connect.search_track_direct(track_name, artist_name)
     if result == 'unavailable':
         return {"matched": False, "reason": "unavailable"}
     if not match:
@@ -410,6 +417,23 @@ def _advance_spotify(save_session, destination_id, now_playing, queue, match_poo
                 now_playing = queue[forward_index]
                 queue = queue[forward_index + 1:]
             else:
+                # Confirmed live: this was the actual reason a session that
+                # had genuinely been stopped hours earlier could still show
+                # as "on air" indefinitely - once carried forward once, this
+                # tag never got re-validated against its own session's
+                # status on any later reconstruction, so it just kept
+                # perpetuating itself onto whatever played next, forever
+                # (the outer radio_session_id guard right below only checks
+                # match_pool's own tag, which is unrelated once match_pool
+                # itself is None for a long-stopped session - a completely
+                # different source of staleness from this one). Only a
+                # session that's still genuinely 'active' gets to keep
+                # tagging what plays next; once it's stopped, this drops the
+                # tag so the frontend's "stop when superseded" check
+                # actually has a real signal to go on.
+                carried_radio_session_id = (now_playing or {}).get('radio_session_id')
+                if carried_radio_session_id is not None and not _radio_session_still_current(carried_radio_session_id):
+                    carried_radio_session_id = None
                 now_playing = {
                     'id': track_uri, 'source': 'spotify', 'uri': track_uri,
                     'context_uri': (now_playing or {}).get('context_uri'),
@@ -440,8 +464,11 @@ def _advance_spotify(save_session, destination_id, now_playing, queue, match_poo
                     # origin_library/playlist_name already are, the frontend's
                     # "stop when superseded" effect sees a tagless now_playing
                     # and concludes Radio was superseded - after just the 2nd
-                    # track, not anything actually stopping.
-                    'radio_session_id': (now_playing or {}).get('radio_session_id'),
+                    # track, not anything actually stopping. Validated above
+                    # (carried_radio_session_id) rather than read directly
+                    # here, so a stopped session's tag doesn't perpetuate
+                    # itself forever.
+                    'radio_session_id': carried_radio_session_id,
                 }
             if not _radio_session_still_current(radio_session_id):
                 # Same race as the near-end branch above - this tick's own
@@ -462,6 +489,18 @@ def _advance_spotify(save_session, destination_id, now_playing, queue, match_poo
     # library-cast pool's candidates are a finite array to walk through
     # (backed by a real, bounded local library), nothing to fetch more of.
     radio_session_id = match_pool.get('radio_session_id')
+    if not _radio_session_still_current(radio_session_id):
+        # Confirmed live this was burning real searches for nothing: the
+        # earlier fix only guarded the *save* right before add_to_queue, not
+        # the attempts leading up to it - so once a session was stopped
+        # (superseded by a newer one, or the user pressing Stop) but its own
+        # leftover pool was still sitting in spotify_match_pool (queue empty,
+        # nothing left to trigger a refill/replace), every tick kept trying
+        # its remaining candidates against Spotify's real /search, over and
+        # over, forever discarding the result at the save-guard - a stopped
+        # session's dead pool should cost nothing at all, not silently drain
+        # the daily budget in the background.
+        return match_pool
     consecutive_misses = 0
     refilled_from_radio = False
 

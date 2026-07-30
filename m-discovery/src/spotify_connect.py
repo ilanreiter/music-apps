@@ -158,24 +158,24 @@ def disconnect():
 # back off for a while instead of barely at all.
 SEARCH_RATE_LIMIT_FALLBACK_SECONDS = 300
 
-# Self-imposed ceiling on real /search calls per calendar day (America/
-# New_York, per user request) - Spotify publishes no quota number to pace
+# Self-reported (not gating) daily search count, purely for display/
+# adjustment bookkeeping - Spotify publishes no quota number to pace
 # against here (confirmed via their own docs: "the specific groupings and
 # limits are subject to change", unlike YouTube's documented daily budget,
 # see ytmusic_push_job.py's DAILY_SAFE_BUDGET). Since there's no
 # authoritative figure, this starts at a guessed default
-# (database.QUOTA_ESTIMATE_DEFAULT) and gets ratcheted both down
-# (_learn_from_quota_exceeded, whenever a real 429 response body confirms
-# Spotify actually meant "daily quota exhausted" - reason: QUOTA_EXCEEDED, a
-# distinct signal Spotify added July 2026 - rather than an ordinary
-# short-window rate-limit, which says nothing about the daily ceiling) and
-# up (database.maybe_recover_spotify_quota_estimate, once a day, if a full
-# day passed clean) over time. Checked in _search_and_score, the single
-# choke point every caller (Discover, Radio, library matching, both prewarm
-# jobs) already funnels through - stopping here before Spotify's own
-# enforcement kicks in is what lets a burst (playback_advancer's per-tick
-# lookahead, Radio's initial match loop) short-circuit for free mid-burst
-# instead of spending real quota until Spotify itself says no.
+# (database.QUOTA_ESTIMATE_DEFAULT), moves down whenever a real 429 response
+# body confirms Spotify actually meant "daily quota exhausted" (reason:
+# QUOTA_EXCEEDED, a distinct signal Spotify added July 2026, rather than an
+# ordinary short-window rate-limit which says nothing about the daily
+# ceiling - see _learn_from_quota_exceeded), and moves up automatically
+# whenever a real search completes with no rate limit hit and today's true
+# count has already exceeded it (see _api_request). Confirmed live that
+# having this also *gate* new attempts (the original design) was backwards -
+# an untested guess was pre-emptively refusing real attempts before Spotify
+# had ever actually said no. search_budget_available() below no longer
+# checks this at all; the only thing that ever blocks a real attempt now is
+# search_block_remaining_seconds' own persisted cooldown.
 #
 # A single anomalous block (observed live: one hit at only 7 requests that
 # day) shouldn't be able to ratchet the estimate down to near-zero and
@@ -183,17 +183,40 @@ SEARCH_RATE_LIMIT_FALLBACK_SECONDS = 300
 # reasons - never let it fall below this.
 QUOTA_ESTIMATE_FLOOR = 5
 
+# How long a confirmed QUOTA_EXCEEDED blocks new /search attempts before
+# trying again, per user request - not a fixed "wait until midnight"
+# anymore. Confirmed live that trusting Spotify's own Retry-After for this
+# specific reason was unreliable (far shorter than the real block, causing
+# repeated hits on the same wall every few minutes) - so instead of trusting
+# either that header or a guessed daily-reset boundary, this lets one real
+# search back through periodically to actually test whether it's cleared.
+# If that probe still 429s, _api_request's same QUOTA_EXCEEDED handling
+# extends the block by this same interval again - repeating until a probe
+# genuinely succeeds, at which point the block simply isn't renewed and
+# normal searching resumes immediately, no more waiting than necessary.
+QUOTA_EXCEEDED_PROBE_INTERVAL_SECONDS = 3600
+
 
 def search_budget_available():
     """True if a fresh /search call would actually be attempted right now -
-    not inside a 429 cooldown, and under today's (America/New_York) self-
-    learned quota estimate. Lets a caller with a cheaper fallback
-    (radio_engine.py's cached-local-track tiering) check first and skip
-    straight to it, instead of finding out the hard way via an
-    'unavailable' result."""
-    if search_block_remaining_seconds() > 0:
-        return False
-    return database.count_searches_since_ny_midnight() < database.get_spotify_quota_estimate()
+    i.e. not inside a real, confirmed 429 cooldown. Lets a caller with a
+    cheaper fallback (radio_engine.py's cached-local-track tiering) check
+    first and skip straight to it, instead of finding out the hard way via
+    an 'unavailable' result.
+
+    Deliberately does NOT also gate on the self-learned daily quota estimate
+    (database.get_spotify_quota_estimate) the way an earlier version did -
+    confirmed live that was backwards: an untested guess (starting at 100)
+    was pre-emptively refusing real attempts before Spotify had ever
+    actually said no, so the counter (and Radio's own discovery) silently
+    stalled at whatever the guess happened to be, with no way to tell "we
+    hit a wall" apart from "we hit our own made-up ceiling." The only real
+    signal Spotify gives is a real 429 - search_block_remaining_seconds
+    reacts to that directly and is the sole gate here now. The daily
+    estimate still exists, but purely as a reported/adjusted-after-the-fact
+    number (see _api_request's post-response bookkeeping below), not
+    something anything checks before acting."""
+    return search_block_remaining_seconds() <= 0
 
 
 def search_block_remaining_seconds():
@@ -281,28 +304,46 @@ def _api_request(method, path, params=None, json_body=None, retried=False):
         # itself triggers QUOTA_EXCEEDED is included in its own "how many
         # did we send today" tally instead of being off by one.
         database.record_spotify_search()
+        if response.status_code != 429:
+            # A completed, non-429 response is direct proof today's real
+            # volume is at least this high with no rate limit hit - the
+            # daily estimate (purely a reported number now, see
+            # search_budget_available - nothing gates on it anymore) should
+            # track that instead of staying frozen at an old guess or a
+            # since-superseded downward ratchet. Only ever raises; a real
+            # 429 elsewhere in this function is still the only thing that
+            # ever lowers it.
+            observed_today = database.count_searches_since_ny_midnight()
+            current_estimate = database.get_spotify_quota_estimate()
+            if observed_today > current_estimate:
+                database.set_spotify_quota_estimate(
+                    observed_today, f"raised to match {observed_today} real searches completed today with no rate limit hit",
+                )
 
     if response.status_code == 429:
         retry_after_header = response.headers.get('Retry-After')
         retry_after = int(retry_after_header) if retry_after_header is not None else 1
         if path == '/search':
             # Confirmed live: Spotify's own Retry-After alongside a
-            # QUOTA_EXCEEDED 429 can be far shorter than the daily allowance
-            # actually takes to reset, so honoring it just re-opened the
-            # window early - this app would try again, get QUOTA_EXCEEDED
-            # again, and (before this check existed) re-learn from it as if
-            # it were fresh evidence, each time nudging the estimate down
-            # toward the floor and letting a couple more real requests leak
-            # out to Spotify for no reason, hours into a block the user could
-            # see was still very much active. A confirmed daily-quota
-            # exhaustion only actually clears at the NY-midnight boundary
-            # this app already tracks the rest of its counting against, so
-            # block until then instead of trusting the header for this
-            # specific reason code.
+            # QUOTA_EXCEEDED 429 can be far shorter than the real block, so
+            # honoring it literally caused repeated hits on the same wall
+            # every few minutes. Rather than trust that header *or* assume a
+            # fixed daily-reset boundary (also just a guess - Spotify never
+            # confirmed the allowance actually resets at NY midnight
+            # specifically), this blocks for a fixed probe interval instead
+            # (QUOTA_EXCEEDED_PROBE_INTERVAL_SECONDS) and lets one real
+            # search back through once it elapses, purely to test whether
+            # it's actually cleared - if that probe also 429s, this same
+            # branch runs again and extends the block by the same interval,
+            # repeating until a probe genuinely succeeds (at which point the
+            # non-429 branch above just doesn't renew the block, and normal
+            # searching resumes immediately).
             was_already_blocked = search_block_remaining_seconds() > 0
             reason = _extract_quota_exceeded_reason(response)
             if reason == 'QUOTA_EXCEEDED':
-                database.set_spotify_search_blocked_until(database.next_ny_midnight_as_naive_utc())
+                database.set_spotify_search_blocked_until(
+                    datetime.utcnow() + timedelta(seconds=QUOTA_EXCEEDED_PROBE_INTERVAL_SECONDS),
+                )
                 if not was_already_blocked:
                     # Only a genuine transition into being rate-limited is
                     # new evidence about where today's real ceiling sits - a
@@ -1005,10 +1046,24 @@ def add_to_queue(device_id, uri):
     queue, without interrupting what's already playing - used to feed one
     lookahead match at a time instead of front-loading a whole batch."""
     result = _api_request('POST', '/me/player/queue', params={'uri': uri, 'device_id': device_id})
-    return result is not None
+    success = result is not None
+    if success:
+        # Tracks exactly how many real account-queue entries are sitting
+        # there unconsumed - see clear_queue, which drains against this
+        # instead of guessing. Only incremented on a confirmed success, so
+        # a failed add (this app believes nothing landed) doesn't inflate
+        # the count past what's actually sitting on the account.
+        database.increment_pending_queue_adds()
+    return success
 
 
-CLEAR_QUEUE_MAX_DRAIN = 20
+# Absolute ceiling regardless of what pending_queue_adds or Spotify's own
+# reported queue length say - a genuine safety net against a runaway drain
+# (a corrupted counter, or a real context playlist's own remaining tracks
+# mixed into GET /me/player/queue's response - see this function's own
+# docstring) turning into an extremely slow walk before the actual play
+# call ever lands.
+CLEAR_QUEUE_SAFETY_CAP = 200
 # Confirmed live this matters, specifically for a slower/flakier device (a
 # budget WiFi streamer, on this account): firing the drain's /next calls
 # back-to-back with no pause at all could leave it in an inconsistent state
@@ -1022,21 +1077,34 @@ CLEAR_QUEUE_STEP_DELAY_SECONDS = 0.3
 CLEAR_QUEUE_SETTLE_DELAY_SECONDS = 0.5
 
 
-def clear_queue(device_id, max_drain=CLEAR_QUEUE_MAX_DRAIN, token=None):
+def clear_queue(device_id, token=None):
     """Spotify's Web API has no endpoint to remove a track from the queue -
     once something lands there it can only be consumed by skipping past it.
     A manually-queued track (via add_to_queue above - this app's own
     lookahead buffer, or anything queued from another Spotify client)
     survives a later play()/play_uris() call untouched, confirmed live: it
     gets spliced in after whatever that call starts, and surfaces later as
-    an unexplained jump to unrelated older music. GET /me/player/queue's
-    `queue` array mixes those in with the *current* context's own upcoming
-    tracks (no way to tell them apart), so this only drains up to
-    max_drain items rather than the whole thing - enough to clear the
-    handful of orphaned single-track entries this app's own lookahead can
-    leave behind (at most one at a time, per session), without turning into
-    a slow walk through an entire playlist's remaining tracks if the prior
-    session was a context (e.g. a Spotify-owned playlist) with a long queue.
+    an unexplained jump to unrelated older music - including, confirmed
+    live, getting mistakenly tagged as belonging to whatever *new* radio
+    session happens to be active when it resurfaces, since this app's own
+    passive reconciliation has no way to tell "genuinely this session's
+    own track" apart from "stray leftover from a previous one" other than
+    whether anything is still sitting in Spotify's real account queue at
+    all.
+
+    Drains database.take_pending_queue_adds() - the exact count of real
+    add_to_queue calls not yet accounted for by a previous drain, tracked
+    precisely because this app is the only thing that ever calls it for its
+    own ad-hoc sessions - rather than guessing from a flat cap. Confirmed
+    live the old flat 20-item cap wasn't enough: a radio session running
+    long enough to queue more than that over its lifetime left genuine
+    residue behind that resurfaced under a later session. Still floored at
+    CLEAR_QUEUE_MIN_DRAIN (covers the common one-or-two-item case even if
+    the counter somehow undercounts) and ceilinged at CLEAR_QUEUE_SAFETY_CAP
+    (so a runaway count, or a real context playlist's own remaining tracks
+    mixed into GET /me/player/queue's response, can't turn this into an
+    extremely slow walk through an entire playlist before the actual play
+    call ever lands).
 
     Called via play()/play_uris()'s drain_queue=True, itself only passed for
     a genuinely new ad-hoc session (a fresh track/Shuffle All/Play All click,
@@ -1058,12 +1126,19 @@ def clear_queue(device_id, max_drain=CLEAR_QUEUE_MAX_DRAIN, token=None):
     drains with both act on whatever device is *currently* active
     account-wide, not necessarily device_id, so calling this against a device
     that isn't already active drains (or reads) the wrong device's queue."""
+    tracked_pending = database.take_pending_queue_adds()
     data = _api_request('GET', '/me/player/queue')
-    if not data:
-        return
-    pending = len(data.get('queue') or [])
+    reported_pending = len(data.get('queue') or []) if data else 0
+    # Whichever signal says more - either can under-report on its own
+    # (tracked_pending only knows what this app itself queued via
+    # add_to_queue since the last drain, e.g. nothing if a container
+    # restart happened mid-session before this call ever landed; the API's
+    # own report has its own confirmed quirks) - capped so neither a
+    # corrupted count nor a real context playlist's own remaining tracks
+    # can turn this into an extremely slow drain.
+    pending = min(max(tracked_pending, reported_pending), CLEAR_QUEUE_SAFETY_CAP)
     drained = 0
-    for _ in range(min(pending, max_drain)):
+    for _ in range(pending):
         if token is not None and not _is_current_intent(device_id, token):
             logger.info("clear_queue %s: superseded by a newer call mid-drain, bailing out", device_id)
             return
@@ -1116,7 +1191,29 @@ def _search_and_score(track_name, artist_name):
     correct the local track's tags to what Spotify actually calls it, which
     can differ from the local tag even on a successful match (capitalization,
     "(Remastered ...)" suffixes, a translated title via the YouTube Music
-    bridge below, etc.)."""
+    bridge below, etc.).
+
+    Checks database.spotify_search_cache first (a general-purpose cache
+    independent of known_tracks, which only covers this user's own library)
+    and returns straight from it with no budget check or live call at all
+    on a hit - this is the one choke point every text search (Radio,
+    Discover, both prewarm jobs, interactive matches) already funnels
+    through, so caching here covers every source at once. Confirmed live
+    this was a real gap: a Radio "fresh discovery" suggestion not in the
+    user's library had nowhere to persist its match, so the same track
+    coming up again in a later, unrelated session cost a fresh search every
+    time. A confirmed no-match gets cached too (same philosophy
+    known_tracks.spotify_checked already uses for library tracks)."""
+    cache_key = f"{track_name.strip().lower()}|||{artist_name.strip().lower()}"
+    cached = database.get_cached_spotify_search(cache_key)
+    if cached is not None:
+        if not cached['matched']:
+            return 'ok', None
+        return 'ok', {
+            'uri': cached['uri'], 'artwork_url': cached['artwork_url'],
+            'track_name': cached['track_name'], 'artist_name': cached['artist_name'],
+        }
+
     if not search_budget_available():
         return 'unavailable', None
     query = f'track:{track_name} artist:{artist_name}'
@@ -1136,17 +1233,37 @@ def _search_and_score(track_name, artist_name):
             candidates.append((item, item_artists))
 
     if not candidates:
+        database.set_cached_spotify_search(cache_key, False, None)
         return 'ok', None
 
     best, best_artists = min(candidates, key=lambda c: _release_date_key(c[0]))
     album = best.get('album') or {}
     images = album.get('images') or []
-    return 'ok', {
+    match = {
         'uri': best['uri'],
         'artwork_url': images[0]['url'] if images else None,
         'track_name': best['name'],
         'artist_name': best_artists,
     }
+    database.set_cached_spotify_search(cache_key, True, match)
+    return 'ok', match
+
+
+def search_track_direct(track_name, artist_name):
+    """Single Spotify /search call, no YouTube Music/Shazam bridging -
+    unlike search_track below, which exists specifically to rescue a
+    *local library file*'s own tag (which can be garbled, placeholder-only,
+    or an English transliteration of a native-script original), a Radio
+    candidate's track_name/artist_name comes straight from Last.fm's own
+    catalog data - already clean, canonical text with nothing for a bridge
+    to plausibly fix. Confirmed live this was a real cost, not theoretical:
+    a single miss (Spotify's own direct search finding nothing) fell through
+    to the YouTube Music bridge and searched *again* with whatever it
+    returned - two real /search calls logged for one candidate that still
+    never became a playable track either way. Same ('ok'|'unavailable',
+    match_or_None) shape _search_and_score already returns; only playback_advancer.py's
+    _match_text_candidate calls this today."""
+    return _search_and_score(track_name, artist_name)
 
 
 # Unauthenticated instance - search-only usage needs no login. Cheap to
@@ -1302,7 +1419,22 @@ def _search_by_isrc(isrc):
     must not treat that as a confirmed absence), or ('ok', match_or_None) -
     match is None if this app's catalog access doesn't have it (confirmed
     live: happens even for an ISRC Shazam correctly reports - not every
-    regional recording is available everywhere)."""
+    regional recording is available everywhere).
+
+    Shares database.spotify_search_cache with _search_and_score, under an
+    'isrc:' prefix so this and a text-search key can never collide - same
+    reasoning as there: a confirmed result, hit or miss, never needs a live
+    lookup again from any source."""
+    cache_key = f"isrc:{isrc}"
+    cached = database.get_cached_spotify_search(cache_key)
+    if cached is not None:
+        if not cached['matched']:
+            return 'ok', None
+        return 'ok', {
+            'uri': cached['uri'], 'artwork_url': cached['artwork_url'],
+            'track_name': cached['track_name'], 'artist_name': cached['artist_name'],
+        }
+
     if not search_budget_available():
         return 'unavailable', None
     data = _api_request('GET', '/search', params={'q': f'isrc:{isrc}', 'type': 'track', 'limit': 1})
@@ -1310,16 +1442,19 @@ def _search_by_isrc(isrc):
         return 'unavailable', None
     items = (data.get('tracks') or {}).get('items') or []
     if not items:
+        database.set_cached_spotify_search(cache_key, False, None)
         return 'ok', None
     best = items[0]
     album = best.get('album') or {}
     images = album.get('images') or []
-    return 'ok', {
+    match = {
         'uri': best['uri'],
         'artwork_url': images[0]['url'] if images else None,
         'track_name': best['name'],
         'artist_name': ', '.join(a['name'] for a in best.get('artists', [])),
     }
+    database.set_cached_spotify_search(cache_key, True, match)
+    return 'ok', match
 
 
 SHAZAM_AUDIO_VENV_PYTHON = '/opt/shazam-venv/bin/python3'

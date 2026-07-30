@@ -273,12 +273,22 @@ def generate_radio_batch_for_spotify(seed_artists, seen_keys, count, db):
         same_artist_limit = min(SEED_ARTIST_FALLBACK_CAP, count - len(collected))
         collected.extend(find_cached_artist_tracks(seed_artists, already_seen, same_artist_limit, db))
 
-    if len(collected) < count and hit_budget_wall:
-        # Only widen past the literal seed artist(s) once genuinely out of
-        # budget AND its own cache still isn't enough to fill the gap - a
-        # short Last.fm list on its own just means this seed's real pool of
-        # strong matches is thinning out, not a reason to flood the queue
-        # with unrelated-artist library repeats.
+    if len(collected) < count:
+        # Widens to Last.fm-similar artists' own cache whenever there's
+        # still a gap - regardless of hit_budget_wall. Confirmed live this
+        # was wrongly gated on budget alone: Last.fm itself can simply have
+        # few similar-track suggestions for a given seed (a real, common
+        # case, not a rate-limit signal at all - "Nick Cave & the Bad
+        # Seeds" returned only 7 raw suggestions total even asking for 30),
+        # and skipping straight past this tier sent it to the untargeted
+        # "any cached track" last resort below instead - both a worse pick
+        # (a random unrelated track instead of a genuinely similar artist
+        # like Grinderman or The Birthday Party, both Nick Cave's own other
+        # projects and likely already cached) and, since that tier also
+        # marks the batch "degraded", a misleading "Spotify's search is
+        # rate-limited" message when no rate limit was involved anywhere.
+        # This lookup itself is Last.fm (unthrottled) plus a local cache
+        # query - free regardless of Spotify's budget state.
         already_seen = list(seen_keys) + [radio_track_key(x['track_name'], x['artist_name']) for x in collected]
         similar_artists = lastfm.similar_artist_names(seed_artists)
         collected.extend(find_cached_artist_tracks(similar_artists, already_seen, count - len(collected), db))

@@ -572,6 +572,50 @@ main.with-player {
   margin-top: 8px;
 }
 
+.prewarm-pause-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 10px 0;
+}
+
+.prewarm-pause-label {
+  font-size: 0.85rem;
+  color: var(--text-main);
+}
+
+.toggle-switch {
+  position: relative;
+  width: 40px;
+  height: 22px;
+  flex-shrink: 0;
+  border: none;
+  border-radius: 999px;
+  background: var(--bg-input);
+  cursor: pointer;
+  padding: 0;
+  transition: background 0.2s ease;
+}
+
+.toggle-switch.on {
+  background: var(--accent);
+}
+
+.toggle-switch-knob {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: white;
+  transition: left 0.2s ease;
+}
+
+.toggle-switch.on .toggle-switch-knob {
+  left: 20px;
+}
+
 .hint.centered {
   text-align: center;
   margin-top: 16px;
@@ -2689,7 +2733,8 @@ main.with-player {
   margin-right: 4px;
 }
 
-.radio-destination-row button {
+.radio-destination-row button,
+.radio-destination-menu button {
   background: var(--bg-card);
   border: 1px solid var(--border);
   color: var(--text-muted);
@@ -2700,16 +2745,48 @@ main.with-player {
   transition: all 0.15s ease;
 }
 
-.radio-destination-row button:hover {
+.radio-destination-row button:hover,
+.radio-destination-menu button:hover {
   color: var(--text-main);
   border-color: var(--radio-accent);
 }
 
-.radio-destination-row button.active {
+.radio-destination-row button.active,
+.radio-destination-menu button.active {
   background: var(--radio-gradient);
   border-color: transparent;
   color: white;
   box-shadow: 0 2px 12px rgba(236, 72, 153, 0.35);
+}
+
+/* Single dropdown trigger (same open/close pattern as the control panel's
+   own destination picker, PlayerBar's .np-destination/.np-destination-menu)
+   replacing what used to be every option shown as its own always-visible
+   button. */
+.radio-destination-picker {
+  position: relative;
+  display: inline-block;
+}
+
+.radio-destination-menu {
+  position: absolute;
+  top: calc(100% + 8px);
+  left: 0;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 6px;
+  min-width: 220px;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.45);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  z-index: 3;
+}
+
+.radio-destination-menu button {
+  text-align: left;
+  width: 100%;
 }
 
 .radio-destination-hint {

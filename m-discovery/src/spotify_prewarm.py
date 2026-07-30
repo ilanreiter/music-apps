@@ -1,5 +1,6 @@
 import time
 
+from . import database
 from . import spotify_connect
 
 # How long to wait between batches of background checks. Originally 300s for
@@ -45,6 +46,14 @@ def run(get_connection, progress, is_idle, is_radio_active=lambda: False):
     progress.update(status='running', processed=0, matched=0, error=None)
 
     while True:
+        if database.is_prewarm_paused():
+            # A manual, explicit override - checked first, ahead of the
+            # is_radio_active/is_idle gating below, since this exists
+            # specifically for whenever those two aren't reason enough on
+            # their own to stop consuming search budget right now.
+            progress['status'] = 'paused_manually'
+            time.sleep(IDLE_POLL_INTERVAL_SECONDS)
+            continue
         if is_radio_active():
             progress['status'] = 'waiting_radio_active'
             time.sleep(IDLE_POLL_INTERVAL_SECONDS)

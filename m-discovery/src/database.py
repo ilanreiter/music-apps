@@ -242,6 +242,18 @@ def create_tables():
                     updated_at TIMESTAMP DEFAULT NOW()
                 );
             """)
+            # Exact count of real Spotify account-queue adds (spotify_connect
+            # .add_to_queue) not yet accounted for by a drain - see
+            # clear_queue's own comment for why: GET /me/player/queue's
+            # reported length has its own quirks (confirmed live it can
+            # misreport), and the previous flat 20-item drain cap could
+            # leave real residue behind after a long-running session queued
+            # more than that over its lifetime, which then resurfaces later
+            # under a *new* session's own tracking. This is exact (we're the
+            # only thing ever calling add_to_queue for this app's own
+            # ad-hoc sessions), so clear_queue can drain precisely this many
+            # instead of guessing.
+            cur.execute("ALTER TABLE playback_session ADD COLUMN IF NOT EXISTS pending_queue_adds INTEGER NOT NULL DEFAULT 0;")
             print("Table 'playback_session' checked/created successfully.")
 
             # One row per running Radio session (track/artist/playlist-seeded
@@ -329,6 +341,22 @@ def create_tables():
             cur.execute("ALTER TABLE spotify_quota_estimate ADD COLUMN IF NOT EXISTS last_recovery_check_date DATE;")
             print("Table 'spotify_quota_estimate' checked/created successfully.")
 
+            # A manual, explicit "stop consuming search budget" switch for
+            # the background prewarm jobs (spotify_prewarm.py,
+            # playlist_match_prewarm.py) - separate from and in addition to
+            # their existing is_radio_active/is_idle gating, for whenever
+            # those aren't enough on their own (e.g. no radio session is
+            # actually 'active' server-side, so they're correctly - by their
+            # own existing rules - running full-tilt, but the user still
+            # wants a hard stop right now).
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS background_job_control (
+                    id INTEGER PRIMARY KEY DEFAULT 1,
+                    prewarm_paused BOOLEAN NOT NULL DEFAULT FALSE
+                );
+            """)
+            print("Table 'background_job_control' checked/created successfully.")
+
             # One reused playlist backing spotify_native radio (see
             # spotify_connect.ensure_radio_seed_playlist) - confirmed live
             # Spotify's own Autoplay only continues once a real *context*
@@ -345,6 +373,40 @@ def create_tables():
                 );
             """)
             print("Table 'spotify_radio_seed_playlist' checked/created successfully.")
+
+            # General-purpose cache for any (track_name, artist_name) text
+            # search against Spotify's catalog - independent of known_tracks,
+            # which only ever covers tracks that are part of this user's own
+            # library. Confirmed live this was a real gap: a Radio "fresh
+            # discovery" suggestion (a Last.fm-recommended track the user
+            # doesn't own locally) had nowhere to persist its Spotify match
+            # at all, so the exact same track coming up again in a later,
+            # unrelated session - a different day, a different seed sharing
+            # a similar-artist neighborhood - cost a fresh search every
+            # single time. Keyed by spotify_connect._search_and_score's own
+            # normalized "track|||artist" text (same shape as
+            # radio_engine.radio_track_key), the one choke point every text
+            # search (Radio, Discover, both prewarm jobs, interactive
+            # matches) already funnels through - caching there covers every
+            # source at once rather than one feature at a time. A confirmed
+            # no-match is cached too (matched=FALSE, no uri) - same
+            # philosophy known_tracks.spotify_checked already uses for
+            # library tracks - so a track this app has resolved once, in
+            # either direction, never needs a live search again from
+            # anywhere.
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS spotify_search_cache (
+                    id SERIAL PRIMARY KEY,
+                    track_key TEXT NOT NULL UNIQUE,
+                    matched BOOLEAN NOT NULL,
+                    spotify_uri TEXT,
+                    spotify_track_name TEXT,
+                    spotify_artist_name TEXT,
+                    artwork_url TEXT,
+                    cached_at TIMESTAMP DEFAULT NOW()
+                );
+            """)
+            print("Table 'spotify_search_cache' checked/created successfully.")
 
             # Cache for the Playlists tab's "All Tracks" mode - flattening
             # every playlist's tracks live (N+1 calls to Spotify/YouTube, one
@@ -1019,6 +1081,122 @@ def update_chromecast_pushed_count(count):
             conn.close()
 
 
+def increment_pending_queue_adds():
+    """Bumps the exact count of real Spotify account-queue adds not yet
+    accounted for by a drain - called right after spotify_connect.add_to_queue
+    actually succeeds. See playback_session.pending_queue_adds' own comment
+    for why this exists (clear_queue used to only guess, via a flat cap and
+    Spotify's own not-fully-reliable queue-length report)."""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("UPDATE playback_session SET pending_queue_adds = pending_queue_adds + 1 WHERE id = 1")
+        conn.commit()
+        cur.close()
+    except Error as e:
+        print(f"Error incrementing pending_queue_adds: {e}")
+    finally:
+        if conn:
+            conn.close()
+
+
+def take_pending_queue_adds():
+    """Reads the current pending_queue_adds count and resets it to 0 in the
+    same transaction - called at the start of a fresh drain (see
+    spotify_connect.clear_queue), so whatever a *new* session's own
+    add_to_queue calls add during/after that drain starts counting fresh
+    rather than being folded into what the drain was already accounting
+    for. Returns 0 on any error, same as "nothing tracked" - clear_queue
+    still has its own flat floor/API-reported-length fallback either way."""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT pending_queue_adds FROM playback_session WHERE id = 1")
+        row = cur.fetchone()
+        cur.execute("UPDATE playback_session SET pending_queue_adds = 0 WHERE id = 1")
+        conn.commit()
+        cur.close()
+        return row[0] if row else 0
+    except Error as e:
+        print(f"Error reading/resetting pending_queue_adds: {e}")
+        return 0
+    finally:
+        if conn:
+            conn.close()
+
+
+def get_cached_spotify_search(track_key):
+    """A previously-cached (track_name, artist_name) text search result, or
+    None if never searched before - see spotify_search_cache's own comment.
+    track_key is the caller's own normalized "track|||artist" text (same
+    shape as radio_engine.radio_track_key) - this function doesn't
+    normalize it itself, so callers must be consistent about it (see
+    spotify_connect._search_and_score, the only caller today).
+
+    Returns {'matched': False} for a cached no-match, or {'matched': True,
+    'uri', 'track_name', 'artist_name', 'artwork_url'} for a cached hit -
+    shaped to drop straight into the same match dict _search_and_score
+    already builds from a live search."""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT matched, spotify_uri, spotify_track_name, spotify_artist_name, artwork_url "
+            "FROM spotify_search_cache WHERE track_key = %s",
+            (track_key,),
+        )
+        row = cur.fetchone()
+        cur.close()
+        if row is None:
+            return None
+        matched, uri, spotify_track_name, spotify_artist_name, artwork_url = row
+        if not matched:
+            return {'matched': False}
+        return {
+            'matched': True, 'uri': uri, 'track_name': spotify_track_name,
+            'artist_name': spotify_artist_name, 'artwork_url': artwork_url,
+        }
+    except Error as e:
+        print(f"Error reading cached Spotify search for {track_key!r}: {e}")
+        return None
+    finally:
+        if conn:
+            conn.close()
+
+
+def set_cached_spotify_search(track_key, matched, match):
+    """Persists a genuine (non-'unavailable') Spotify search result - see
+    spotify_search_cache's own comment. match is the {'uri', 'track_name',
+    'artist_name', 'artwork_url'} dict _search_and_score already builds, or
+    None for a confirmed no-match."""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO spotify_search_cache (track_key, matched, spotify_uri, spotify_track_name, spotify_artist_name, artwork_url)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            ON CONFLICT (track_key) DO UPDATE SET
+                matched = EXCLUDED.matched, spotify_uri = EXCLUDED.spotify_uri,
+                spotify_track_name = EXCLUDED.spotify_track_name, spotify_artist_name = EXCLUDED.spotify_artist_name,
+                artwork_url = EXCLUDED.artwork_url, cached_at = NOW()
+        """, (
+            track_key, matched,
+            (match or {}).get('uri'), (match or {}).get('track_name'),
+            (match or {}).get('artist_name'), (match or {}).get('artwork_url'),
+        ))
+        conn.commit()
+        cur.close()
+    except Error as e:
+        print(f"Error caching Spotify search for {track_key!r}: {e}")
+    finally:
+        if conn:
+            conn.close()
+
+
 def clear_playback_session():
     """Nulls out the active session (destination/now_playing/queue) rather than
     deleting the row - the background advancer always SELECTs id=1, so keeping
@@ -1231,15 +1409,6 @@ def _ny_midnight_as_naive_utc(days_ago=0):
     now_ny = datetime.now(NY_TZ)
     start_ny = (now_ny - timedelta(days=days_ago)).replace(hour=0, minute=0, second=0, microsecond=0)
     return start_ny.astimezone(timezone.utc).replace(tzinfo=None)
-
-
-def next_ny_midnight_as_naive_utc():
-    """Start of the *next* America/New_York calendar day, as the naive UTC
-    value _ny_midnight_as_naive_utc's callers already compare TIMESTAMP
-    columns against - the correct block-until point for a confirmed
-    QUOTA_EXCEEDED (a daily allowance that only resets at that boundary, not
-    on whatever short Retry-After Spotify's response happens to carry)."""
-    return _ny_midnight_as_naive_utc(days_ago=-1)
 
 
 def count_searches_since_ny_midnight():
@@ -1474,6 +1643,44 @@ def set_spotify_radio_seed_playlist_id(playlist_id):
         cur.close()
     except Error as e:
         print(f"Error setting the Spotify Radio seed playlist id: {e}")
+    finally:
+        if conn:
+            conn.close()
+
+
+def is_prewarm_paused():
+    """The manual override checked by spotify_prewarm.py and
+    playlist_match_prewarm.py alongside their existing is_radio_active/
+    is_idle gating - see background_job_control's own comment."""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT prewarm_paused FROM background_job_control WHERE id = 1")
+        row = cur.fetchone()
+        return bool(row[0]) if row else False
+    except Error as e:
+        print(f"Error reading prewarm pause state: {e}")
+        return False
+    finally:
+        if conn:
+            conn.close()
+
+
+def set_prewarm_paused(paused):
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO background_job_control (id, prewarm_paused)
+            VALUES (1, %s)
+            ON CONFLICT (id) DO UPDATE SET prewarm_paused = EXCLUDED.prewarm_paused
+        """, (paused,))
+        conn.commit()
+        cur.close()
+    except Error as e:
+        print(f"Error setting prewarm pause state: {e}")
     finally:
         if conn:
             conn.close()
