@@ -144,6 +144,28 @@ def _dedupe_seed_artists(seed_artists):
     return kept
 
 
+def similar_artist_names(seed_artists, limit_per_seed=SIMILAR_ARTISTS_PER_SEED):
+    """Flat, deduped list of artist names similar to seed_artists (just the
+    names, no track lookups), filtered by MIN_ARTIST_MATCH_SCORE and ordered
+    strongest-match-first - same candidate-building logic discover_tracks
+    uses internally, exposed on its own for callers that want to widen a
+    search against something else entirely (radio_engine.py's local-library
+    fallback when Spotify's search is rate-limited: Last.fm itself isn't,
+    so this still works to find more on-theme candidates when Spotify can't
+    be searched at all)."""
+    seed_artists = _dedupe_seed_artists(seed_artists)
+    seed_set = {a.lower() for a in seed_artists}
+    candidates = {}
+    for seed_artist in seed_artists:
+        for name, match in _get_similar_artists(seed_artist, limit=limit_per_seed):
+            key = name.lower()
+            if key in seed_set or match < MIN_ARTIST_MATCH_SCORE:
+                continue
+            if key not in candidates or match > candidates[key][1]:
+                candidates[key] = (name, match)
+    return [name for name, _ in sorted(candidates.values(), key=lambda c: c[1], reverse=True)]
+
+
 def discover_tracks(seed_artists, target_count=10, tracks_per_artist=1):
     """[{'track_name', 'artist_name'}, ...] of real tracks similar to
     seed_artists, drawn from Last.fm's similar-artist/top-tracks data - since

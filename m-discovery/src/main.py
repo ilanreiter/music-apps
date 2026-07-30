@@ -15,6 +15,7 @@ from .database import (
     find_known_track_external_match, backfill_known_track_ids, backfill_ytmusic_cache_match,
     create_radio_session, get_radio_session, append_seen_track_keys,
     set_radio_session_ytmusic_job, stop_radio_session, append_tracks_to_ytmusic_push_job,
+    has_active_spotify_radio_session, count_searches_since_ny_midnight, get_spotify_quota_state,
 )
 from .library_scanner import run_scan
 from .artwork import get_or_create_thumbnail, check_artwork_presence, cache_key_for, normalize_album_name, normalized_album_sql, save_thumbnail
@@ -196,6 +197,7 @@ async def track_activity(request, call_next):
         "/api/spotify/devices",
         "/api/chromecast/devices",
         "/api/library/groups",
+        "/api/spotify/search-budget",
     }
     if not path.endswith("/status") and path not in routine_poll_paths:
         _last_activity_at = time.time()
@@ -1996,7 +1998,7 @@ def _start_spotify_prewarm_background():
 
         def _run():
             try:
-                spotify_prewarm.run(get_db_connection, spotify_prewarm_progress, _is_idle)
+                spotify_prewarm.run(get_db_connection, spotify_prewarm_progress, _is_idle, has_active_spotify_radio_session)
             finally:
                 spotify_prewarm_lock.release()
 
@@ -2026,6 +2028,39 @@ async def get_spotify_prewarm_stats(db: psycopg2.extensions.connection = Depends
     cur.close()
     return {"total": total, "checked": checked, "matched": matched}
 
+@app.get("/api/spotify/search-budget")
+async def get_spotify_search_budget():
+    """Live view of the Spotify /search rate-limit state - two independent
+    gates, both surfaced so the UI never shows a healthy-looking counter
+    while search is actually blocked (confirmed live: the self-imposed
+    estimate can read well under its ceiling while a real 429's Retry-After
+    cooldown is still fully in effect, since that's a separate mechanism -
+    see spotify_connect.py's search_budget_available/
+    search_block_remaining_seconds, both DB-backed so a container restart
+    doesn't lose either). "limit" is not a number Spotify publishes - it's
+    this app's own self-learned daily estimate (starts at
+    database.QUOTA_ESTIMATE_DEFAULT), ratcheted down when a real 429
+    confirms reason=QUOTA_EXCEEDED (spotify_connect.py's
+    _learn_from_quota_exceeded) and back up once a day after a clean
+    stretch (database.maybe_recover_spotify_quota_estimate) -
+    last_adjusted_at/last_adjustment_reason show when/why it last moved,
+    if ever. "used" counts since midnight America/New_York, not a rolling
+    24h window, so it resets for free at that boundary. Polled by the
+    Radio tab's traffic-light meter and shown alongside the Cleanup tab's
+    prewarm status, since every Spotify-search consumer in the app
+    (Discover, Radio, library matching, both prewarm jobs) shares all of
+    this."""
+    used = count_searches_since_ny_midnight()
+    blocked_seconds = spotify_connect.search_block_remaining_seconds()
+    quota_state = get_spotify_quota_state()
+    return {
+        "used": used,
+        "limit": quota_state["daily_estimate"],
+        "blocked_seconds": round(blocked_seconds),
+        "last_adjusted_at": quota_state["last_adjusted_at"],
+        "last_adjustment_reason": quota_state["last_adjustment_reason"],
+    }
+
 def _start_playlist_match_prewarm_background():
     """Kicks off the background YT-Music-to-Spotify match job if one isn't
     already running - same non-blocking-lock pattern as
@@ -2040,7 +2075,7 @@ def _start_playlist_match_prewarm_background():
 
         def _run():
             try:
-                playlist_match_prewarm.run(playlist_match_prewarm_progress, _is_idle)
+                playlist_match_prewarm.run(playlist_match_prewarm_progress, _is_idle, has_active_spotify_radio_session)
             finally:
                 playlist_match_prewarm_lock.release()
 
@@ -2642,6 +2677,12 @@ class RadioStartResponse(BaseModel):
     # nothing to queue/play itself for that destination, it just polls
     # /api/ytmusic/push-job/status using this id's job.
     ytmusic_push_job_id: Optional[int] = None
+    # True when Spotify's search is rate-limited or this session's share of
+    # the self-imposed budget is spent, so this batch is cached-library-only
+    # (see radio_engine.generate_radio_batch_for_spotify) rather than fresh
+    # Last.fm suggestions - always False for browser/ytmusic destinations,
+    # which never touch Spotify's search at all.
+    degraded: bool = False
 
 class RadioMoreResponse(BaseModel):
     tracks: List[Track]
@@ -2651,6 +2692,8 @@ class RadioMoreResponse(BaseModel):
     # the frontend decides whether to surface "this station is running low"
     # and/or stop polling.
     exhausted: bool = False
+    # See RadioStartResponse.degraded.
+    degraded: bool = False
 
 @app.post("/api/radio/start", response_model=RadioStartResponse)
 def start_radio(params: RadioStartRequest, db: psycopg2.extensions.connection = Depends(get_db)):
@@ -2671,9 +2714,12 @@ def start_radio(params: RadioStartRequest, db: psycopg2.extensions.connection = 
     # richer object it already has (a real local file, a cached Spotify
     # match, or a native playlist track) rather than this plain
     # track_name/artist_name reconstruction.
-    track_dicts = radio_engine.generate_fresh_radio_tracks(
-        params.seed_artists, params.destination_type, [seed_key] if seed_key else [], 15, db,
-    )
+    initial_seen = [seed_key] if seed_key else []
+    degraded = False
+    if params.destination_type == 'spotify':
+        track_dicts, degraded = radio_engine.generate_radio_batch_for_spotify(params.seed_artists, initial_seen, 15, db)
+    else:
+        track_dicts = radio_engine.generate_fresh_radio_tracks(params.seed_artists, params.destination_type, initial_seen, 15, db)
     seen_keys = [radio_engine.radio_track_key(t['track_name'], t['artist_name']) for t in track_dicts]
     if seed_key:
         seen_keys.append(seed_key)
@@ -2706,7 +2752,7 @@ def start_radio(params: RadioStartRequest, db: psycopg2.extensions.connection = 
         _start_ytmusic_push_job_background()
         return {"session_id": session_id, "tracks": [], "ytmusic_push_job_id": job_id}
 
-    return {"session_id": session_id, "tracks": [Track(**t) for t in track_dicts]}
+    return {"session_id": session_id, "tracks": [Track(**t) for t in track_dicts], "degraded": degraded}
 
 @app.post("/api/radio/{session_id}/more", response_model=RadioMoreResponse)
 def get_more_radio_tracks(session_id: int, params: RadioMoreRequest, db: psycopg2.extensions.connection = Depends(get_db)):
@@ -2717,9 +2763,15 @@ def get_more_radio_tracks(session_id: int, params: RadioMoreRequest, db: psycopg
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="This radio session has been stopped")
 
     count = max(1, min(params.count or 10, 30))
-    track_dicts = radio_engine.generate_fresh_radio_tracks(
-        session['seed_artists'], session['destination_type'], session['seen_track_keys'] or [], count, db,
-    )
+    degraded = False
+    if session['destination_type'] == 'spotify':
+        track_dicts, degraded = radio_engine.generate_radio_batch_for_spotify(
+            session['seed_artists'], session['seen_track_keys'] or [], count, db,
+        )
+    else:
+        track_dicts = radio_engine.generate_fresh_radio_tracks(
+            session['seed_artists'], session['destination_type'], session['seen_track_keys'] or [], count, db,
+        )
     if track_dicts:
         append_seen_track_keys(session_id, [radio_engine.radio_track_key(t['track_name'], t['artist_name']) for t in track_dicts])
 
@@ -2729,7 +2781,7 @@ def get_more_radio_tracks(session_id: int, params: RadioMoreRequest, db: psycopg
             _start_ytmusic_push_job_background()
         return {"tracks": [], "exhausted": len(track_dicts) == 0}
 
-    return {"tracks": [Track(**t) for t in track_dicts], "exhausted": len(track_dicts) == 0}
+    return {"tracks": [Track(**t) for t in track_dicts], "exhausted": len(track_dicts) == 0, "degraded": degraded}
 
 @app.post("/api/radio/{session_id}/stop")
 def stop_radio(session_id: int):

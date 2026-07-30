@@ -1,7 +1,14 @@
 import os
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 import psycopg2
 from psycopg2 import Error
 from psycopg2.extras import Json, execute_values
+
+# Used to align the Spotify daily search counter/quota to America/New_York
+# calendar days (per user request), regardless of what timezone the DB
+# server itself runs in (confirmed to be UTC - see _ny_midnight_as_naive_utc).
+NY_TZ = ZoneInfo('America/New_York')
 
 def get_db_connection():
     """Establishes and returns a database connection."""
@@ -266,6 +273,54 @@ def create_tables():
                 );
             """)
             print("Table 'radio_session' checked/created successfully.")
+
+            # One row per real (non-short-circuited) Spotify /search call -
+            # every consumer of spotify_connect.search_track shares this same
+            # rate limit (Discover, Radio, library matching, and the two
+            # always-on prewarm jobs), and Spotify publishes no quota number
+            # to pace against the way YouTube's Data API does - this is what
+            # lets spotify_connect.py's own self-imposed budget (see
+            # SEARCH_BUDGET_PER_WINDOW) count real recent usage instead of
+            # guessing blind. Pruned back to the last 24h on every insert
+            # (see record_spotify_search) - nothing here needs history longer
+            # than the rolling window it's checked against.
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS spotify_search_log (
+                    id SERIAL PRIMARY KEY,
+                    requested_at TIMESTAMP DEFAULT NOW()
+                );
+            """)
+            print("Table 'spotify_search_log' checked/created successfully.")
+
+            # Single-row, self-learned estimate of Spotify's real (never
+            # published - confirmed via developer forum research) daily
+            # search quota. Starts at a guessed 100/day; spotify_connect.py
+            # ratchets it down whenever a real 429 response's body confirms
+            # "reason": "QUOTA_EXCEEDED" specifically (not just an ordinary
+            # short-window rate-limit, which says nothing about the daily
+            # ceiling) - so the self-imposed throttle gets more accurate
+            # over time instead of being a permanent guess.
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS spotify_quota_estimate (
+                    id INTEGER PRIMARY KEY DEFAULT 1,
+                    daily_estimate INTEGER NOT NULL DEFAULT 100,
+                    last_adjusted_at TIMESTAMP,
+                    last_adjustment_reason TEXT,
+                    updated_at TIMESTAMP DEFAULT NOW()
+                );
+            """)
+            # blocked_until persists the live Spotify /search 429 cooldown
+            # that used to live only in an in-memory Python global
+            # (spotify_connect.py's old _search_blocked_until) - lost on
+            # every container restart, which meant a mid-cooldown restart
+            # would immediately re-poke Spotify during its own penalty
+            # window. last_recovery_check_date tracks the last NY calendar
+            # date the upward-recovery check (see
+            # maybe_recover_spotify_quota_estimate) already ran for, so it
+            # only ever evaluates once per day.
+            cur.execute("ALTER TABLE spotify_quota_estimate ADD COLUMN IF NOT EXISTS blocked_until TIMESTAMP;")
+            cur.execute("ALTER TABLE spotify_quota_estimate ADD COLUMN IF NOT EXISTS last_recovery_check_date DATE;")
+            print("Table 'spotify_quota_estimate' checked/created successfully.")
 
             # Cache for the Playlists tab's "All Tracks" mode - flattening
             # every playlist's tracks live (N+1 calls to Spotify/YouTube, one
@@ -975,11 +1030,23 @@ def create_radio_session(seed_type, seed_description, seed_artists, destination_
     """Starts a new radio_session row. seen_track_keys is the caller's
     already-lowercased list of "track|||artist" keys for the first batch of
     tracks it just generated, so a subsequent /more call's dedup starts from
-    a non-empty set rather than repeating the very first batch."""
+    a non-empty set rather than repeating the very first batch.
+
+    Retires every other still-'active' session first, in the same
+    transaction - this is a personal single-user tool, so only one radio
+    session is ever really "the" current one at a time, same as
+    playback_session's single-row model. Without this, a session the user
+    never explicitly stopped (closed the tab, navigated away mid-playback)
+    stays 'active' forever, and has_active_spotify_radio_session (used to
+    pause spotify_prewarm/playlist_match_prewarm) would see it and think
+    Radio is still running long after it genuinely isn't - confirmed live
+    this session: over a dozen abandoned test sessions kept both prewarm
+    jobs paused indefinitely."""
     conn = None
     try:
         conn = get_db_connection()
         cur = conn.cursor()
+        cur.execute("UPDATE radio_session SET status = 'stopped', updated_at = NOW() WHERE status = 'active'")
         cur.execute("""
             INSERT INTO radio_session (seed_type, seed_description, seed_artists, seen_track_keys, destination_type, status)
             VALUES (%s, %s, %s, %s, %s, 'active')
@@ -1082,6 +1149,268 @@ def stop_radio_session(session_id):
         cur.close()
     except Error as e:
         print(f"Error stopping radio session {session_id}: {e}")
+    finally:
+        if conn:
+            conn.close()
+
+
+def has_active_spotify_radio_session():
+    """True while any radio_session is actively driving a Spotify Connect
+    destination - used to pause spotify_prewarm/playlist_match_prewarm (see
+    their is_radio_active param) so a long-running background sweep doesn't
+    compete with the user's own foreground listening for the same rate-
+    limited search budget."""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT 1 FROM radio_session WHERE status = 'active' AND destination_type = 'spotify' LIMIT 1")
+        exists = cur.fetchone() is not None
+        cur.close()
+        return exists
+    except Error as e:
+        print(f"Error checking for an active Spotify radio session: {e}")
+        return False
+    finally:
+        if conn:
+            conn.close()
+
+
+def record_spotify_search():
+    """Logs one real (non-short-circuited) Spotify /search call - see
+    spotify_connect.py's _search_and_score. Prunes rows older than 24h on
+    every insert so this never needs a separate cleanup job; nothing reads
+    further back than the rolling window it's checked against
+    (SEARCH_BUDGET_WINDOW_MINUTES)."""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("INSERT INTO spotify_search_log DEFAULT VALUES")
+        cur.execute("DELETE FROM spotify_search_log WHERE requested_at < NOW() - INTERVAL '24 hours'")
+        conn.commit()
+        cur.close()
+    except Error as e:
+        print(f"Error recording a Spotify search: {e}")
+    finally:
+        if conn:
+            conn.close()
+
+
+def _ny_midnight_as_naive_utc(days_ago=0):
+    """Start of "today" (or N days back) in America/New_York, expressed as
+    the naive UTC-wall-clock value this app's plain TIMESTAMP columns
+    actually store (confirmed live: this DB's own session timezone is
+    Etc/UTC, and NOW() is stored with its offset silently stripped) - so a
+    plain >= comparison against requested_at/last_adjusted_at lines up
+    correctly without needing every column to be TIMESTAMPTZ."""
+    now_ny = datetime.now(NY_TZ)
+    start_ny = (now_ny - timedelta(days=days_ago)).replace(hour=0, minute=0, second=0, microsecond=0)
+    return start_ny.astimezone(timezone.utc).replace(tzinfo=None)
+
+
+def next_ny_midnight_as_naive_utc():
+    """Start of the *next* America/New_York calendar day, as the naive UTC
+    value _ny_midnight_as_naive_utc's callers already compare TIMESTAMP
+    columns against - the correct block-until point for a confirmed
+    QUOTA_EXCEEDED (a daily allowance that only resets at that boundary, not
+    on whatever short Retry-After Spotify's response happens to carry)."""
+    return _ny_midnight_as_naive_utc(days_ago=-1)
+
+
+def count_searches_since_ny_midnight():
+    """How many real Spotify /search calls have been logged since midnight,
+    America/New_York - the daily counter resets for free at that boundary
+    (nothing to explicitly clear - rows before it just fall outside the
+    query), per the user's request to align the day boundary to NY time
+    rather than a rolling 24h window."""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM spotify_search_log WHERE requested_at >= %s", (_ny_midnight_as_naive_utc(),))
+        count = cur.fetchone()[0]
+        cur.close()
+        return count
+    except Error as e:
+        print(f"Error counting today's Spotify searches: {e}")
+        return 0
+    finally:
+        if conn:
+            conn.close()
+
+
+# What the daily estimate starts at, and the ceiling upward recovery (see
+# maybe_recover_spotify_quota_estimate) never climbs past - the original
+# guess is the most this app ever assumed was safe to begin with, so
+# recovering past it would just be inventing a second, ungrounded guess.
+QUOTA_ESTIMATE_DEFAULT = 100
+
+
+def get_spotify_quota_estimate():
+    """Current self-learned daily search quota estimate - creates the
+    single row (default 100/day) on first read if it doesn't exist yet.
+    Also opportunistically runs the once-a-day upward-recovery check (see
+    maybe_recover_spotify_quota_estimate) - cheap/idempotent past the first
+    call each day, and this is the one function every budget check already
+    calls, so recovery reliably gets evaluated soon after each NY midnight
+    without needing its own scheduled job."""
+    maybe_recover_spotify_quota_estimate()
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT daily_estimate FROM spotify_quota_estimate WHERE id = 1")
+        row = cur.fetchone()
+        if row is None:
+            cur.execute(
+                "INSERT INTO spotify_quota_estimate (id, daily_estimate) VALUES (1, %s) ON CONFLICT (id) DO NOTHING",
+                (QUOTA_ESTIMATE_DEFAULT,),
+            )
+            conn.commit()
+            row = (QUOTA_ESTIMATE_DEFAULT,)
+        cur.close()
+        return row[0]
+    except Error as e:
+        print(f"Error reading Spotify quota estimate: {e}")
+        return QUOTA_ESTIMATE_DEFAULT
+    finally:
+        if conn:
+            conn.close()
+
+
+def get_spotify_quota_state():
+    """Full row - used by the /api/spotify/search-budget route to also
+    surface when/why the estimate was last adjusted, not just its current
+    value."""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT daily_estimate, last_adjusted_at, last_adjustment_reason FROM spotify_quota_estimate WHERE id = 1")
+        row = cur.fetchone()
+        cur.close()
+        if row is None:
+            return {"daily_estimate": QUOTA_ESTIMATE_DEFAULT, "last_adjusted_at": None, "last_adjustment_reason": None}
+        return {
+            "daily_estimate": row[0],
+            "last_adjusted_at": row[1].isoformat() if row[1] else None,
+            "last_adjustment_reason": row[2],
+        }
+    except Error as e:
+        print(f"Error reading Spotify quota state: {e}")
+        return {"daily_estimate": QUOTA_ESTIMATE_DEFAULT, "last_adjusted_at": None, "last_adjustment_reason": None}
+    finally:
+        if conn:
+            conn.close()
+
+
+def set_spotify_quota_estimate(new_value, reason):
+    """Records a new self-learned daily quota estimate, with why - called
+    by spotify_connect.py only when a real 429 response body confirms
+    reason='QUOTA_EXCEEDED', never on an ordinary rate-limit."""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO spotify_quota_estimate (id, daily_estimate, last_adjusted_at, last_adjustment_reason, updated_at)
+            VALUES (1, %s, NOW(), %s, NOW())
+            ON CONFLICT (id) DO UPDATE SET
+                daily_estimate = EXCLUDED.daily_estimate,
+                last_adjusted_at = EXCLUDED.last_adjusted_at,
+                last_adjustment_reason = EXCLUDED.last_adjustment_reason,
+                updated_at = NOW()
+        """, (new_value, reason))
+        conn.commit()
+        cur.close()
+        print(f"Spotify daily search quota estimate adjusted to {new_value}: {reason}")
+    except Error as e:
+        print(f"Error setting Spotify quota estimate: {e}")
+    finally:
+        if conn:
+            conn.close()
+
+
+def maybe_recover_spotify_quota_estimate():
+    """Once per NY calendar day: if the estimate is below the original
+    default and wasn't lowered again yesterday or today, nudge it back up
+    (20% of the remaining gap, floor +1, capped at the default) - the
+    closest thing to a positive signal available, since Spotify never
+    confirms "your quota was fine," only reactively rejects with a 429. A
+    clean day is treated as weak evidence the current estimate might be
+    more conservative than it needs to be. No-ops immediately once already
+    run for today."""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT daily_estimate, last_adjusted_at, last_recovery_check_date FROM spotify_quota_estimate WHERE id = 1",
+        )
+        row = cur.fetchone()
+        if row is None:
+            cur.close()
+            return
+        daily_estimate, last_adjusted_at, last_recovery_check_date = row
+        today = datetime.now(NY_TZ).date()
+        if last_recovery_check_date == today:
+            cur.close()
+            return
+        adjusted_recently = last_adjusted_at is not None and last_adjusted_at >= _ny_midnight_as_naive_utc(days_ago=1)
+        new_estimate = daily_estimate
+        if not adjusted_recently and daily_estimate < QUOTA_ESTIMATE_DEFAULT:
+            new_estimate = min(QUOTA_ESTIMATE_DEFAULT, daily_estimate + max(1, round(daily_estimate * 0.2)))
+        cur.execute(
+            "UPDATE spotify_quota_estimate SET daily_estimate = %s, last_recovery_check_date = %s, updated_at = NOW() WHERE id = 1",
+            (new_estimate, today),
+        )
+        conn.commit()
+        cur.close()
+        if new_estimate != daily_estimate:
+            print(f"Spotify daily search quota estimate recovered {daily_estimate} -> {new_estimate} after a clean day")
+    except Error as e:
+        print(f"Error checking Spotify quota recovery: {e}")
+    finally:
+        if conn:
+            conn.close()
+
+
+def get_spotify_search_blocked_until():
+    """Naive-UTC datetime this app's last real 429 said to wait until, or
+    None - persisted (not just an in-memory Python global) so a container
+    restart mid-cooldown doesn't forget and immediately re-poke Spotify
+    during its own penalty window."""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT blocked_until FROM spotify_quota_estimate WHERE id = 1")
+        row = cur.fetchone()
+        cur.close()
+        return row[0] if row else None
+    except Error as e:
+        print(f"Error reading Spotify search block state: {e}")
+        return None
+    finally:
+        if conn:
+            conn.close()
+
+
+def set_spotify_search_blocked_until(blocked_until):
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO spotify_quota_estimate (id, blocked_until, updated_at)
+            VALUES (1, %s, NOW())
+            ON CONFLICT (id) DO UPDATE SET blocked_until = EXCLUDED.blocked_until, updated_at = NOW()
+        """, (blocked_until,))
+        conn.commit()
+        cur.close()
+    except Error as e:
+        print(f"Error setting Spotify search block state: {e}")
     finally:
         if conn:
             conn.close()

@@ -14,7 +14,7 @@ BATCH_SIZE = 5
 IDLE_POLL_INTERVAL_SECONDS = 30
 
 
-def run(progress, is_idle):
+def run(progress, is_idle, is_radio_active=lambda: False):
     """Slowly resolves a Spotify match for every playlist_track_cache row
     (platform='ytmusic') that doesn't have one yet, so playing a YouTube
     Music playlist track via Spotify Connect can skip the live search
@@ -23,6 +23,10 @@ def run(progress, is_idle):
     as spotify_prewarm, same reasoning (this is background housekeeping, not
     something that should compete with an actively-in-progress interaction).
 
+    Also pauses for as long as is_radio_active() is true (a Spotify-
+    destination Radio session is running) - same shared-budget reasoning as
+    spotify_prewarm.py.
+
     Never marks a row matched-and-done on an 'unavailable' (rate-limited)
     result - same rule spotify_prewarm follows - so a track hit during a
     rate-limited stretch just gets tried again next cycle, not permanently
@@ -30,6 +34,10 @@ def run(progress, is_idle):
     progress.update(status='running', processed=0, matched=0, error=None)
 
     while True:
+        if is_radio_active():
+            progress['status'] = 'waiting_radio_active'
+            time.sleep(IDLE_POLL_INTERVAL_SECONDS)
+            continue
         if not is_idle():
             progress['status'] = 'waiting_active_use'
             time.sleep(IDLE_POLL_INTERVAL_SECONDS)

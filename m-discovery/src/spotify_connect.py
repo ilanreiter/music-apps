@@ -7,6 +7,7 @@ import secrets
 import subprocess
 import threading
 import time
+from datetime import datetime, timedelta
 from urllib.parse import quote
 
 import requests
@@ -146,29 +147,118 @@ def disconnect():
     database.clear_spotify_tokens()
 
 
-# Set whenever /search comes back 429'd, to the real (uncapped) Retry-After -
-# confirmed live this can be ~56 minutes, not the few seconds the quick retry
-# below waits. _search_and_score checks this before making a call at all, so
-# a caller stuck retrying the same still-blocked candidate every poll tick
-# (see playback_advancer._advance_spotify) doesn't re-hit the API - and
-# re-poking Spotify during its own penalty window is a real risk of making
-# the block worse, not just wasted effort.
-_search_blocked_until = 0.0
-
 # Spotify's 429 response for /search has been confirmed live to sometimes
 # omit Retry-After entirely - falling back to "assume 1 second" in that case
-# (as if Spotify meant "barely rate-limited at all") defeats the whole point
-# of _search_blocked_until above: the always-on background pre-warm job
-# (spotify_prewarm.py, one attempt every 5 minutes) would just try again
+# (as if Spotify meant "barely rate-limited at all") would defeat the whole
+# point of persisting a cooldown at all: the always-on background pre-warm
+# job (spotify_prewarm.py, one attempt every 5 minutes) would just try again
 # almost immediately, re-poking an endpoint that's already rate-limiting the
 # account and plausibly extending the penalty rather than ever letting it
 # cool down. When the header's missing, assume a real block is in effect and
 # back off for a while instead of barely at all.
 SEARCH_RATE_LIMIT_FALLBACK_SECONDS = 300
 
+# Self-imposed ceiling on real /search calls per calendar day (America/
+# New_York, per user request) - Spotify publishes no quota number to pace
+# against here (confirmed via their own docs: "the specific groupings and
+# limits are subject to change", unlike YouTube's documented daily budget,
+# see ytmusic_push_job.py's DAILY_SAFE_BUDGET). Since there's no
+# authoritative figure, this starts at a guessed default
+# (database.QUOTA_ESTIMATE_DEFAULT) and gets ratcheted both down
+# (_learn_from_quota_exceeded, whenever a real 429 response body confirms
+# Spotify actually meant "daily quota exhausted" - reason: QUOTA_EXCEEDED, a
+# distinct signal Spotify added July 2026 - rather than an ordinary
+# short-window rate-limit, which says nothing about the daily ceiling) and
+# up (database.maybe_recover_spotify_quota_estimate, once a day, if a full
+# day passed clean) over time. Checked in _search_and_score, the single
+# choke point every caller (Discover, Radio, library matching, both prewarm
+# jobs) already funnels through - stopping here before Spotify's own
+# enforcement kicks in is what lets a burst (playback_advancer's per-tick
+# lookahead, Radio's initial match loop) short-circuit for free mid-burst
+# instead of spending real quota until Spotify itself says no.
+#
+# A single anomalous block (observed live: one hit at only 7 requests that
+# day) shouldn't be able to ratchet the estimate down to near-zero and
+# effectively neuter Radio's Spotify-fresh-discovery path for unrelated
+# reasons - never let it fall below this.
+QUOTA_ESTIMATE_FLOOR = 5
+
+
+def search_budget_available():
+    """True if a fresh /search call would actually be attempted right now -
+    not inside a 429 cooldown, and under today's (America/New_York) self-
+    learned quota estimate. Lets a caller with a cheaper fallback
+    (radio_engine.py's cached-local-track tiering) check first and skip
+    straight to it, instead of finding out the hard way via an
+    'unavailable' result."""
+    if search_block_remaining_seconds() > 0:
+        return False
+    return database.count_searches_since_ny_midnight() < database.get_spotify_quota_estimate()
+
+
+def search_block_remaining_seconds():
+    """How much longer a real Spotify 429 cooldown has left, or 0 if none is
+    active. Reads the *persisted* cooldown (database.get_spotify_search_blocked_until)
+    rather than an in-memory value - confirmed live this needed to survive
+    a container restart: losing an in-memory-only cooldown mid-block meant
+    immediately re-poking Spotify during its own penalty window the moment
+    this app's process happened to restart. This is a *separate* gate from
+    the daily quota estimate above - the estimate can read well under its
+    ceiling (plenty of self-imposed headroom left) while Spotify's own
+    enforcement is still actively blocking every search, since a single
+    real 429's Retry-After (minutes to ~20h, observed live) has nothing to
+    do with how many calls this app's own counter has made."""
+    blocked_until = database.get_spotify_search_blocked_until()
+    if blocked_until is None:
+        return 0
+    remaining = (blocked_until - datetime.utcnow()).total_seconds()
+    return max(0, remaining)
+
+
+def _extract_quota_exceeded_reason(response):
+    """None, or 'QUOTA_EXCEEDED' if this 429's own response body confirms
+    that's specifically what Spotify meant (added July 2026 - previously a
+    429 gave no way to tell "daily quota exhausted" apart from "you're
+    briefly going too fast"). Defensive about exactly where the field lives
+    in the body, since the precise shape isn't fully documented anywhere
+    this app's own research could confirm - checks a couple of plausible
+    locations rather than assuming one, and never raises on an unexpected
+    or non-JSON body."""
+    try:
+        body = response.json()
+    except Exception:
+        return None
+    if not isinstance(body, dict):
+        return None
+    if body.get('reason') == 'QUOTA_EXCEEDED':
+        return 'QUOTA_EXCEEDED'
+    error = body.get('error')
+    if isinstance(error, dict) and error.get('reason') == 'QUOTA_EXCEEDED':
+        return 'QUOTA_EXCEEDED'
+    return None
+
+
+def _learn_from_quota_exceeded():
+    """A confirmed QUOTA_EXCEEDED response is direct evidence that today's
+    (America/New_York) actual request volume already exceeded Spotify's
+    real (undocumented) daily allowance - ratchets the self-imposed
+    estimate down to just under that observed point, so the rest of today
+    (and tomorrow) stops before hitting the same wall instead of
+    re-learning it the hard way. This only ever moves the estimate down -
+    recovering it back up is database.maybe_recover_spotify_quota_estimate's
+    job, run separately once a day after a clean stretch, not this
+    function's (a bad day doesn't mean Spotify's real limit went up, so
+    there's no equivalent positive signal to react to here)."""
+    observed_today = database.count_searches_since_ny_midnight()
+    current_estimate = database.get_spotify_quota_estimate()
+    new_estimate = max(QUOTA_ESTIMATE_FLOOR, min(current_estimate, observed_today - 1))
+    if new_estimate < current_estimate:
+        database.set_spotify_quota_estimate(
+            new_estimate, f"QUOTA_EXCEEDED after {observed_today} real searches today",
+        )
+
 
 def _api_request(method, path, params=None, json_body=None, retried=False):
-    global _search_blocked_until
     token = _get_valid_access_token()
     if not token:
         return None
@@ -184,15 +274,60 @@ def _api_request(method, path, params=None, json_body=None, retried=False):
     except Exception:
         return None
 
+    if path == '/search':
+        # Logged here for every real attempt that reaches Spotify - success
+        # or not, including a post-429 retry below (its own real call) -
+        # before any quota-learning logic reads it back, so a request that
+        # itself triggers QUOTA_EXCEEDED is included in its own "how many
+        # did we send today" tally instead of being off by one.
+        database.record_spotify_search()
+
     if response.status_code == 429:
         retry_after_header = response.headers.get('Retry-After')
         retry_after = int(retry_after_header) if retry_after_header is not None else 1
         if path == '/search':
-            # A missing header doesn't mean "barely rate-limited" - assume a
-            # real block and back off for a while rather than the ~1s this
-            # would otherwise fall back to (see SEARCH_RATE_LIMIT_FALLBACK_SECONDS).
-            block_seconds = retry_after if retry_after_header is not None else SEARCH_RATE_LIMIT_FALLBACK_SECONDS
-            _search_blocked_until = time.time() + block_seconds
+            # Confirmed live: Spotify's own Retry-After alongside a
+            # QUOTA_EXCEEDED 429 can be far shorter than the daily allowance
+            # actually takes to reset, so honoring it just re-opened the
+            # window early - this app would try again, get QUOTA_EXCEEDED
+            # again, and (before this check existed) re-learn from it as if
+            # it were fresh evidence, each time nudging the estimate down
+            # toward the floor and letting a couple more real requests leak
+            # out to Spotify for no reason, hours into a block the user could
+            # see was still very much active. A confirmed daily-quota
+            # exhaustion only actually clears at the NY-midnight boundary
+            # this app already tracks the rest of its counting against, so
+            # block until then instead of trusting the header for this
+            # specific reason code.
+            was_already_blocked = search_block_remaining_seconds() > 0
+            reason = _extract_quota_exceeded_reason(response)
+            if reason == 'QUOTA_EXCEEDED':
+                database.set_spotify_search_blocked_until(database.next_ny_midnight_as_naive_utc())
+                if not was_already_blocked:
+                    # Only a genuine transition into being rate-limited is
+                    # new evidence about where today's real ceiling sits - a
+                    # 429 that lands while a block was already in effect is
+                    # just the same still-ongoing event, not a second
+                    # independent data point, and must not ratchet the
+                    # estimate down again for it.
+                    _learn_from_quota_exceeded()
+            else:
+                # A missing header doesn't mean "barely rate-limited" -
+                # assume a real block and back off for a while rather than
+                # the ~1s this would otherwise fall back to (see
+                # SEARCH_RATE_LIMIT_FALLBACK_SECONDS). Not a confirmed daily
+                # exhaustion, so no reason to assume it lasts until midnight.
+                block_seconds = retry_after if retry_after_header is not None else SEARCH_RATE_LIMIT_FALLBACK_SECONDS
+                database.set_spotify_search_blocked_until(datetime.utcnow() + timedelta(seconds=block_seconds))
+            # Deliberately no quick-retry for /search specifically - real
+            # cooldowns here run minutes to ~20h (observed live), so retrying
+            # a few seconds later is essentially guaranteed to hit the same
+            # wall again. Confirmed live this was actually happening: one
+            # logical lookup would 429, auto-retry once below, 429 again,
+            # and get logged/learned-from twice for what was really a single
+            # event. Every other endpoint keeps the existing quick-retry,
+            # since their rate limits are observed to be much shorter-lived.
+            return None
         if not retried:
             wait = min(retry_after, RATE_LIMIT_RETRY_CAP_SECONDS)
             time.sleep(wait)
@@ -891,9 +1026,12 @@ def _search_and_score(track_name, artist_name):
     can differ from the local tag even on a successful match (capitalization,
     "(Remastered ...)" suffixes, a translated title via the YouTube Music
     bridge below, etc.)."""
-    if time.time() < _search_blocked_until:
+    if not search_budget_available():
         return 'unavailable', None
     query = f'track:{track_name} artist:{artist_name}'
+    # _api_request itself logs this attempt (success or not) and, on a real
+    # 429, checks for/learns from a confirmed QUOTA_EXCEEDED reason - see
+    # both there.
     data = _api_request('GET', '/search', params={'q': query, 'type': 'track', 'limit': 5})
     if data is None:
         return 'unavailable', None
@@ -1074,7 +1212,7 @@ def _search_by_isrc(isrc):
     match is None if this app's catalog access doesn't have it (confirmed
     live: happens even for an ISRC Shazam correctly reports - not every
     regional recording is available everywhere)."""
-    if time.time() < _search_blocked_until:
+    if not search_budget_available():
         return 'unavailable', None
     data = _api_request('GET', '/search', params={'q': f'isrc:{isrc}', 'type': 'track', 'limit': 1})
     if data is None:

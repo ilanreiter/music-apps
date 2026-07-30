@@ -2645,7 +2645,15 @@ main.with-player {
   }
 }
 
-/* Radio tab */
+/* Radio tab - a distinct pink/violet accent (--radio-*) instead of the
+   app's usual indigo, so the tab reads as its own "on air" space rather
+   than a plain reskinned library view. */
+:root {
+  --radio-accent: #ec4899;
+  --radio-accent-2: #8b5cf6;
+  --radio-gradient: linear-gradient(135deg, var(--radio-accent), var(--radio-accent-2));
+}
+
 .radio-section {
   max-width: 720px;
   margin: 0 auto;
@@ -2654,6 +2662,11 @@ main.with-player {
 
 .radio-header h2 {
   margin-bottom: 4px;
+  background: var(--radio-gradient);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  display: inline-block;
 }
 
 .radio-subtitle {
@@ -2681,19 +2694,22 @@ main.with-player {
   border: 1px solid var(--border);
   color: var(--text-muted);
   padding: 7px 14px;
-  border-radius: 8px;
+  border-radius: 999px;
   cursor: pointer;
   font-size: 0.85rem;
+  transition: all 0.15s ease;
 }
 
 .radio-destination-row button:hover {
   color: var(--text-main);
+  border-color: var(--radio-accent);
 }
 
 .radio-destination-row button.active {
-  background: var(--accent);
-  border-color: var(--accent);
+  background: var(--radio-gradient);
+  border-color: transparent;
   color: white;
+  box-shadow: 0 2px 12px rgba(236, 72, 153, 0.35);
 }
 
 .radio-destination-hint {
@@ -2701,34 +2717,300 @@ main.with-player {
   font-size: 0.8rem;
 }
 
-.radio-now-streaming {
+/* "Now Playing" hero card - the tab's centerpiece while a session is live */
+.radio-now-playing {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  padding: 20px;
+  border-radius: 16px;
+  margin-bottom: 20px;
+  background:
+    radial-gradient(circle at 100% 0%, rgba(236, 72, 153, 0.22), transparent 55%),
+    var(--bg-card);
+  border: 1px solid rgba(236, 72, 153, 0.3);
+  overflow: hidden;
+}
+
+.radio-now-playing-idle {
+  background: var(--bg-card);
+  border: 1px dashed var(--border-color, rgba(148, 163, 184, 0.35));
+}
+
+.radio-now-playing-main {
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  gap: 18px;
+}
+
+/* Search budget nested inside the panel (moved here from its own separate
+   block per user request) - a divider keeps it visually distinct from the
+   session status row above it while still reading as one panel. */
+.radio-now-playing > .radio-budget {
+  padding-top: 14px;
+  margin-bottom: 0;
+  border-top: 1px solid rgba(148, 163, 184, 0.18);
+}
+
+.radio-live-badge-idle {
+  color: var(--text-muted);
+}
+
+.radio-live-badge-idle .radio-live-dot {
+  background: var(--text-muted);
+  animation: none;
+}
+
+.radio-now-playing-art {
+  width: 76px;
+  height: 76px;
+  border-radius: 14px;
+  flex-shrink: 0;
+  background: var(--radio-gradient);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  box-shadow: 0 8px 22px rgba(139, 92, 246, 0.35);
+}
+
+.radio-now-playing-art img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.radio-now-playing-fallback {
+  font-size: 2rem;
+}
+
+.radio-now-playing-info {
+  flex: 1;
+  min-width: 0;
+}
+
+.radio-now-playing-title {
+  font-size: 1.1rem;
+  margin: 4px 0 2px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.radio-now-playing-artist {
+  color: var(--text-muted);
+  font-size: 0.9rem;
+  margin-bottom: 6px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.radio-now-playing-seed {
+  font-size: 0.78rem;
+  color: var(--text-muted);
+}
+
+.radio-stop-btn {
+  flex-shrink: 0;
+}
+
+.radio-live-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.7rem;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--radio-accent);
+}
+
+.radio-live-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--radio-accent);
+  animation: radio-pulse 1.6s ease-in-out infinite;
+}
+
+@keyframes radio-pulse {
+  0% { box-shadow: 0 0 0 0 rgba(236, 72, 153, 0.55); }
+  70% { box-shadow: 0 0 0 8px rgba(236, 72, 153, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(236, 72, 153, 0); }
+}
+
+.radio-equalizer {
+  display: flex;
+  align-items: flex-end;
+  gap: 3px;
+  height: 20px;
+  flex-shrink: 0;
+}
+
+.radio-equalizer span {
+  width: 3px;
+  border-radius: 2px;
+  background: var(--radio-gradient);
+  animation: radio-eq 0.9s ease-in-out infinite;
+}
+
+.radio-equalizer span:nth-child(1) { animation-delay: 0s; }
+.radio-equalizer span:nth-child(2) { animation-delay: 0.2s; }
+.radio-equalizer span:nth-child(3) { animation-delay: 0.4s; }
+.radio-equalizer span:nth-child(4) { animation-delay: 0.1s; }
+
+.radio-equalizer.paused span {
+  animation-play-state: paused;
+  height: 4px !important;
+}
+
+@keyframes radio-eq {
+  0%, 100% { height: 4px; }
+  50% { height: 18px; }
+}
+
+/* Up Next strip */
+.radio-upnext {
+  margin-bottom: 0;
+}
+
+/* Nested inside the radio-now-playing panel (moved there per user request,
+   same treatment as .radio-budget) - a divider keeps it visually distinct
+   from whatever sits above it (the live/idle row, and the budget bar when
+   present) while still reading as one panel. */
+.radio-now-playing > .radio-upnext {
+  padding-top: 14px;
+  border-top: 1px solid rgba(148, 163, 184, 0.18);
+}
+
+.radio-upnext h3 {
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-muted);
+  margin-bottom: 10px;
+}
+
+.radio-upnext-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.radio-upnext-card {
+  display: flex;
+  align-items: center;
   gap: 12px;
   background: var(--bg-card);
   border: 1px solid var(--border);
   border-radius: 10px;
-  padding: 12px 16px;
-  margin-bottom: 16px;
-  font-size: 0.9rem;
+  padding: 8px 10px;
+  transition: border-color 0.15s ease;
 }
 
-.radio-destination-tag {
+.radio-upnext-card:hover {
+  border-color: var(--radio-accent);
+}
+
+.radio-upnext-thumb {
+  width: 44px;
+  height: 44px;
+  flex-shrink: 0;
+  border-radius: 8px;
+  background: linear-gradient(135deg, rgba(236, 72, 153, 0.28), rgba(139, 92, 246, 0.28));
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 1.2rem;
+  overflow: hidden;
+}
+
+.radio-upnext-thumb img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.radio-upnext-info {
+  min-width: 0;
+}
+
+.radio-upnext-title {
+  font-size: 0.85rem;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.radio-upnext-artist {
+  font-size: 0.75rem;
   color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .radio-ytmusic-status {
   background: var(--bg-card);
   border: 1px solid var(--border);
-  border-radius: 10px;
-  padding: 12px 16px;
+  border-radius: 12px;
+  padding: 16px;
   margin-bottom: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.radio-ytmusic-status-header {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 12px;
-  flex-wrap: wrap;
+}
+
+.radio-progress-fill {
+  background: var(--radio-gradient);
+}
+
+/* Live traffic-light view of the shared Spotify search budget */
+.radio-budget {
+  margin-bottom: 20px;
+}
+
+.radio-budget-label {
+  display: flex;
+  justify-content: space-between;
+  font-size: 0.78rem;
+  color: var(--text-muted);
+  margin-bottom: 6px;
+}
+
+.radio-budget-sublabel {
+  font-size: 0.7rem;
+  color: var(--text-muted);
+  opacity: 0.75;
+  margin-top: 5px;
+}
+
+.radio-budget-fill {
+  transition: width 0.4s ease, background 0.4s ease;
+}
+
+.radio-budget-fill.radio-budget-green {
+  background: #22c55e;
+}
+
+.radio-budget-fill.radio-budget-orange {
+  background: #f59e0b;
+}
+
+.radio-budget-fill.radio-budget-red {
+  background: #ef4444;
 }
 
 .radio-seed-tabs {
@@ -2754,7 +3036,7 @@ main.with-player {
 }
 
 .radio-seed-tabs button.active {
-  background: var(--accent);
+  background: var(--radio-gradient);
   color: white;
 }
 
@@ -2778,8 +3060,15 @@ main.with-player {
   gap: 12px;
   background: var(--bg-card);
   border: 1px solid var(--border);
+  border-left: 3px solid transparent;
   border-radius: 8px;
   padding: 10px 14px;
+  transition: border-left-color 0.15s ease, background 0.15s ease;
+}
+
+.radio-seed-row:hover {
+  border-left-color: var(--radio-accent);
+  background: var(--bg-card-hover);
 }
 
 .radio-seed-row-info {
@@ -2801,6 +3090,23 @@ main.with-player {
   color: var(--text-muted);
 }
 
+.radio-seed-btn {
+  background: var(--radio-gradient);
+  border: none;
+  color: white;
+  flex-shrink: 0;
+}
+
+.radio-seed-btn:hover {
+  filter: brightness(1.1);
+}
+
+.radio-seed-btn:disabled {
+  background: var(--bg-input);
+  color: var(--text-muted);
+  filter: none;
+}
+
 .play-btn.radio-seed {
   background: var(--bg-input);
   color: var(--text-muted);
@@ -2809,5 +3115,15 @@ main.with-player {
 
 .play-btn.radio-seed:hover {
   background: var(--accent-soft);
-  color: var(--accent);
+  color: var(--radio-accent);
+}
+
+@media (max-width: 600px) {
+  .radio-now-playing-main {
+    flex-wrap: wrap;
+  }
+
+  .radio-equalizer {
+    display: none;
+  }
 }

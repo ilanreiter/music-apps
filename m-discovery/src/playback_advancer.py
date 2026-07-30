@@ -338,6 +338,19 @@ def _advance_spotify(save_session, destination_id, now_playing, queue, match_poo
                     # mapMatchedLocalTrack) is still a Library track as far as
                     # the "Source: ..." label is concerned.
                     'origin_library': (now_playing or {}).get('origin_library'),
+                    # Confirmed live: a Radio session's 2nd track can hit this
+                    # exact branch - if Spotify's device naturally advances to
+                    # the already-queued next track (see add_to_queue above)
+                    # faster than this thread's own near-end/play_uris
+                    # transition catches it, forward_index below comes back
+                    # None (the one-buffered-ahead queue only ever tracks a
+                    # single lookahead item) and this reconstructs now_playing
+                    # from scratch. Without carrying this forward the same way
+                    # origin_library/playlist_name already are, the frontend's
+                    # "stop when superseded" effect sees a tagless now_playing
+                    # and concludes Radio was superseded - after just the 2nd
+                    # track, not anything actually stopping.
+                    'radio_session_id': (now_playing or {}).get('radio_session_id'),
                 }
             save_session(now_playing=now_playing, queue=queue)
             is_context = bool((now_playing or {}).get('context_uri'))
@@ -389,17 +402,24 @@ def _advance_spotify(save_session, destination_id, now_playing, queue, match_poo
                 }
                 if candidate_id is not None:
                     found['local_id'] = candidate_id
-                    # Still a Library track as far as the "Source: ..." label
-                    # is concerned, same as App.js's mapMatchedLocalTrack -
-                    # this is just the server-side equivalent of that same
-                    # match+play.
-                    found['origin_library'] = True
-                elif radio_session_id is not None:
+                    if radio_session_id is None:
+                        # Only a genuine "cast my own library" match (not part
+                        # of a Radio pool) reads as "Your Library" in the
+                        # "Source: ..." label - see App.js's mapMatchedLocalTrack
+                        # / sourceLabel, which already prefers radio_session_id
+                        # over origin_library whenever both could apply.
+                        found['origin_library'] = True
+                if radio_session_id is not None:
                     # Bridges back to the Radio session that suggested this
                     # track - App.js's continuous-refill effect uses this to
                     # tell "radio is still what's playing" apart from
                     # anything else, same role it plays for a client-resolved
-                    # radio match.
+                    # radio match. Must be independent of the candidate_id
+                    # check above: the tiered radio batch (radio_engine.py)
+                    # now legitimately hands out cached-library candidates
+                    # (real candidate_id) as part of an active radio pool, and
+                    # those still need this tag or the frontend concludes
+                    # radio was superseded after the very first track.
                     found['radio_session_id'] = radio_session_id
                 spotify_connect.add_to_queue(destination_id, match_result['uri'])
                 match_pool = {'candidates': candidates, 'cursor': cursor}
@@ -428,8 +448,16 @@ def _advance_spotify(save_session, destination_id, now_playing, queue, match_poo
         if conn is None:
             break
         try:
-            new_tracks = radio_engine.generate_fresh_radio_tracks(
-                session['seed_artists'], 'spotify', session.get('seen_track_keys') or [], RADIO_ADVANCER_REFILL_BATCH, conn,
+            # Tiered by API cost, not just a flat Last.fm pull - tries
+            # already-cached library tracks first (zero new Spotify calls),
+            # only reaching for a fresh search if there's budget, and falling
+            # further back to a wider (Last.fm-only, unthrottled) artist
+            # pool of still-cached tracks if there isn't. This is what keeps
+            # a backgrounded Radio session matching indefinitely through a
+            # rate limit instead of just running dry - see
+            # radio_engine.generate_radio_batch_for_spotify.
+            new_tracks, _degraded = radio_engine.generate_radio_batch_for_spotify(
+                session['seed_artists'], session.get('seen_track_keys') or [], RADIO_ADVANCER_REFILL_BATCH, conn,
             )
         finally:
             conn.close()
@@ -437,7 +465,14 @@ def _advance_spotify(save_session, destination_id, now_playing, queue, match_poo
         if not new_tracks:
             break
         append_seen_track_keys(radio_session_id, [radio_engine.radio_track_key(t['track_name'], t['artist_name']) for t in new_tracks])
-        candidates = candidates + [{'id': None, 'track_name': t['track_name'], 'artist_name': t['artist_name']} for t in new_tracks]
+        # t.get('id') is a real known_tracks id for an already-cached library
+        # track (find_cached_artist_tracks) - carrying it through lets the
+        # matching loop above use the cache-hit path instead of a fresh
+        # search; None (a plain Last.fm suggestion) still gets the text path.
+        candidates = candidates + [
+            {'id': t.get('id'), 'track_name': t['track_name'], 'artist_name': t['artist_name'], 'album_name': t.get('album_name')}
+            for t in new_tracks
+        ]
 
     match_pool = {'candidates': candidates, 'cursor': cursor}
     if radio_session_id is not None:
