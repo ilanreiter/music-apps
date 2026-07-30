@@ -369,6 +369,14 @@ def _advance_spotify(save_session, destination_id, now_playing, queue, match_poo
         # below, so none of this function's own driving/lookahead logic
         # applies here at all.
         return _advance_spotify_native(save_session, destination_id, match_pool)
+    # Read once, up front - this tick's own get_status() call below is
+    # exactly the kind of real network delay that opened the race
+    # _radio_session_still_current guards against elsewhere in this
+    # function (the matching/refill loops); this section needs the same
+    # guard, since it can also drive a real play_uris command and save,
+    # not just read.
+    radio_session_id = (match_pool or {}).get('radio_session_id')
+
     result = spotify_connect.get_status(destination_id)
     if result is None:
         return match_pool
@@ -380,6 +388,14 @@ def _advance_spotify(save_session, destination_id, now_playing, queue, match_poo
     near_end = duration > 0 and (duration - position) < SPOTIFY_NEAR_END_MS
 
     if not is_context and queue and near_end:
+        if not _radio_session_still_current(radio_session_id):
+            # Confirmed live: a newer radio session (either engine) can
+            # already be up and running while this tick was waiting on
+            # get_status() above - this branch actively drives playback
+            # (play_uris), so continuing here wouldn't just save stale data,
+            # it would actually yank the device back onto this now-retired
+            # session's own leftover lookahead track.
+            return match_pool
         next_track = queue[0]
         queue = queue[1:]
         spotify_connect.play_uris(destination_id, [next_track['uri']])
@@ -427,6 +443,13 @@ def _advance_spotify(save_session, destination_id, now_playing, queue, match_poo
                     # track, not anything actually stopping.
                     'radio_session_id': (now_playing or {}).get('radio_session_id'),
                 }
+            if not _radio_session_still_current(radio_session_id):
+                # Same race as the near-end branch above - this tick's own
+                # now_playing/queue/match_pool snapshot (including
+                # radio_session_id) was all read before get_status() above,
+                # and a newer session can have already taken over in the
+                # meantime.
+                return match_pool
             save_session(now_playing=now_playing, queue=queue)
             is_context = bool((now_playing or {}).get('context_uri'))
 

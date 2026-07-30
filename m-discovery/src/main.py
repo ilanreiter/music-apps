@@ -2723,6 +2723,14 @@ class RadioMoreResponse(BaseModel):
     # See RadioStartResponse.degraded.
     degraded: bool = False
 
+class RadioSessionInfo(BaseModel):
+    id: int
+    status: str  # 'active' | 'stopped'
+    seed_type: str
+    seed_description: Optional[str] = None
+    destination_type: Optional[str] = None
+    engine: str
+
 @app.post("/api/radio/start", response_model=RadioStartResponse)
 def start_radio(params: RadioStartRequest, db: psycopg2.extensions.connection = Depends(get_db)):
     if not lastfm.is_configured():
@@ -2828,6 +2836,22 @@ def get_more_radio_tracks(session_id: int, params: RadioMoreRequest, db: psycopg
         return {"tracks": [], "exhausted": len(track_dicts) == 0}
 
     return {"tracks": [Track(**t) for t in track_dicts], "exhausted": len(track_dicts) == 0, "degraded": degraded}
+
+@app.get("/api/radio/{session_id}", response_model=RadioSessionInfo)
+def get_radio_session_route(session_id: int):
+    """Lets the frontend confirm a radio_session_id it already has (from a
+    restored now_playing/queue - see /api/playback-session) is still genuinely
+    'active' before restoring the Radio tab's own UI state around it on
+    page load - see App.js's session-restore effect. Without this, a
+    refreshed tab had no way to tell "Radio is still actually running,
+    server-side, right now" apart from "an old, already-stopped session's
+    tag is just sitting there on stale localStorage/playback_session data,"
+    so it always came back showing no active session even when one
+    genuinely still was."""
+    session = get_radio_session(session_id)
+    if session is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No radio session with that id")
+    return session
 
 @app.post("/api/radio/{session_id}/stop")
 def stop_radio(session_id: int):

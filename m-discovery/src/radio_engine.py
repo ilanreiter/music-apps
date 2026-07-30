@@ -15,6 +15,17 @@ from . import spotify_connect
 # especially once a seed's real pool of strong matches starts thinning out.
 RADIO_MORE_MAX_ROUNDS = 3
 
+# Caps how many of a cached-fallback batch can come from the literal seed
+# artist(s) alone (see generate_radio_batch_for_spotify) - just enough to
+# guarantee a genuine same-artist track exists to become the seed pick
+# itself, without a well-covered artist (e.g. 16 cached Jethro Tull tracks)
+# swallowing the *entire* batch before the widened similar-artist tier ever
+# gets a turn. Confirmed live this was happening: an "Aqualung" (Jethro
+# Tull) session's whole fallback batch came back as 7 Jethro Tull tracks and
+# just 1 Genesis one, when the point of Radio is discovering other artists,
+# not replaying the same one seed.
+SEED_ARTIST_FALLBACK_CAP = 2
+
 
 def radio_track_key(track_name, artist_name):
     return f"{track_name.strip().lower()}|||{artist_name.strip().lower()}"
@@ -244,20 +255,33 @@ def generate_radio_batch_for_spotify(seed_artists, seen_keys, count, db):
             continue
         collected.append(c)  # a genuine fresh discovery - matched (live search) later, at actual play time
 
-    degraded = False
+    degraded = hit_budget_wall
     if len(collected) < count:
         # Last.fm's own list ran short (not necessarily a budget problem),
         # or the budget wall was hit partway through - either way, keep the
         # queue filled with more cached library tracks rather than stop.
-        # Only widen past the literal seed artist(s) once genuinely out of
-        # budget - a short Last.fm list on its own just means this seed's
-        # real pool of strong matches is thinning out, not a reason to
-        # flood the queue with library repeats.
-        degraded = hit_budget_wall
-        fallback_artists = (seed_artists + lastfm.similar_artist_names(seed_artists)) if hit_budget_wall else seed_artists
+        # Tries the literal seed artist(s)' own cache first, unwidened - a
+        # genuine same-artist track is always a better seed/filler than a
+        # same-genre substitute. Confirmed live this matters: the old single
+        # combined query (seed_artists + similar_artist_names in one list,
+        # picked via ORDER BY random()) gave a seed's own cached tracks no
+        # priority at all over the widened similar-artist pool - a "Radio
+        # from Aqualung" (Jethro Tull) session's random draw won on a Yes
+        # track from the widened list, even though 16 genuine cached Jethro
+        # Tull tracks were sitting right there unused.
         already_seen = list(seen_keys) + [radio_track_key(x['track_name'], x['artist_name']) for x in collected]
-        more_cached = find_cached_artist_tracks(fallback_artists, already_seen, count - len(collected), db)
-        collected.extend(more_cached)
+        same_artist_limit = min(SEED_ARTIST_FALLBACK_CAP, count - len(collected))
+        collected.extend(find_cached_artist_tracks(seed_artists, already_seen, same_artist_limit, db))
+
+    if len(collected) < count and hit_budget_wall:
+        # Only widen past the literal seed artist(s) once genuinely out of
+        # budget AND its own cache still isn't enough to fill the gap - a
+        # short Last.fm list on its own just means this seed's real pool of
+        # strong matches is thinning out, not a reason to flood the queue
+        # with unrelated-artist library repeats.
+        already_seen = list(seen_keys) + [radio_track_key(x['track_name'], x['artist_name']) for x in collected]
+        similar_artists = lastfm.similar_artist_names(seed_artists)
+        collected.extend(find_cached_artist_tracks(similar_artists, already_seen, count - len(collected), db))
 
     if len(collected) < count:
         # Confirmed live: an obscure seed's cached pool (even widened to
@@ -270,5 +294,25 @@ def generate_radio_batch_for_spotify(seed_artists, seen_keys, count, db):
         degraded = True
         already_seen = list(seen_keys) + [radio_track_key(x['track_name'], x['artist_name']) for x in collected]
         collected.extend(find_any_cached_tracks(already_seen, count - len(collected), db))
+
+    # Moves the *first* genuine seed-artist match (if any) to the front -
+    # deliberately not a full sort. Whoever calls this to resolve an actual
+    # seed track (App.js's resolveFirstSpotifyMatch, used when the literal
+    # picked track/artist itself couldn't be matched) takes the first
+    # candidate that resolves, so this is what makes that the picked
+    # artist's own track whenever one exists in the batch, rather than
+    # whichever came first by Last.fm's ranking or random luck. Everything
+    # *after* that one spot is left exactly as tiered above (Last.fm
+    # discovery first, other-artist cache only once genuinely constrained) -
+    # a full sort here would instead front-load every same-artist match
+    # ahead of any other artist's, turning the whole ongoing queue into a
+    # run of the seed artist's own tracks before ever reaching the similar-
+    # artist variety Radio's actually meant to surface.
+    seed_artists_lower = {a.lower() for a in seed_artists}
+    same_artist_index = next(
+        (i for i, t in enumerate(collected) if t['artist_name'].lower() in seed_artists_lower), None,
+    )
+    if same_artist_index is not None and same_artist_index != 0:
+        collected.insert(0, collected.pop(same_artist_index))
 
     return collected, degraded

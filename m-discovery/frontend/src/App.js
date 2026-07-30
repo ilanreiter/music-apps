@@ -2533,6 +2533,40 @@ function App() {
     setRadioDestinationType(destinationType);
   };
 
+  // Restores Radio's own UI state (hero card, Up Next, Stop button) after a
+  // page refresh - nowPlaying/queue/outputDevice already restore from
+  // localStorage, but radioSessionId/radioSeed/radioDestinationType never
+  // did (always started null), so a refresh mid-session looked identical to
+  // "no radio running" even though playback_advancer was still actively
+  // driving it server-side the whole time it was gone. Reads the *server's*
+  // own current now_playing (not just whatever this tab's localStorage
+  // still has) so this reflects reality even if a different tab/device is
+  // what's actually been keeping the session going - then confirms that
+  // session is still genuinely 'active' (via the new GET /api/radio/{id})
+  // before restoring, since an already-stopped session's old
+  // radio_session_id tag can still be sitting on stale now_playing data.
+  useEffect(() => {
+    let cancelled = false;
+    axios.get(`${API_BASE_URL}/playback-session`).then((response) => {
+      if (cancelled) return;
+      const sessionId = response.data?.now_playing?.radio_session_id;
+      if (sessionId == null) return;
+      axios.get(`${API_BASE_URL}/radio/${sessionId}`).then((sessionResponse) => {
+        if (cancelled) return;
+        const session = sessionResponse.data;
+        if (session.status !== 'active') return;
+        commitRadioSession(
+          sessionId,
+          { type: session.seed_type, description: session.seed_description },
+          session.destination_type,
+        );
+        if (session.destination_type === 'ytmusic') setRadioDestination('ytmusic');
+      }).catch(() => {});
+    }).catch(() => {});
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   // Tries each candidate in order until one actually resolves to a Spotify
   // URI, hands the rest off to the server pool the moment it does (same
   // low-latency-first-track philosophy as Discover/library-cast). A
