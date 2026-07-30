@@ -285,6 +285,13 @@ class RadioStartRequest(BaseModel):
     # suggest it either.
     seed_track_name: Optional[str] = None
     seed_artist_name: Optional[str] = None
+    # 'discovery' (default) - this app's own Last.fm-driven candidate
+    # generation, matched/queued track by track, same as always. 'spotify_native' -
+    # only meaningful for destination_type == 'spotify': generates no batch
+    # at all, since the frontend seeds Spotify's own account-level autoplay
+    # with a single track and playback_advancer._advance_spotify_native just
+    # mirrors whatever Spotify queues on its own from then on.
+    engine: Optional[str] = 'discovery'
 
 class RadioMoreRequest(BaseModel):
     count: Optional[int] = 10
@@ -494,6 +501,12 @@ class SpotifyMatchResult(BaseModel):
     uri: Optional[str] = None
     artwork_url: Optional[str] = None
     reason: Optional[str] = None  # "no_match" | "unavailable", set when matched=False
+
+class NativeRadioSeedRequest(BaseModel):
+    track_uri: str
+
+class NativeRadioSeedResponse(BaseModel):
+    context_uri: str
 
 # Dependency to get a database connection
 def get_db():
@@ -1957,6 +1970,21 @@ def match_discovered_track_to_spotify(params: DiscoverTrackMatchRequest):
         backfill_ytmusic_cache_match(params.ytmusic_video_id, None)
     return {"matched": False, "reason": "no_match"}
 
+@app.post("/api/spotify/native-radio-seed", response_model=NativeRadioSeedResponse)
+def seed_native_radio(params: NativeRadioSeedRequest):
+    """Replaces the reused spotify_native radio playlist's one track with
+    track_uri and returns its context_uri - see
+    spotify_connect.ensure_radio_seed_playlist for why a real context
+    (rather than the bare track_uri the frontend already has) is what a
+    spotify_native session actually needs to play: confirmed live that's the
+    only way Spotify's own Autoplay gets a handoff point at all."""
+    if not spotify_connect.is_connected():
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Spotify not connected")
+    context_uri = spotify_connect.seed_radio_playlist(params.track_uri)
+    if context_uri is None:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Could not seed the Spotify Radio playlist")
+    return {"context_uri": context_uri}
+
 class DiscoverPreviewRequest(BaseModel):
     track_name: str
     artist_name: str
@@ -2703,10 +2731,28 @@ def start_radio(params: RadioStartRequest, db: psycopg2.extensions.connection = 
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No seed artists to start radio from")
     if params.destination_type not in ('browser', 'spotify', 'ytmusic'):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="destination_type must be 'browser', 'spotify', or 'ytmusic'")
+    engine = params.engine or 'discovery'
+    if engine not in ('discovery', 'spotify_native'):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="engine must be 'discovery' or 'spotify_native'")
+    if engine == 'spotify_native' and params.destination_type != 'spotify':
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="spotify_native only applies to the spotify destination")
 
     seed_description = params.seed_description or f"Radio from {', '.join(params.seed_artists[:3])}"
     has_seed_track = bool(params.seed_track_name and params.seed_artist_name)
     seed_key = radio_engine.radio_track_key(params.seed_track_name, params.seed_artist_name) if has_seed_track else None
+
+    # spotify_native seeds Spotify's own account-level autoplay with a single
+    # track and leaves it entirely alone from there - it never needs a batch
+    # of its own candidates at all (no Last.fm call, no generate_radio_batch_for_spotify),
+    # unlike 'discovery' which drives every track itself.
+    if engine == 'spotify_native':
+        session_id = create_radio_session(
+            seed_type=params.seed_type, seed_description=seed_description, seed_artists=params.seed_artists,
+            destination_type=params.destination_type, seen_track_keys=[seed_key] if seed_key else [], engine=engine,
+        )
+        if session_id is None:
+            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Could not start a radio session")
+        return {"session_id": session_id, "tracks": [], "degraded": False}
 
     # Excludes the seed track itself from the generated batch (via the
     # initial seen-keys arg) so it's never immediately re-suggested right

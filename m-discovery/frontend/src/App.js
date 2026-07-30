@@ -1194,8 +1194,7 @@ function App() {
       // once the backend has moved the cursor on - see the ref's comment.
       if (outputDevice.type === 'spotify' && spotifyMatchPoolDirtyRef.current) {
         const pool = spotifyLookaheadRef.current;
-        if (pool && pool.cursor < pool.candidates.length) {
-          payload.spotify_match_pool = { candidates: pool.candidates, cursor: pool.cursor };
+        if (pool && Array.isArray(pool.candidates)) {
           // spotifyLookaheadRef is shared with startQueue's generic
           // spotifyMatchPool option - a Radio session's own pool (see
           // buildRadioSpotifyPool) lands in this same ref and sets this same
@@ -1208,9 +1207,27 @@ function App() {
           // playback_advancer had no radio_session_id to carry forward no
           // matter how it tagged results, and every subsequent track read
           // back as plain library playback instead of Radio.
-          if (pool.radio_session_id != null) {
-            payload.spotify_match_pool.radio_session_id = pool.radio_session_id;
+          if (pool.cursor < pool.candidates.length) {
+            payload.spotify_match_pool = { candidates: pool.candidates, cursor: pool.cursor };
+            if (pool.radio_session_id != null) {
+              payload.spotify_match_pool.radio_session_id = pool.radio_session_id;
+            }
           }
+        } else if (pool && pool.engine === 'spotify_native') {
+          // A spotify_native radio pool (see startNativeSpotifyRadio) has no
+          // candidates/cursor at all - it's just {engine, radio_session_id},
+          // never advanced from here (playback_advancer._advance_spotify_native
+          // only ever reads radio_session_id back off it, ignoring
+          // candidates/cursor entirely). Confirmed live this needs to still
+          // be forwarded, just without the candidates-array bookkeeping
+          // above: skipping spotify_match_pool entirely for this shape (an
+          // earlier, over-corrected version of this guard) meant a brand
+          // new native session's own pool never actually reached the server
+          // at all - playback_advancer kept dispatching to the *discovery*
+          // engine's logic instead (spotify_match_pool.engine was never set
+          // to 'spotify_native'), working off whatever unrelated pool
+          // happened to be persisted from before.
+          payload.spotify_match_pool = { engine: pool.engine, radio_session_id: pool.radio_session_id };
         }
         spotifyMatchPoolDirtyRef.current = false;
       }
@@ -2576,8 +2593,115 @@ function App() {
     return false;
   };
 
+  // Same per-candidate matching tryResolveAndStartFirstSpotifyMatch uses
+  // (cache-first via known_track_id, text search otherwise), but just
+  // returns the first resolved entry instead of also starting playback/
+  // building a server-side match pool - startNativeSpotifyRadio below only
+  // ever needs a single track to seed Spotify's own autoplay with, never a
+  // pool of further candidates.
+  const resolveFirstSpotifyMatch = async (sessionId, candidates) => {
+    for (const candidate of candidates) {
+      let matchResult;
+      try {
+        if (candidate.known_track_id != null) {
+          const matchResponse = await axios.post(`${API_BASE_URL}/spotify/tracks/${candidate.known_track_id}/match`);
+          matchResult = matchResponse.data;
+        } else {
+          const matchResponse = await axios.post(`${API_BASE_URL}/spotify/discover-match`, {
+            track_name: candidate.track_name, artist_name: candidate.artist_name,
+          });
+          matchResult = matchResponse.data;
+        }
+      } catch (err) {
+        console.error('Error matching a Spotify Radio seed fallback candidate:', err);
+        continue;
+      }
+      if (!matchResult.matched) continue;
+      return {
+        id: matchResult.uri, source: 'spotify', uri: matchResult.uri, context_uri: null,
+        radio_session_id: sessionId,
+        track_name: candidate.track_name, artist_name: candidate.artist_name,
+        album_name: candidate.album_name, artwork_url: matchResult.artwork_url,
+      };
+    }
+    return null;
+  };
+
+  // Starts a 'spotify_native' radio session: plays just the seed track, then
+  // leaves entirely alone from there - Spotify's own account-level autoplay
+  // (a client-side "Autoplay similar songs" setting on the account/device,
+  // not something this app's Web API access can toggle) keeps queueing
+  // similar tracks on its own, and playback_advancer._advance_spotify_native
+  // just mirrors whatever it ends up playing/queueing. No candidates/match
+  // pool of our own at all past this one seed - unlike handleStartRadio's
+  // 'discovery' path, which drives every track itself.
+  const startNativeSpotifyRadio = async (seed, destinationType) => {
+    try {
+      const response = await axios.post(`${API_BASE_URL}/radio/start`, {
+        seed_type: seed.type,
+        seed_description: seed.description,
+        seed_artists: seed.seedArtists,
+        destination_type: destinationType,
+        seed_track_name: seed.seedTrack?.track_name || null,
+        seed_artist_name: seed.seedTrack?.artist_name || null,
+        engine: 'spotify_native',
+      });
+      const { session_id } = response.data;
+
+      let seedEntry = await resolveSeedTrackForPlayback(seed.seedTrack, destinationType, session_id);
+      if (!seedEntry) {
+        // The literal seed track couldn't be matched (not cached, and either
+        // genuinely not on Spotify or search is rate-limited) - fall back to
+        // one of this same seed's already-cached library tracks instead of
+        // failing outright. Reuses /more's own cached-tier fallback
+        // (radio_engine.generate_radio_batch_for_spotify) rather than
+        // duplicating that tiering logic here.
+        try {
+          const moreResponse = await axios.post(`${API_BASE_URL}/radio/${session_id}/more`, { count: 5 });
+          const fallbackMapped = mapRadioTracks(session_id, moreResponse.data.tracks);
+          seedEntry = await resolveFirstSpotifyMatch(session_id, fallbackMapped);
+        } catch (err) {
+          console.error('Error fetching a cached-only seed fallback for Spotify Radio:', err);
+        }
+      }
+
+      if (!seedEntry) {
+        axios.post(`${API_BASE_URL}/radio/${session_id}/stop`).catch((err) => console.error('Error stopping an unstarted radio session:', err));
+        setRadioSessionId(null);
+        setRadioSeed(null);
+        setRadioDestinationType(null);
+        setRadioStatus(
+          seed.seedTrack
+            ? `Couldn't start Spotify Radio - "${seed.seedTrack.track_name}" hasn't been matched to Spotify yet, search is rate-limited right now, and nothing else in your library is cached for this seed either. Try again once the rate limit clears.`
+            : "Couldn't start Spotify Radio - Spotify's search is rate-limited right now and nothing in your library is already cached for this seed. Try again once the rate limit clears.",
+        );
+        return;
+      }
+
+      // Confirmed live: Spotify's own Autoplay only ever continues once a
+      // real *context* (playlist/album/artist) finishes - a bare ad-hoc
+      // uris-list play just stops after the seed, Autoplay setting
+      // notwithstanding. Reseeds this app's one reused single-track
+      // playlist with this exact seed and plays *that* as context instead -
+      // once its one track "finishes" (immediately), Autoplay picks up from
+      // there the same way it does at the end of any real playlist/album.
+      try {
+        const seedResponse = await axios.post(`${API_BASE_URL}/spotify/native-radio-seed`, { track_uri: seedEntry.uri });
+        seedEntry = { ...seedEntry, context_uri: seedResponse.data.context_uri };
+      } catch (err) {
+        console.error('Error seeding the Spotify Radio playlist - Autoplay may not continue past this track:', err);
+      }
+
+      commitRadioSession(session_id, seed, destinationType);
+      startQueue([seedEntry], { spotifyMatchPool: { engine: 'spotify_native', radio_session_id: session_id } });
+    } catch (err) {
+      console.error('Error starting Spotify Radio:', err);
+      setRadioStatus('Failed to start Spotify Radio. Please try again.');
+    }
+  };
+
   const handleStartRadio = async (seed) => {
-    // seed: { type: 'track'|'artist'|'playlist', description, seedArtists: string[], seedTrack? }
+    // seed: { type: 'track'|'artist'|'playlist', description, seedArtists: string[], seedTrack?, engine? }
     const destinationType = resolveRadioDestinationType();
     if (!destinationType) {
       setRadioStatus('Select a Spotify Connect device, This Browser, or YouTube Music (below) to use Radio.');
@@ -2592,6 +2716,9 @@ function App() {
       return;
     }
     setRadioStatus(null);
+    if (seed.engine === 'spotify_native' && destinationType === 'spotify') {
+      return startNativeSpotifyRadio(seed, destinationType);
+    }
     try {
       const response = await axios.post(`${API_BASE_URL}/radio/start`, {
         seed_type: seed.type,
@@ -2733,7 +2860,7 @@ function App() {
   // reasoning: keeps the seed a sane size even for a huge playlist.
   const RADIO_PLAYLIST_ARTIST_LIMIT = 8;
 
-  const startRadioFromPlaylist = async (platform, playlistId, playlistName) => {
+  const startRadioFromPlaylist = async (platform, playlistId, playlistName, engine = 'discovery') => {
     try {
       const endpoint = platform === 'spotify'
         ? `${API_BASE_URL}/spotify/playlists/${playlistId}/tracks`
@@ -2761,7 +2888,7 @@ function App() {
       const seedTrack = tracks.length > 0
         ? (platform === 'spotify' ? mapSpotifyTrack(tracks[0], playlistName) : mapYtMusicTrack(tracks[0], playlistName))
         : null;
-      await handleStartRadio({ type: 'playlist', description: `Radio from ${playlistName}`, seedArtists: artists, seedTrack });
+      await handleStartRadio({ type: 'playlist', description: `Radio from ${playlistName}`, seedArtists: artists, seedTrack, engine });
     } catch (err) {
       console.error('Error reading playlist tracks for radio seed:', err);
       setRadioStatus('Could not read this playlist to start radio.');
@@ -5144,6 +5271,14 @@ function RadioTab({
   onDismissRadioStatus, onStartRadio, onStartRadioFromPlaylist, onStopRadio,
 }) {
   const [seedMode, setSeedMode] = useState('track');
+  // 'discovery' (default) - this app's own Last.fm-driven engine, matching/
+  // queueing every track itself. 'spotify_native' - only meaningful for a
+  // Spotify Connect destination: seeds Spotify's own account-level autoplay
+  // with a single track and leaves it alone from there (see
+  // playback_advancer._advance_spotify_native) - near-zero ongoing search
+  // cost, but depends on the account/device's own "Autoplay similar songs"
+  // setting (Spotify's app, not this one) actually being turned on.
+  const [radioEngine, setRadioEngine] = useState('discovery');
   const [trackQuery, setTrackQuery] = useState('');
   const [trackResults, setTrackResults] = useState([]);
   const [artistQuery, setArtistQuery] = useState('');
@@ -5236,7 +5371,7 @@ function RadioTab({
   const startFromTrack = (track) => {
     // track already came from /tracks/known - the exact plain library-track
     // shape onStartRadio/resolveSeedTrackForPlayback expects to play first.
-    onStartRadio({ type: 'track', description: `Radio from "${track.track_name}"`, seedArtists: [track.artist_name], seedTrack: track });
+    onStartRadio({ type: 'track', description: `Radio from "${track.track_name}"`, seedArtists: [track.artist_name], seedTrack: track, engine: radioEngine });
   };
 
   const startFromArtist = async (artistName) => {
@@ -5256,7 +5391,7 @@ function RadioTab({
       console.error('Error finding a track for this artist:', err);
     }
     try {
-      await onStartRadio({ type: 'artist', description: `Radio from ${artistName}`, seedArtists: [artistName], seedTrack });
+      await onStartRadio({ type: 'artist', description: `Radio from ${artistName}`, seedArtists: [artistName], seedTrack, engine: radioEngine });
     } finally {
       setStartingSeedKey(null);
     }
@@ -5266,7 +5401,7 @@ function RadioTab({
     const key = `${playlist.platform}-${playlist.id}`;
     setStartingSeedKey(key);
     try {
-      await onStartRadioFromPlaylist(playlist.platform, playlist.id, playlist.name);
+      await onStartRadioFromPlaylist(playlist.platform, playlist.id, playlist.name, radioEngine);
     } finally {
       setStartingSeedKey(null);
     }
@@ -5370,6 +5505,23 @@ function RadioTab({
         )}
       </div>
 
+      {outputDevice?.type === 'spotify' && (
+        <div className="radio-destination-row">
+          <span className="radio-destination-label">Engine:</span>
+          <button className={radioEngine === 'discovery' ? 'active' : ''} onClick={() => setRadioEngine('discovery')}>
+            🔎 Discover new music
+          </button>
+          <button className={radioEngine === 'spotify_native' ? 'active' : ''} onClick={() => setRadioEngine('spotify_native')}>
+            🟢 Spotify Radio
+          </button>
+          {radioEngine === 'spotify_native' && (
+            <span className="radio-destination-hint">
+              Plays your pick, then leans on Spotify's own "Autoplay similar songs" (a setting in Spotify's own app) to keep going - uses almost no search budget, but needs that setting turned on.
+            </span>
+          )}
+        </div>
+      )}
+
       {radioDestinationType !== 'ytmusic' && (
         // Always rendered, live or not - previously this only existed while
         // radioSessionId was set, so it looked identical (just gone) whether
@@ -5421,7 +5573,25 @@ function RadioTab({
             <div className="radio-upnext">
               <h3>Up Next</h3>
               <div className="radio-upnext-list">
-                {queue.slice(0, 8).map((t, i) => (
+                {/* Spotify Radio mirrors GET /me/player/queue verbatim (see
+                    playback_advancer._advance_spotify_native) - confirmed live
+                    that endpoint can list the same track several times in a
+                    row (observed: Spotify's own autoplay repeating a single
+                    track when a seed has weak continuation signal on its
+                    side, not anything this app queued). Collapsing to first-
+                    occurrence-per-id keeps this list honest either way,
+                    without hiding a genuine repeat further down the list. */}
+                {(() => {
+                  const seen = new Set();
+                  const deduped = [];
+                  for (const t of queue) {
+                    if (seen.has(t.id)) continue;
+                    seen.add(t.id);
+                    deduped.push(t);
+                    if (deduped.length >= 8) break;
+                  }
+                  return deduped;
+                })().map((t, i) => (
                   // Same row layout as the currently-playing section above it
                   // (art on the left, title/artist stacked beside it) rather
                   // than the previous vertical thumbnail-grid cards, per user

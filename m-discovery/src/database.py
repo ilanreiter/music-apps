@@ -272,6 +272,13 @@ def create_tables():
                     updated_at TIMESTAMP DEFAULT NOW()
                 );
             """)
+            # 'discovery' (default, existing behavior) - this app's own
+            # Last.fm-driven candidate generation, matched/queued track by
+            # track. 'spotify_native' - just seeds one track and leans on
+            # Spotify's own account-level autoplay to keep queueing similar
+            # tracks after it, at near-zero ongoing /search cost since
+            # nothing past the seed goes through this app's own matching.
+            cur.execute("ALTER TABLE radio_session ADD COLUMN IF NOT EXISTS engine TEXT NOT NULL DEFAULT 'discovery';")
             print("Table 'radio_session' checked/created successfully.")
 
             # One row per real (non-short-circuited) Spotify /search call -
@@ -321,6 +328,23 @@ def create_tables():
             cur.execute("ALTER TABLE spotify_quota_estimate ADD COLUMN IF NOT EXISTS blocked_until TIMESTAMP;")
             cur.execute("ALTER TABLE spotify_quota_estimate ADD COLUMN IF NOT EXISTS last_recovery_check_date DATE;")
             print("Table 'spotify_quota_estimate' checked/created successfully.")
+
+            # One reused playlist backing spotify_native radio (see
+            # spotify_connect.ensure_radio_seed_playlist) - confirmed live
+            # Spotify's own Autoplay only continues once a real *context*
+            # (playlist/album/artist) finishes, never for a bare ad-hoc
+            # track URI, even with Autoplay turned on. A single-track
+            # playlist is the smallest context that satisfies that - its one
+            # track gets replaced every time a new native session starts,
+            # rather than creating a fresh playlist per session and
+            # littering the account.
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS spotify_radio_seed_playlist (
+                    id INTEGER PRIMARY KEY DEFAULT 1,
+                    playlist_id TEXT
+                );
+            """)
+            print("Table 'spotify_radio_seed_playlist' checked/created successfully.")
 
             # Cache for the Playlists tab's "All Tracks" mode - flattening
             # every playlist's tracks live (N+1 calls to Spotify/YouTube, one
@@ -1026,7 +1050,7 @@ def clear_playback_session():
 RADIO_SEEN_TRACK_KEYS_CAP = 500
 
 
-def create_radio_session(seed_type, seed_description, seed_artists, destination_type, seen_track_keys):
+def create_radio_session(seed_type, seed_description, seed_artists, destination_type, seen_track_keys, engine='discovery'):
     """Starts a new radio_session row. seen_track_keys is the caller's
     already-lowercased list of "track|||artist" keys for the first batch of
     tracks it just generated, so a subsequent /more call's dedup starts from
@@ -1048,10 +1072,10 @@ def create_radio_session(seed_type, seed_description, seed_artists, destination_
         cur = conn.cursor()
         cur.execute("UPDATE radio_session SET status = 'stopped', updated_at = NOW() WHERE status = 'active'")
         cur.execute("""
-            INSERT INTO radio_session (seed_type, seed_description, seed_artists, seen_track_keys, destination_type, status)
-            VALUES (%s, %s, %s, %s, %s, 'active')
+            INSERT INTO radio_session (seed_type, seed_description, seed_artists, seen_track_keys, destination_type, engine, status)
+            VALUES (%s, %s, %s, %s, %s, %s, 'active')
             RETURNING id
-        """, (seed_type, seed_description, Json(seed_artists), Json(seen_track_keys[-RADIO_SEEN_TRACK_KEYS_CAP:]), destination_type))
+        """, (seed_type, seed_description, Json(seed_artists), Json(seen_track_keys[-RADIO_SEEN_TRACK_KEYS_CAP:]), destination_type, engine))
         session_id = cur.fetchone()[0]
         conn.commit()
         cur.close()
@@ -1071,7 +1095,7 @@ def get_radio_session(session_id):
         cur = conn.cursor()
         cur.execute("""
             SELECT id, seed_type, seed_description, seed_artists, seen_track_keys, destination_type,
-                   ytmusic_playlist_id, ytmusic_push_job_id, status
+                   ytmusic_playlist_id, ytmusic_push_job_id, status, engine
             FROM radio_session WHERE id = %s
         """, (session_id,))
         row = cur.fetchone()
@@ -1081,7 +1105,7 @@ def get_radio_session(session_id):
         return {
             'id': row[0], 'seed_type': row[1], 'seed_description': row[2], 'seed_artists': row[3],
             'seen_track_keys': row[4], 'destination_type': row[5], 'ytmusic_playlist_id': row[6],
-            'ytmusic_push_job_id': row[7], 'status': row[8],
+            'ytmusic_push_job_id': row[7], 'status': row[8], 'engine': row[9],
         }
     except Error as e:
         print(f"Error reading radio session {session_id}: {e}")
@@ -1411,6 +1435,45 @@ def set_spotify_search_blocked_until(blocked_until):
         cur.close()
     except Error as e:
         print(f"Error setting Spotify search block state: {e}")
+    finally:
+        if conn:
+            conn.close()
+
+
+def get_spotify_radio_seed_playlist_id():
+    """The reused Spotify playlist id backing spotify_native radio (see
+    spotify_connect.ensure_radio_seed_playlist), or None if it's never been
+    created yet."""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT playlist_id FROM spotify_radio_seed_playlist WHERE id = 1")
+        row = cur.fetchone()
+        cur.close()
+        return row[0] if row else None
+    except Error as e:
+        print(f"Error reading the Spotify Radio seed playlist id: {e}")
+        return None
+    finally:
+        if conn:
+            conn.close()
+
+
+def set_spotify_radio_seed_playlist_id(playlist_id):
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO spotify_radio_seed_playlist (id, playlist_id)
+            VALUES (1, %s)
+            ON CONFLICT (id) DO UPDATE SET playlist_id = EXCLUDED.playlist_id
+        """, (playlist_id,))
+        conn.commit()
+        cur.close()
+    except Error as e:
+        print(f"Error setting the Spotify Radio seed playlist id: {e}")
     finally:
         if conn:
             conn.close()

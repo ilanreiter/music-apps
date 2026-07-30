@@ -560,6 +560,45 @@ def get_status(device_id):
     }
 
 
+def _map_queue_item(item):
+    """Raw Spotify track item (from /me/player/queue) into this app's own
+    track shape - same fields playback_advancer._advance_spotify's own
+    matched-track dicts use, so the "spotify_native" radio mode (see
+    playback_advancer._advance_spotify_native) can hand these straight to
+    save_session(now_playing=..., queue=...) with no further mapping."""
+    if not item:
+        return None
+    album = item.get('album') or {}
+    images = album.get('images') or []
+    return {
+        'id': item.get('uri'), 'source': 'spotify', 'uri': item.get('uri'), 'context_uri': None,
+        'track_name': item.get('name'),
+        'artist_name': ', '.join(a['name'] for a in item.get('artists', [])),
+        'album_name': album.get('name'),
+        'duration_seconds': (item['duration_ms'] / 1000) if item.get('duration_ms') is not None else None,
+        'artwork_url': images[0]['url'] if images else None,
+    }
+
+
+def get_queue():
+    """Spotify's own account-wide "on air + up next" - reflects whatever the
+    active device's native queue actually holds, including anything its own
+    autoplay added on its own once a spotify_native radio session's seed
+    track played through (see playback_advancer._advance_spotify_native). A
+    read-only GET against a dedicated endpoint, not /search - doesn't touch
+    this app's own search budget at all, which is the whole appeal of that
+    radio mode. Returns None if the request itself failed; {'now_playing':
+    None, 'queue': []} is a normal "nothing playing right now" response, not
+    a failure."""
+    data = _api_request('GET', '/me/player/queue')
+    if data is None:
+        return None
+    return {
+        'now_playing': _map_queue_item(data.get('currently_playing')),
+        'queue': [t for t in (_map_queue_item(i) for i in (data.get('queue') or [])) if t],
+    }
+
+
 def _get_full_url(url):
     """Like _api_request, but for a complete `next` pagination URL Spotify
     already handed back (own query string included) rather than a path+params
@@ -775,6 +814,58 @@ def add_tracks_to_playlist(playlist_id, uris):
         if _api_request('POST', f'/playlists/{playlist_id}/items', json_body={'uris': batch}) is None:
             return False
     return True
+
+
+RADIO_SEED_PLAYLIST_NAME = "m-discovery Radio Seed"
+RADIO_SEED_PLAYLIST_DESCRIPTION = (
+    "Used internally by m-discovery's Spotify Radio mode - its one track "
+    "changes every time a new session starts. Safe to ignore."
+)
+
+
+def ensure_radio_seed_playlist():
+    """Get-or-create the one playlist spotify_native radio reuses every time
+    a session starts (see main.py's start_radio / seed_radio_playlist
+    below). Confirmed live: Spotify's own Autoplay only continues once a
+    real *context* (playlist/album/artist) finishes - a bare ad-hoc
+    play_uris track, however Autoplay is configured on the account, never
+    triggers it (verified directly: an album context correctly handed off
+    to Autoplay once its last track ended; a plain uris-list play of the
+    same account/device just stopped). A single-track playlist is the
+    smallest context that gets the same handoff, without playing through
+    anything else first the way a real album/playlist would. Reused rather
+    than created fresh per session so this doesn't litter the account with
+    a new playlist every time Radio starts. Returns {'id', 'uri'}, or None
+    if creation genuinely failed (not connected, scope missing, API error)."""
+    playlist_id = database.get_spotify_radio_seed_playlist_id()
+    if playlist_id:
+        # Confirm it still exists - the user could have deleted it from
+        # Spotify directly - rather than trusting a stale id forever and
+        # failing every session start on a 404 that's simple to self-heal.
+        if _api_request('GET', f'/playlists/{playlist_id}', params={'fields': 'id'}) is not None:
+            return {'id': playlist_id, 'uri': f'spotify:playlist:{playlist_id}'}
+    created = create_playlist(RADIO_SEED_PLAYLIST_NAME, RADIO_SEED_PLAYLIST_DESCRIPTION)
+    if created is None:
+        return None
+    database.set_spotify_radio_seed_playlist_id(created['id'])
+    return {'id': created['id'], 'uri': f"spotify:playlist:{created['id']}"}
+
+
+def seed_radio_playlist(track_uri):
+    """Replaces the radio-seed playlist's entire contents with just
+    track_uri and returns its context_uri to play - see
+    ensure_radio_seed_playlist. Returns None if the playlist couldn't be
+    ensured or the replace call itself failed.
+
+    PUT /playlists/{id}/items, not .../tracks - same endpoint rename
+    add_tracks_to_playlist above already works around (.../tracks 403s
+    unconditionally for this app's calls, confirmed live)."""
+    playlist = ensure_radio_seed_playlist()
+    if playlist is None:
+        return None
+    if _api_request('PUT', f"/playlists/{playlist['id']}/items", json_body={'uris': [track_uri]}) is None:
+        return None
+    return playlist['uri']
 
 
 # Bumped from 3 - confirmed live one of this account's actual devices

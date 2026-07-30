@@ -256,6 +256,32 @@ def _match_local_track_cached(track_id, track_name, artist_name):
         conn.close()
 
 
+def _radio_session_still_current(radio_session_id):
+    """True if radio_session_id is still the one active radio_session row
+    (or radio_session_id is None - a plain library-cast pool, not Radio-fed
+    at all, has no such notion). Guards a save right after a live Spotify
+    search/match call in _advance_spotify's matching and refill loops
+    against a race: this whole function only reads match_pool/now_playing/
+    queue once, at the top of a single poll tick, then can spend real wall-
+    clock time on a live search before its own save_session call - if a
+    brand new radio session starts (either engine) and saves its own fresh
+    pool/now_playing while an *old* session's tick is still mid-search, the
+    old tick's eventual save can otherwise land afterward and silently
+    revert the new session's pool back to the stale one. Confirmed live:
+    starting a fresh Spotify Radio session while a long-running Discover-
+    engine one was mid-tick reverted straight back to the old session's pool
+    and now_playing seconds later. create_radio_session retires every other
+    session to 'stopped' in the same transaction it creates a new one, so a
+    stale radio_session_id reliably reads back non-'active' the moment a
+    newer session exists - checked as close to the actual save as practical
+    rather than only once at the top of the tick, since that's exactly the
+    gap the search call opens."""
+    if radio_session_id is None:
+        return True
+    session = get_radio_session(radio_session_id)
+    return session is not None and session.get('status') == 'active'
+
+
 def _match_text_candidate(track_name, artist_name):
     """Matches a Radio-suggested track directly against Spotify's catalog -
     Last.fm text suggestions have no known_tracks row, so unlike
@@ -269,6 +295,48 @@ def _match_text_candidate(track_name, artist_name):
     if not match:
         return {"matched": False, "reason": "no_match"}
     return {"matched": True, "uri": match['uri'], "artwork_url": match.get('artwork_url')}
+
+
+def _advance_spotify_native(save_session, destination_id, match_pool):
+    """Mirrors a spotify_native radio session's state instead of driving it -
+    this app only ever plays the seed track (see main.py's start_radio_native),
+    then Spotify's own account-level autoplay takes over queueing similar
+    tracks entirely on its own, provided the account/device has "Autoplay
+    similar songs" turned on in Spotify's own app (a client-side setting with
+    no Web API equivalent - if it's off, playback just ends after the seed
+    and there's nothing this app can do about it). GET /me/player/queue is
+    the one place Spotify's Web API actually surfaces its own upcoming picks
+    (autoplay-added ones included) - a read-only call against a dedicated
+    endpoint, not /search, so this whole mode costs nothing against the daily
+    search budget past the one-time seed match. last_status still comes from
+    get_status (play/pause/position for the player bar's progress/equalizer),
+    same as the discovery-driven mode above."""
+    status_result = spotify_connect.get_status(destination_id)
+    if status_result is not None:
+        save_session(last_status=status_result)
+
+    queue_result = spotify_connect.get_queue()
+    if queue_result is None:
+        return match_pool
+
+    radio_session_id = match_pool.get('radio_session_id')
+    now_playing = queue_result['now_playing']
+    if now_playing is not None and radio_session_id is not None:
+        now_playing['radio_session_id'] = radio_session_id
+    tagged_queue = []
+    for t in queue_result['queue']:
+        if radio_session_id is not None:
+            t['radio_session_id'] = radio_session_id
+        tagged_queue.append(t)
+
+    if not _radio_session_still_current(radio_session_id):
+        # Same race _advance_spotify's own matching/refill loops guard
+        # against: get_status/get_queue above are real network calls, and a
+        # newer session (either engine) can have already started and saved
+        # its own fresh state while this tick was waiting on them.
+        return match_pool
+    save_session(now_playing=now_playing, queue=tagged_queue)
+    return match_pool
 
 
 def _advance_spotify(save_session, destination_id, now_playing, queue, match_pool):
@@ -294,6 +362,13 @@ def _advance_spotify(save_session, destination_id, now_playing, queue, match_poo
     it survives the tab sleeping. Stops immediately on an 'unavailable'
     (rate-limited) result rather than trying more candidates - same rule the
     interactive routes already follow."""
+    if (match_pool or {}).get('engine') == 'spotify_native':
+        # A spotify_native radio session (see main.py's start_radio_native)
+        # only ever plays its own seed track - everything after that is
+        # Spotify's own account-level autoplay, not this app's matching loop
+        # below, so none of this function's own driving/lookahead logic
+        # applies here at all.
+        return _advance_spotify_native(save_session, destination_id, match_pool)
     result = spotify_connect.get_status(destination_id)
     if result is None:
         return match_pool
@@ -421,6 +496,14 @@ def _advance_spotify(save_session, destination_id, now_playing, queue, match_poo
                     # those still need this tag or the frontend concludes
                     # radio was superseded after the very first track.
                     found['radio_session_id'] = radio_session_id
+                if not _radio_session_still_current(radio_session_id):
+                    # A newer radio session (either engine) already took over
+                    # while this candidate's live search was in flight - the
+                    # match itself is harmless to have made (spotify_prewarm.py
+                    # would've found it eventually anyway), but queueing it and
+                    # saving this now-stale pool would revert whatever the new
+                    # session already correctly set up moments ago.
+                    return match_pool
                 spotify_connect.add_to_queue(destination_id, match_result['uri'])
                 match_pool = {'candidates': candidates, 'cursor': cursor}
                 if radio_session_id is not None:
@@ -477,6 +560,11 @@ def _advance_spotify(save_session, destination_id, now_playing, queue, match_poo
     match_pool = {'candidates': candidates, 'cursor': cursor}
     if radio_session_id is not None:
         match_pool['radio_session_id'] = radio_session_id
+    if not _radio_session_still_current(radio_session_id):
+        # Same race as the matching loop above, guarding against this tick's
+        # refill (generate_radio_batch_for_spotify, itself possibly a live
+        # search) finishing after a newer session already saved its own pool.
+        return match_pool
     save_session(spotify_match_pool=match_pool)
     return match_pool
 
