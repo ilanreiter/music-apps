@@ -1073,10 +1073,11 @@ def _record_track_played(cur, now_playing):
     now_playing - already funnels through, so this covers all of them at
     once rather than needing a hook at every individual play/queue call
     site."""
+    played_at = now_ny_naive()
     radio_track_id = now_playing.get('radio_track_id')
     if radio_track_id is not None:
         try:
-            cur.execute("UPDATE radio_discovered_tracks SET last_played_at = NOW() WHERE id = %s", (radio_track_id,))
+            cur.execute("UPDATE radio_discovered_tracks SET last_played_at = %s WHERE id = %s", (played_at, radio_track_id))
         except Error as e:
             print(f"Error recording last played time for discovered track {radio_track_id}: {e}")
         return
@@ -1086,7 +1087,7 @@ def _record_track_played(cur, now_playing):
     if known_track_id is None:
         return
     try:
-        cur.execute("UPDATE known_tracks SET last_played_at = NOW() WHERE id = %s", (known_track_id,))
+        cur.execute("UPDATE known_tracks SET last_played_at = %s WHERE id = %s", (played_at, known_track_id))
     except Error as e:
         print(f"Error recording last played time for track {known_track_id}: {e}")
 
@@ -1550,6 +1551,19 @@ def record_spotify_search():
     finally:
         if conn:
             conn.close()
+
+
+def now_ny_naive():
+    """Current wall-clock moment in America/New_York, as a naive value -
+    used to stamp last_played_at (see _record_track_played) so that
+    timestamp reads as NY local time at a glance, matching every other
+    NY-aligned convention in this app (see NY_TZ above), rather than the
+    DB server's own UTC. This is a deliberate, isolated exception to the
+    rest of this file's naive-UTC convention (see
+    _ny_midnight_as_naive_utc's own note) - anything comparing against
+    last_played_at must also use this, not NOW()/_ny_midnight_as_naive_utc,
+    or the comparison will be off by the UTC/NY offset."""
+    return datetime.now(NY_TZ).replace(tzinfo=None)
 
 
 def _ny_midnight_as_naive_utc(days_ago=0):

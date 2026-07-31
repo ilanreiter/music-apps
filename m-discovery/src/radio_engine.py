@@ -7,6 +7,8 @@ it. main.py wraps the plain dicts this returns into its own Track pydantic
 model for its response bodies; playback_advancer.py uses them as-is.
 """
 
+from datetime import timedelta
+
 from . import database
 from . import lastfm
 from . import spotify_connect
@@ -119,26 +121,26 @@ def find_cached_artist_tracks(artist_names, seen_keys, limit, db):
         return []
     seen = set(seen_keys)
     lowered = list({a.lower() for a in artist_names})
-    cooldown_days = database.get_radio_cooldown_days()
+    cooldown_cutoff = database.now_ny_naive() - timedelta(days=database.get_radio_cooldown_days())
     try:
         cur = db.cursor()
         cur.execute("""
             SELECT id, track_name, artist_name, album_name, spotify_album_art_url
             FROM known_tracks
             WHERE LOWER(artist_name) = ANY(%s) AND spotify_checked IS TRUE AND spotify_track_id IS NOT NULL
-                AND (last_played_at IS NULL OR last_played_at < NOW() - (%s * INTERVAL '1 day'))
+                AND (last_played_at IS NULL OR last_played_at < %s)
             ORDER BY random()
             LIMIT %s
-        """, (lowered, cooldown_days, max(limit * 3, limit)))  # over-fetch - seen_keys will drop some
+        """, (lowered, cooldown_cutoff, max(limit * 3, limit)))  # over-fetch - seen_keys will drop some
         known_rows = cur.fetchall()
         cur.execute("""
             SELECT id, track_name, artist_name, album_name, spotify_track_id, spotify_album_art_url
             FROM radio_discovered_tracks
             WHERE LOWER(artist_name) = ANY(%s)
-                AND (last_played_at IS NULL OR last_played_at < NOW() - (%s * INTERVAL '1 day'))
+                AND (last_played_at IS NULL OR last_played_at < %s)
             ORDER BY random()
             LIMIT %s
-        """, (lowered, cooldown_days, max(limit * 3, limit)))
+        """, (lowered, cooldown_cutoff, max(limit * 3, limit)))
         discovered_rows = cur.fetchall()
         cur.close()
     except Exception as e:
@@ -181,25 +183,25 @@ def find_any_cached_tracks(seen_keys, limit, db):
     playing wins over staying on-theme, per the same "Radio must never just
     stop" requirement the rest of this tiering already follows."""
     seen = set(seen_keys)
-    cooldown_days = database.get_radio_cooldown_days()
+    cooldown_cutoff = database.now_ny_naive() - timedelta(days=database.get_radio_cooldown_days())
     try:
         cur = db.cursor()
         cur.execute("""
             SELECT id, track_name, artist_name, album_name, spotify_album_art_url
             FROM known_tracks
             WHERE spotify_checked IS TRUE AND spotify_track_id IS NOT NULL
-                AND (last_played_at IS NULL OR last_played_at < NOW() - (%s * INTERVAL '1 day'))
+                AND (last_played_at IS NULL OR last_played_at < %s)
             ORDER BY random()
             LIMIT %s
-        """, (cooldown_days, max(limit * 3, limit)))  # over-fetch - seen_keys will drop some
+        """, (cooldown_cutoff, max(limit * 3, limit)))  # over-fetch - seen_keys will drop some
         known_rows = cur.fetchall()
         cur.execute("""
             SELECT id, track_name, artist_name, album_name, spotify_track_id, spotify_album_art_url
             FROM radio_discovered_tracks
-            WHERE (last_played_at IS NULL OR last_played_at < NOW() - (%s * INTERVAL '1 day'))
+            WHERE (last_played_at IS NULL OR last_played_at < %s)
             ORDER BY random()
             LIMIT %s
-        """, (cooldown_days, max(limit * 3, limit)))
+        """, (cooldown_cutoff, max(limit * 3, limit)))
         discovered_rows = cur.fetchall()
         cur.close()
     except Exception as e:
@@ -240,22 +242,22 @@ def _index_cached_tracks_by_key(artist_names, db):
     if not artist_names:
         return {}
     lowered = list({a.lower() for a in artist_names})
-    cooldown_days = database.get_radio_cooldown_days()
+    cooldown_cutoff = database.now_ny_naive() - timedelta(days=database.get_radio_cooldown_days())
     try:
         cur = db.cursor()
         cur.execute("""
             SELECT id, track_name, artist_name, album_name, spotify_album_art_url
             FROM known_tracks
             WHERE LOWER(artist_name) = ANY(%s) AND spotify_checked IS TRUE AND spotify_track_id IS NOT NULL
-                AND (last_played_at IS NULL OR last_played_at < NOW() - (%s * INTERVAL '1 day'))
-        """, (lowered, cooldown_days))
+                AND (last_played_at IS NULL OR last_played_at < %s)
+        """, (lowered, cooldown_cutoff))
         known_rows = cur.fetchall()
         cur.execute("""
             SELECT id, track_name, artist_name, album_name, spotify_track_id, spotify_album_art_url
             FROM radio_discovered_tracks
             WHERE LOWER(artist_name) = ANY(%s)
-                AND (last_played_at IS NULL OR last_played_at < NOW() - (%s * INTERVAL '1 day'))
-        """, (lowered, cooldown_days))
+                AND (last_played_at IS NULL OR last_played_at < %s)
+        """, (lowered, cooldown_cutoff))
         discovered_rows = cur.fetchall()
         cur.close()
     except Exception as e:
@@ -377,7 +379,19 @@ def generate_radio_batch_for_spotify(seed_artists, seen_keys, count, db):
         # doesn't get a pass just because this specific artist neighborhood
         # ran dry. Any already-matched library track, any artist, is still
         # better than silence.
-        degraded = True
+        #
+        # Deliberately does NOT force degraded=True here (confirmed live
+        # this was a real bug: an ABBA session hit this tier off just 2 raw
+        # Last.fm suggestions plus a cooldown-thinned cache, with
+        # search_budget_available() True and no block in effect anywhere -
+        # yet the frontend showed "Spotify's search is rate-limited right
+        # now" regardless, contradicting the search-budget bar right next to
+        # it, which correctly showed healthy). degraded already carries
+        # hit_budget_wall's real value from the main loop above and that's
+        # the one thing RadioStartResponse.degraded is documented to mean -
+        # reaching this tier because Last.fm/the cache genuinely ran thin
+        # for this seed is a completely different, unrelated reason to need
+        # a cached fallback, not evidence of a rate limit.
         already_seen = list(seen_keys) + [radio_track_key(x['track_name'], x['artist_name']) for x in collected]
         collected.extend(find_any_cached_tracks(already_seen, count - len(collected), db))
 

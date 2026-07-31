@@ -2563,12 +2563,47 @@ function App() {
         if (cancelled) return;
         const session = sessionResponse.data;
         if (session.status !== 'active') return;
+        // Confirmed live: on a device seeing this session for the very
+        // first time (a different browser/phone that never had it in its
+        // own localStorage), nowPlaying/queue start out null/empty and
+        // nothing else fills them in yet - the ongoing reconciliation poll
+        // that normally would can't even start until outputDevice AND
+        // nowPlaying are already set (see that effect's own `if
+        // (!outputDevice || !nowPlaying) return`), and this effect used to
+        // set only radioSessionId/seed/destinationType. The "stop when
+        // superseded" effect re-runs the instant radioSessionId changes,
+        // saw a still-null nowPlaying/empty queue that couldn't possibly
+        // match the session it was just told about, read that as "already
+        // superseded", and immediately wiped the restore straight back to
+        // null - the phone showed "no active radio session" for a session
+        // that was, in fact, actively running. Setting all of it together
+        // closes the gap, same fix commitRadioSession's own comment above
+        // already applied to the local-start flow, just for this restore
+        // path too.
+        if (response.data.now_playing) setNowPlaying(response.data.now_playing);
+        if (response.data.queue) setQueue(response.data.queue);
         commitRadioSession(
           sessionId,
           { type: session.seed_type, description: session.seed_description },
           session.destination_type,
         );
         if (session.destination_type === 'ytmusic') setRadioDestination('ytmusic');
+        // Without this, the restore above is a one-time snapshot only: the
+        // reconciliation poll (see its own `if (!outputDevice ||
+        // !nowPlaying) return` guard) still can't start without a real
+        // outputDevice, so this device would never see the session advance
+        // beyond whatever track happened to be playing at the moment of
+        // this restore. Only relevant for 'spotify' - 'ytmusic' already
+        // polls its own push-job status independent of outputDevice, and
+        // 'browser' playback is inherently local to whichever tab actually
+        // started it, nothing to hand off to a different device for.
+        if (session.destination_type === 'spotify' && !outputDevice && response.data.destination_id) {
+          axios.get(`${API_BASE_URL}/spotify/devices`).then((dr) => {
+            if (cancelled) return;
+            const match = (dr.data || []).find((d) => d.id === response.data.destination_id);
+            if (match) setOutputDevice({ ...match, type: 'spotify' });
+          }).catch(() => {});
+        }
       }).catch(() => {});
     }).catch(() => {});
     return () => { cancelled = true; };

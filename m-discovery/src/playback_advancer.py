@@ -393,8 +393,26 @@ def _advance_spotify(save_session, destination_id, now_playing, queue, match_poo
     duration = result.get('duration_ms') or 0
     position = result.get('position_ms') or 0
     near_end = duration > 0 and (duration - position) < SPOTIFY_NEAR_END_MS
+    # Confirmed live: the host process sleeping (e.g. the machine itself
+    # suspending) for longer than the current track's remaining runtime lets
+    # it finish entirely before this loop gets another tick to catch
+    # near_end - Spotify then reports a fully empty player (get_status's
+    # dedicated 'stop' shape: no item, duration_ms/track_uri both None, data
+    # itself empty from Spotify's /me/player). That's distinguishable from a
+    # real user pause, which still is_playing=False but keeps the paused
+    # track's own item/duration/position - so this can't misfire on a
+    # deliberate pause. Without this, nothing ever recovers: near_end can
+    # never become true again for a track that already finished, and the
+    # passive-reconciliation branch below only reacts to a *changed*
+    # track_uri, which an empty player never provides either - the device
+    # just sits stopped forever. Mirrors _advance_wiim's own
+    # stopped_on_its_own handling (same "device already stopped, don't wait
+    # for near_end" rule, just detected from a full/empty response there vs.
+    # a dedicated 'stop' status here since the two APIs shape "nothing
+    # playing" differently).
+    stopped_on_its_own = result.get('status') == 'stop' and now_playing is not None
 
-    if not is_context and queue and near_end:
+    if not is_context and queue and (near_end or stopped_on_its_own):
         if not _radio_session_still_current(radio_session_id):
             # Confirmed live: a newer radio session (either engine) can
             # already be up and running while this tick was waiting on
