@@ -2097,6 +2097,59 @@ async def set_radio_cooldown_days_route(params: RadioCooldownRequest):
     set_radio_cooldown_days(params.cooldown_days)
     return {"cooldown_days": params.cooldown_days}
 
+@app.get("/api/play-log")
+async def get_play_log(limit: int = 2000, db: psycopg2.extensions.connection = Depends(get_db)):
+    """Every track with a recorded last_played_at (see database._record_track_played),
+    newest first - both known_tracks (this user's own library) and
+    radio_discovered_tracks (a Radio/Discover match not in the library -
+    see that table's own comment) carry this column, so this is a UNION of
+    both rather than just one. played_at is formatted here as a plain
+    'YYYY-MM-DD HH:MM:SS' string, not an ISO/tz-aware one - the column is
+    already stored as America/New_York wall-clock time (database.now_ny_naive),
+    deliberately not UTC, and letting the frontend's `new Date(...)` parse
+    it would silently reinterpret it as the viewer's own local time zone
+    instead. Displaying the stored string verbatim is what actually keeps
+    it reading as NY time everywhere it's shown, same reasoning as the NY-
+    time work itself.
+
+    known_track_id is only ever set for a 'library' row - the frontend
+    builds its artwork src from GET /tracks/{id}/artwork with it, same
+    pattern used everywhere else in the app (see App.js). A
+    'radio_discovered' row has no known_tracks row to point at, so its
+    artwork_url (radio_discovered_tracks.spotify_album_art_url, already a
+    real, direct CDN URL) is returned as-is instead. Sorting/filtering
+    (by artist/track/source, or a date range) all happen client-side once
+    fetched - this is a single-user personal log, not a dataset that needs
+    server-side pagination at any plausible scale, and doing it client-side
+    means every filter/sort change is instant, no round trip."""
+    cur = db.cursor()
+    cur.execute("""
+        SELECT id AS known_track_id, track_name, artist_name, last_played_at,
+               'library' AS source, NULL::TEXT AS artwork_url
+        FROM known_tracks
+        WHERE last_played_at IS NOT NULL
+        UNION ALL
+        SELECT NULL::INTEGER AS known_track_id, track_name, artist_name, last_played_at,
+               'radio_discovered' AS source, spotify_album_art_url AS artwork_url
+        FROM radio_discovered_tracks
+        WHERE last_played_at IS NOT NULL
+        ORDER BY last_played_at DESC
+        LIMIT %s
+    """, (limit,))
+    rows = cur.fetchall()
+    cur.close()
+    return [
+        {
+            "known_track_id": known_track_id,
+            "track_name": track_name,
+            "artist_name": artist_name,
+            "played_at": last_played_at.strftime("%Y-%m-%d %H:%M:%S"),
+            "source": source,
+            "artwork_url": artwork_url,
+        }
+        for known_track_id, track_name, artist_name, last_played_at, source, artwork_url in rows
+    ]
+
 @app.get("/api/spotify/prewarm/stats")
 async def get_spotify_prewarm_stats(db: psycopg2.extensions.connection = Depends(get_db)):
     # spotify_prewarm_progress only tracks *this run's* processed/matched
@@ -2398,22 +2451,25 @@ async def post_playback_session(params: PlaybackSessionUpdate):
         existing and existing.get('destination_type') == params.destination_type
         and existing.get('destination_id') == params.destination_id
     )
+    # spotify_match_pool deliberately does NOT use the same_destination gate
+    # chromecast_pushed_count/last_status still do below - confirmed live
+    # this was a real bug: any routine sync (Next/Prev, a queue update, the
+    # periodic position sync) whose destination_id didn't line up exactly
+    # with what's already stored (a stale value racing a page reload before
+    # the true server state loads, a Spotify Connect device reconnecting
+    # under a slightly different id, two tabs syncing against each other)
+    # silently wiped spotify_match_pool to None, even though nothing
+    # actually intended a clear - with an active radio_session_id still on
+    # now_playing but no pool left to refill from, Radio got permanently
+    # stuck with an empty queue and a disabled Next button, no path back
+    # short of a restart. clear_spotify_match_pool already exists as the
+    # one explicit, intentional way to clear it (see Stop Radio in App.js) -
+    # nothing legitimately relies on a destination mismatch doing the same
+    # thing by accident, so this now only ever preserves or explicitly
+    # replaces it, never implicitly drops it.
     resolved_pool = None if params.clear_spotify_match_pool \
         else (params.spotify_match_pool if params.spotify_match_pool is not None
-            else (existing.get('spotify_match_pool') if same_destination else None))
-    # TEMPORARY diagnostic logging - tracking down a radio_session_id that
-    # keeps reverting to an older, already-stopped session's tag on some
-    # syncs. Remove once pinpointed. Deliberately print(), not logger, so it
-    # shows up in `docker compose logs app` the same way existing prints do.
-    print(
-        f"[playback-session POST] incoming now_playing.radio_session_id="
-        f"{(params.now_playing or {}).get('radio_session_id')} "
-        f"incoming spotify_match_pool={params.spotify_match_pool} "
-        f"clear_spotify_match_pool={params.clear_spotify_match_pool} "
-        f"same_destination={same_destination} "
-        f"existing.spotify_match_pool={(existing or {}).get('spotify_match_pool')} "
-        f"resolved_pool={resolved_pool}"
-    )
+            else (existing.get('spotify_match_pool') if existing else None))
     save_playback_session(
         destination_type=params.destination_type,
         destination_id=params.destination_id,

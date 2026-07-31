@@ -18,14 +18,29 @@ LASTFM_BASE_URL = 'http://ws.audioscrobbler.com/2.0/'
 SIMILAR_ARTISTS_PER_SEED = 10
 TOP_TRACKS_PER_ARTIST = 3
 
-# Last.fm's artist.getSimilar "match" score (0-1, relative to the single best
-# match for that seed artist) - candidates below this are dropped entirely
-# rather than just deprioritized. Confirmed live: with a genre-filtered seed
-# spanning several artists at once, a plain uniform shuffle of the combined
-# candidate pool gave a barely-related 0.15-match artist from one seed the
-# same odds as a 0.9-match artist from another, which is exactly the "some
-# recommendations make sense, some don't" pattern reported.
-MIN_ARTIST_MATCH_SCORE = 0.4
+# Last.fm's artist.getSimilar "match" score (0-1) is relative to that seed's
+# own single best match, not an absolute similarity measure - a seed whose
+# best match is unusually strong compresses everyone else's score downward
+# regardless of how genuinely similar they are. Confirmed live: ABBA's top
+# match is Agnetha Fältskog (1.0, her own former bandmate's solo career),
+# which alone compressed real genre peers - Bee Gees (0.25), Donna Summer
+# (0.21), Fleetwood Mac (0.19) - below what used to be a flat 0.4 cutoff,
+# leaving only Agnetha and Frida (ABBA's other former member) as candidates
+# and starving Radio down to an unrelated last-resort fallback. This is now
+# just a floor for genuinely unrelated noise, not a quality bar - real
+# per-seed volume is bounded by MAX_SIMILAR_ARTISTS_PER_SEED_BY_RANK below
+# instead, which doesn't care how compressed one seed's particular scale is.
+MIN_ARTIST_MATCH_SCORE = 0.15
+# How many of a single seed's own similar-artist results to actually keep,
+# by Last.fm's own rank order (_get_similar_artists already returns them
+# most-similar-first) - independent of the score floor above, so a strong
+# top match compressing the rest of that seed's scores never costs it real
+# candidates it would otherwise have kept. Keeps each seed's contribution to
+# a multi-seed pool comparably sized too: without this, a seed fetched
+# deeper than usual (discover_tracks's per_seed_limit, for a large
+# target_count) could flood a shared shortlist with a long mediocre tail
+# just by being asked for more, at another seed's expense.
+MAX_SIMILAR_ARTISTS_PER_SEED_BY_RANK = SIMILAR_ARTISTS_PER_SEED
 # From the remaining (already match-filtered) candidates, how many of the
 # strongest to actually consider - picked from with weighted randomness
 # (higher match score = more likely, but not deterministic) so repeated runs
@@ -146,10 +161,11 @@ def _dedupe_seed_artists(seed_artists):
 
 def similar_artist_names(seed_artists, limit_per_seed=SIMILAR_ARTISTS_PER_SEED):
     """Flat, deduped list of artist names similar to seed_artists (just the
-    names, no track lookups), filtered by MIN_ARTIST_MATCH_SCORE and ordered
-    strongest-match-first - same candidate-building logic discover_tracks
-    uses internally, exposed on its own for callers that want to widen a
-    search against something else entirely (radio_engine.py's local-library
+    names, no track lookups), filtered by MIN_ARTIST_MATCH_SCORE and capped
+    per seed by MAX_SIMILAR_ARTISTS_PER_SEED_BY_RANK, ordered strongest-
+    match-first - same candidate-building logic discover_tracks uses
+    internally, exposed on its own for callers that want to widen a search
+    against something else entirely (radio_engine.py's local-library
     fallback when Spotify's search is rate-limited: Last.fm itself isn't,
     so this still works to find more on-theme candidates when Spotify can't
     be searched at all)."""
@@ -157,10 +173,12 @@ def similar_artist_names(seed_artists, limit_per_seed=SIMILAR_ARTISTS_PER_SEED):
     seed_set = {a.lower() for a in seed_artists}
     candidates = {}
     for seed_artist in seed_artists:
-        for name, match in _get_similar_artists(seed_artist, limit=limit_per_seed):
+        ranked = [
+            (name, match) for name, match in _get_similar_artists(seed_artist, limit=limit_per_seed)
+            if name.lower() not in seed_set and match >= MIN_ARTIST_MATCH_SCORE
+        ]
+        for name, match in ranked[:MAX_SIMILAR_ARTISTS_PER_SEED_BY_RANK]:
             key = name.lower()
-            if key in seed_set or match < MIN_ARTIST_MATCH_SCORE:
-                continue
             if key not in candidates or match > candidates[key][1]:
                 candidates[key] = (name, match)
     return [name for name, _ in sorted(candidates.values(), key=lambda c: c[1], reverse=True)]
@@ -174,13 +192,17 @@ def discover_tracks(seed_artists, target_count=10, tracks_per_artist=1):
     this replaced). Best-effort throughout: any single artist lookup failing
     just yields fewer candidates, never an exception.
 
-    Candidates are filtered by Last.fm's own match score (MIN_ARTIST_MATCH_SCORE)
-    and selection is weighted toward the strongest matches (see
-    _weighted_sample_without_replacement) - confirmed live this was needed:
-    with a genre-filtered seed spanning several artists, a plain uniform
-    shuffle of the combined pool gave a barely-related low-match candidate
-    from one seed the same odds as a strong match from another, producing
-    the "some recommendations make sense, some don't" pattern reported.
+    Candidates are filtered by Last.fm's own match score (MIN_ARTIST_MATCH_SCORE,
+    now just a floor for genuinely unrelated noise - see its own comment)
+    and capped per seed by rank (MAX_SIMILAR_ARTISTS_PER_SEED_BY_RANK), then
+    selection is weighted toward the strongest matches among what's left
+    (see _weighted_sample_without_replacement) - confirmed live the per-seed
+    rank cap was needed: with a genre-filtered seed spanning several
+    artists, a seed fetched deeper than usual (per_seed_limit below, for a
+    large target_count) could otherwise flood the shared shortlist with a
+    long mediocre tail just by being asked for more, at another seed's
+    expense, producing the "some recommendations make sense, some don't"
+    pattern reported.
 
     tracks_per_artist=1 (default) is today's "flat list of individual
     tracks" mode - target_count means how many tracks, one per artist,
@@ -197,13 +219,17 @@ def discover_tracks(seed_artists, target_count=10, tracks_per_artist=1):
     candidates = {}
     # Same floor-not-cap reasoning as SHORTLIST_SIZE below - a narrow seed
     # (few seed artists) asking for a high target_count needs a deeper pull
-    # per seed artist too, not just a bigger shortlist to choose from.
+    # per seed artist too, not just a bigger shortlist to choose from. The
+    # per-seed rank cap right below is what keeps that deeper pull from
+    # translating into a proportionally larger share of the final pool.
     per_seed_limit = max(SIMILAR_ARTISTS_PER_SEED, target_count * 2)
     for seed_artist in seed_artists:
-        for name, match in _get_similar_artists(seed_artist, limit=per_seed_limit):
+        ranked = [
+            (name, match) for name, match in _get_similar_artists(seed_artist, limit=per_seed_limit)
+            if name.lower() not in seed_set and match >= MIN_ARTIST_MATCH_SCORE
+        ]
+        for name, match in ranked[:MAX_SIMILAR_ARTISTS_PER_SEED_BY_RANK]:
             key = name.lower()
-            if key in seed_set or match < MIN_ARTIST_MATCH_SCORE:
-                continue
             if key not in candidates or match > candidates[key][1]:
                 candidates[key] = (name, match)
 

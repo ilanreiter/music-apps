@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useMemo } from 'react';
 import axios from 'axios';
 import './App.css';
 
@@ -509,6 +509,200 @@ function YtMusicPushPanel({ apiBase, onPush, pushing, onClose }) {
         </button>
       </div>
     </div>
+  );
+}
+
+// Top-level tab (nav-tabs, next to Cleanup) - every track with a recorded
+// last_played_at (see database._record_track_played / src/main.py's GET
+// /api/play-log), library and Radio-discovered alike. played_at comes back
+// from the backend as a plain already-formatted string, not an ISO
+// timestamp - deliberately not run through `new Date(...)` anywhere here,
+// since that column is stored as America/New_York wall-clock time (not
+// UTC) and parsing it as a Date would have the browser reinterpret it as
+// its own local time zone instead, silently shifting it away from the NY
+// time it actually reflects. Its "YYYY-MM-DD HH:MM:SS" shape also sorts and
+// range-compares correctly as a plain string, which is what both the
+// column sort and the date-range filter below lean on. Fetched once on
+// mount, not polled - this is a look-back log, not something that needs to
+// update live while you're browsing it. Sorting/filtering all happen
+// client-side over the one fetched batch (see GET /api/play-log's own
+// comment on why) - instant, no round trip per filter/sort change.
+const PLAY_LOG_SOURCE_LABELS = { library: 'Library', radio_discovered: 'Radio discovery' };
+
+function PlayLogTab({ apiBase }) {
+  const [entries, setEntries] = useState(null);
+  const [error, setError] = useState(null);
+  const [artistFilter, setArtistFilter] = useState('');
+  const [trackFilter, setTrackFilter] = useState('');
+  const [sourceFilter, setSourceFilter] = useState('all');
+  const [startDate, setStartDate] = useState('');
+  const [endDate, setEndDate] = useState('');
+  const [sortField, setSortField] = useState('played_at');
+  const [sortDir, setSortDir] = useState('desc');
+
+  useEffect(() => {
+    axios.get(`${apiBase}/play-log`)
+      .then((response) => setEntries(response.data))
+      .catch((err) => {
+        console.error('Error fetching play log:', err);
+        setError('Could not load the play log.');
+      });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const toggleSort = (field) => {
+    if (sortField === field) {
+      setSortDir((d) => (d === 'asc' ? 'desc' : 'asc'));
+    } else {
+      setSortField(field);
+      // Played defaults to newest-first (matches the backend's own default
+      // order); the text columns default to A-Z, since "newest first" has
+      // no meaning for an artist/track/source name.
+      setSortDir(field === 'played_at' ? 'desc' : 'asc');
+    }
+  };
+
+  const hasActiveFilters = artistFilter || trackFilter || sourceFilter !== 'all' || startDate || endDate;
+  const clearFilters = () => {
+    setArtistFilter('');
+    setTrackFilter('');
+    setSourceFilter('all');
+    setStartDate('');
+    setEndDate('');
+  };
+
+  const visibleEntries = useMemo(() => {
+    if (!entries) return [];
+    const artistNeedle = artistFilter.trim().toLowerCase();
+    const trackNeedle = trackFilter.trim().toLowerCase();
+    // datetime-local gives "YYYY-MM-DDTHH:MM" (no seconds); played_at is
+    // "YYYY-MM-DD HH:MM:SS". Swapping the separator makes both directly
+    // string-comparable - startDate as-is is already an inclusive lower
+    // bound (it's a strict prefix of any second within that same minute,
+    // and a shorter string that's otherwise a prefix always sorts as
+    // "less than" the longer one). endDate needs ':59' appended to make it
+    // an inclusive upper bound covering that whole final minute too,
+    // otherwise every played_at with real seconds on it would sort as
+    // "after" a bare HH:MM and get wrongly excluded.
+    const endBound = endDate ? `${endDate}:59` : null;
+    let rows = entries.filter((e) => {
+      if (artistNeedle && !e.artist_name.toLowerCase().includes(artistNeedle)) return false;
+      if (trackNeedle && !e.track_name.toLowerCase().includes(trackNeedle)) return false;
+      if (sourceFilter !== 'all' && e.source !== sourceFilter) return false;
+      const normalizedPlayedAt = e.played_at.replace(' ', 'T');
+      if (startDate && normalizedPlayedAt < startDate) return false;
+      if (endBound && normalizedPlayedAt > endBound) return false;
+      return true;
+    });
+    rows = [...rows].sort((a, b) => {
+      const av = sortField === 'source' ? (PLAY_LOG_SOURCE_LABELS[a.source] || a.source) : a[sortField];
+      const bv = sortField === 'source' ? (PLAY_LOG_SOURCE_LABELS[b.source] || b.source) : b[sortField];
+      const cmp = String(av).localeCompare(String(bv), undefined, { numeric: true, sensitivity: 'base' });
+      return sortDir === 'asc' ? cmp : -cmp;
+    });
+    return rows;
+  }, [entries, artistFilter, trackFilter, sourceFilter, startDate, endDate, sortField, sortDir]);
+
+  const SortHeader = ({ field, children }) => (
+    <th className="play-log-sortable" onClick={() => toggleSort(field)}>
+      {children}
+      <span className="play-log-sort-arrow">{sortField === field ? (sortDir === 'asc' ? ' ▲' : ' ▼') : ''}</span>
+    </th>
+  );
+
+  return (
+    <section className="play-log-section">
+      <div className="play-log-filters">
+        <input
+          type="text"
+          placeholder="Filter by artist…"
+          value={artistFilter}
+          onChange={(e) => setArtistFilter(e.target.value)}
+        />
+        <input
+          type="text"
+          placeholder="Filter by track…"
+          value={trackFilter}
+          onChange={(e) => setTrackFilter(e.target.value)}
+        />
+        <select value={sourceFilter} onChange={(e) => setSourceFilter(e.target.value)}>
+          <option value="all">All sources</option>
+          <option value="library">Library</option>
+          <option value="radio_discovered">Radio discovery</option>
+        </select>
+        <label className="play-log-date-label">
+          From
+          <input type="datetime-local" value={startDate} onChange={(e) => setStartDate(e.target.value)} />
+        </label>
+        <label className="play-log-date-label">
+          To
+          <input type="datetime-local" value={endDate} onChange={(e) => setEndDate(e.target.value)} />
+        </label>
+        {hasActiveFilters && (
+          <button type="button" className="play-log-clear-btn" onClick={clearFilters}>Clear filters</button>
+        )}
+      </div>
+
+      {error && <p className="empty-state">{error}</p>}
+      {!error && entries === null && <p className="empty-state">Loading…</p>}
+      {!error && entries && entries.length === 0 && <p className="empty-state">Nothing played yet.</p>}
+      {!error && entries && entries.length > 0 && (
+        <>
+          <p className="play-log-count hint">
+            {visibleEntries.length === entries.length
+              ? `${entries.length.toLocaleString()} play${entries.length === 1 ? '' : 's'}`
+              : `${visibleEntries.length.toLocaleString()} of ${entries.length.toLocaleString()} plays`}
+          </p>
+          <div className="play-log-table-wrap">
+            <table className="play-log-table">
+              <thead>
+                <tr>
+                  <th className="play-log-artwork-col" />
+                  <SortHeader field="played_at">Played (NY time)</SortHeader>
+                  <SortHeader field="artist_name">Artist</SortHeader>
+                  <SortHeader field="track_name">Track</SortHeader>
+                  <SortHeader field="source">Source</SortHeader>
+                </tr>
+              </thead>
+              <tbody>
+                {visibleEntries.map((entry, i) => {
+                  const artworkSrc = entry.artwork_url
+                    || (entry.known_track_id != null ? `${apiBase}/tracks/${entry.known_track_id}/artwork` : null);
+                  return (
+                    <tr key={`${entry.played_at}-${i}`}>
+                      <td className="play-log-artwork-col">
+                        {artworkSrc ? (
+                          <img
+                            className="play-log-artwork"
+                            src={artworkSrc}
+                            alt=""
+                            loading="lazy"
+                            onError={(e) => { e.target.style.visibility = 'hidden'; }}
+                          />
+                        ) : (
+                          <div className="play-log-artwork play-log-artwork-fallback" aria-hidden="true">♪</div>
+                        )}
+                      </td>
+                      <td className="play-log-time">{entry.played_at}</td>
+                      <td>{entry.artist_name}</td>
+                      <td>{entry.track_name}</td>
+                      <td>
+                        <span className={`play-log-source play-log-source-${entry.source}`}>
+                          {PLAY_LOG_SOURCE_LABELS[entry.source] || entry.source}
+                        </span>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+          {visibleEntries.length === 0 && (
+            <p className="empty-state">No plays match these filters.</p>
+          )}
+        </>
+      )}
+    </section>
   );
 }
 
@@ -3896,6 +4090,12 @@ function App() {
           >
             Cleanup
           </button>
+          <button
+            className={activeTab === 'playlog' ? 'active' : ''}
+            onClick={() => setActiveTab('playlog')}
+          >
+            Play Log
+          </button>
         </nav>
         <button className="settings-btn" onClick={() => setSettingsOpen(true)} aria-label="Settings" title="Settings">
           &#9881;
@@ -4503,6 +4703,8 @@ function App() {
             onStartRadioFromPlaylist={startRadioFromPlaylist}
             onStopRadio={stopRadio}
           />
+        ) : activeTab === 'playlog' ? (
+          <PlayLogTab apiBase={API_BASE_URL} />
         ) : (
           <CleanupTab
             apiBase={API_BASE_URL}

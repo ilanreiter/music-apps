@@ -55,6 +55,17 @@ SPOTIFY_MATCH_CONSECUTIVE_CAP = 20
 # only bounds how much a single refill grows the pool by, not how often.
 RADIO_ADVANCER_REFILL_BATCH = 10
 
+# How many tracks _advance_spotify keeps buffered ahead in the ad-hoc `queue`
+# array at once (previously always exactly 1, replaced wholesale rather than
+# topped up). At 1, the buffer is fully empty - Up Next shows nothing, the
+# frontend's Next button has nothing to jump to - for the entire stretch
+# between "the one buffered track just started playing" and "this tick's
+# refill found its replacement" (up to one full poll interval, more if that
+# tick's match happens to miss and needs another round). Keeping one spare
+# buffered means there's always still something to advance to immediately,
+# even if a given tick's refill is slow, misses, or is briefly rate-limited.
+SPOTIFY_QUEUE_LOOKAHEAD_DEPTH = 2
+
 
 def _track_to_cast_item(track):
     content_type = FORMAT_MIME_TYPES.get((track.get('file_format') or '').upper(), 'audio/mpeg')
@@ -498,7 +509,26 @@ def _advance_spotify(save_session, destination_id, now_playing, queue, match_poo
             save_session(now_playing=now_playing, queue=queue)
             is_context = bool((now_playing or {}).get('context_uri'))
 
-    if is_context or queue or not match_pool:
+    if not match_pool and not is_context and not queue:
+        # Confirmed live: match_pool can end up None while now_playing still
+        # carries a genuinely active radio_session_id (e.g. a container
+        # restart landing between a save that cleared/never set match_pool
+        # and the next refill) - without this, the "not match_pool" branch
+        # right below returns immediately forever after, since the refill
+        # logic that could rebuild match_pool only runs *inside* the block
+        # this guards. A dead pool for an actually-active session otherwise
+        # never recovers: no candidates ever get matched again, the queue
+        # stays permanently empty, and the frontend's Next button/Up Next
+        # list have nothing to show - "Radio must never just stop" applies
+        # here too, not just to a rate limit. Rebuilding an empty pool
+        # tagged with the still-current session id is enough - the refill
+        # branch a few lines down already knows how to repopulate an empty
+        # candidates list for a tracked radio_session_id from scratch.
+        carried_radio_session_id = (now_playing or {}).get('radio_session_id')
+        if carried_radio_session_id is not None and _radio_session_still_current(carried_radio_session_id):
+            match_pool = {'candidates': [], 'cursor': 0, 'radio_session_id': carried_radio_session_id}
+
+    if is_context or len(queue) >= SPOTIFY_QUEUE_LOOKAHEAD_DEPTH or not match_pool:
         return match_pool
 
     candidates = match_pool.get('candidates') or []
@@ -621,7 +651,14 @@ def _advance_spotify(save_session, destination_id, now_playing, queue, match_poo
                 match_pool = {'candidates': candidates, 'cursor': cursor}
                 if radio_session_id is not None:
                     match_pool['radio_session_id'] = radio_session_id
-                save_session(queue=[found], spotify_match_pool=match_pool)
+                # Appends rather than replaces - queue can already hold up to
+                # SPOTIFY_QUEUE_LOOKAHEAD_DEPTH - 1 earlier buffered track(s)
+                # at this point (the depth check above only lets this section
+                # run at all once queue is below the target depth, it doesn't
+                # require it to be empty). The near-end/stopped_on_its_own
+                # branch above already pops from the front and leaves the
+                # rest, so this stays correct regardless of depth.
+                save_session(queue=queue + [found], spotify_match_pool=match_pool)
                 return match_pool
             consecutive_misses += 1
 

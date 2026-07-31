@@ -201,6 +201,161 @@ main.with-player {
   background: none;
 }
 
+.play-log-section {
+  padding: 8px 0 32px;
+}
+
+.play-log-filters {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: end;
+  gap: 10px;
+  margin-bottom: 16px;
+}
+
+.play-log-filters input[type="text"],
+.play-log-filters input[type="datetime-local"],
+.play-log-filters select {
+  padding: 9px 12px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  color: var(--text-main);
+  font-size: 0.88rem;
+}
+
+.play-log-filters input[type="text"] {
+  width: 170px;
+}
+
+.play-log-filters input[type="text"]:focus,
+.play-log-filters input[type="datetime-local"]:focus,
+.play-log-filters select:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+.play-log-date-label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 0.72rem;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.play-log-clear-btn {
+  padding: 9px 14px;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  color: var(--text-muted);
+  font-size: 0.85rem;
+  cursor: pointer;
+}
+
+.play-log-clear-btn:hover {
+  color: var(--text-main);
+  background: var(--bg-card-hover);
+}
+
+.play-log-count {
+  margin-bottom: 10px;
+}
+
+.play-log-table-wrap {
+  overflow-x: auto;
+}
+
+.play-log-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.88rem;
+}
+
+.play-log-table th {
+  text-align: left;
+  padding: 8px 10px;
+  color: var(--text-muted);
+  font-weight: 600;
+  font-size: 0.78rem;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+}
+
+.play-log-table th.play-log-sortable {
+  cursor: pointer;
+  user-select: none;
+}
+
+.play-log-table th.play-log-sortable:hover {
+  color: var(--text-main);
+}
+
+.play-log-sort-arrow {
+  color: var(--accent-hover);
+}
+
+.play-log-artwork-col {
+  width: 44px;
+}
+
+.play-log-table td {
+  padding: 9px 10px;
+  border-bottom: 1px solid var(--border);
+  vertical-align: middle;
+}
+
+.play-log-table tr:last-child td {
+  border-bottom: none;
+}
+
+.play-log-artwork {
+  width: 36px;
+  height: 36px;
+  border-radius: 6px;
+  object-fit: cover;
+  display: block;
+  background: var(--bg-input);
+}
+
+.play-log-artwork-fallback {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-muted);
+  font-size: 1rem;
+}
+
+.play-log-time {
+  white-space: nowrap;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.play-log-source {
+  display: inline-block;
+  padding: 2px 9px;
+  border-radius: 999px;
+  font-size: 0.74rem;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.play-log-source-library {
+  background: var(--accent-soft);
+  color: var(--accent-hover);
+}
+
+.play-log-source-radio_discovered {
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--text-muted);
+}
+
 .settings-section {
   margin-top: 24px;
   padding-top: 20px;
