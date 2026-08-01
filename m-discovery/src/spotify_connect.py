@@ -262,23 +262,33 @@ def _extract_quota_exceeded_reason(response):
 
 
 def _learn_from_quota_exceeded():
-    """A confirmed QUOTA_EXCEEDED response is direct evidence that today's
-    (America/New_York) actual request volume already exceeded Spotify's
-    real (undocumented) daily allowance - ratchets the self-imposed
-    estimate down to just under that observed point, so the rest of today
-    (and tomorrow) stops before hitting the same wall instead of
-    re-learning it the hard way. This only ever moves the estimate down -
-    recovering it back up is database.maybe_recover_spotify_quota_estimate's
-    job, run separately once a day after a clean stretch, not this
-    function's (a bad day doesn't mean Spotify's real limit went up, so
-    there's no equivalent positive signal to react to here)."""
-    observed_today = database.count_searches_since_ny_midnight()
+    """A confirmed QUOTA_EXCEEDED response is direct evidence that the
+    actual request volume since the last reset already exceeded Spotify's
+    real (undocumented) allowance - ratchets the self-imposed estimate down
+    to just under that observed point, so the rest of this stretch stops
+    before hitting the same wall instead of re-learning it the hard way.
+    This only ever moves the estimate down - recovering it back up is
+    database.maybe_recover_spotify_quota_estimate's job, run separately once
+    a day after a clean stretch, not this function's (a bad stretch doesn't
+    mean Spotify's real limit went up, so there's no equivalent positive
+    signal to react to here).
+
+    Also resets the "used" counter itself (database.reset_search_count) -
+    per explicit user request, a real QUOTA_EXCEEDED is the ONLY thing that
+    should ever reset it, not a calendar-day boundary. Done unconditionally
+    here (not just when the estimate actually moves down) since this
+    function only ever runs on a genuine new transition into being blocked
+    (see the was_already_blocked guard at the only call site below) - that
+    transition itself is the reset trigger, regardless of whether the
+    estimate needed adjusting too."""
+    observed = database.count_searches_since_last_reset()
     current_estimate = database.get_spotify_quota_estimate()
-    new_estimate = max(QUOTA_ESTIMATE_FLOOR, min(current_estimate, observed_today - 1))
+    new_estimate = max(QUOTA_ESTIMATE_FLOOR, min(current_estimate, observed - 1))
     if new_estimate < current_estimate:
         database.set_spotify_quota_estimate(
-            new_estimate, f"QUOTA_EXCEEDED after {observed_today} real searches today",
+            new_estimate, f"QUOTA_EXCEEDED after {observed} real searches since the last reset",
         )
+    database.reset_search_count(f"QUOTA_EXCEEDED after {observed} real searches")
 
 
 def _api_request(method, path, params=None, json_body=None, retried=False):
@@ -302,22 +312,22 @@ def _api_request(method, path, params=None, json_body=None, retried=False):
         # or not, including a post-429 retry below (its own real call) -
         # before any quota-learning logic reads it back, so a request that
         # itself triggers QUOTA_EXCEEDED is included in its own "how many
-        # did we send today" tally instead of being off by one.
+        # since the last reset" tally instead of being off by one.
         database.record_spotify_search()
         if response.status_code != 429:
-            # A completed, non-429 response is direct proof today's real
-            # volume is at least this high with no rate limit hit - the
-            # daily estimate (purely a reported number now, see
+            # A completed, non-429 response is direct proof the real volume
+            # since the last reset is at least this high with no rate limit
+            # hit - the daily estimate (purely a reported number now, see
             # search_budget_available - nothing gates on it anymore) should
             # track that instead of staying frozen at an old guess or a
             # since-superseded downward ratchet. Only ever raises; a real
             # 429 elsewhere in this function is still the only thing that
             # ever lowers it.
-            observed_today = database.count_searches_since_ny_midnight()
+            observed = database.count_searches_since_last_reset()
             current_estimate = database.get_spotify_quota_estimate()
-            if observed_today > current_estimate:
+            if observed > current_estimate:
                 database.set_spotify_quota_estimate(
-                    observed_today, f"raised to match {observed_today} real searches completed today with no rate limit hit",
+                    observed, f"raised to match {observed} real searches completed since the last reset with no rate limit hit",
                 )
 
     if response.status_code == 429:
@@ -1075,6 +1085,21 @@ CLEAR_QUEUE_SAFETY_CAP = 200
 # fully catch up after the last one, before the actual play command arrives.
 CLEAR_QUEUE_STEP_DELAY_SECONDS = 0.3
 CLEAR_QUEUE_SETTLE_DELAY_SECONDS = 0.5
+# How many extra skip rounds to try, beyond the initial tracked/reported
+# pass, if Spotify still reports an active *context* afterward - a context
+# (a playlist/album/shuffled Liked Songs actively driving playback, not
+# this app's own ad-hoc queue) is a fundamentally different, harder problem
+# than ordinary leftover residue: GET /me/player/queue only ever shows a
+# shallow "next few" preview of it, which just refills to roughly the same
+# depth after every skip, so a single guessed count computed once up front
+# can never actually escape it. Bounded rather than unbounded so a
+# genuinely endless shuffle doesn't turn this into an infinite loop - after
+# this many rounds, give up and let the caller's own play()/play_uris() ad-
+# hoc list try to override it directly instead (confirmed live that alone
+# can still win, just not reliably on the first attempt - see play_uris'
+# own retry loop).
+CLEAR_QUEUE_MAX_CONTEXT_ROUNDS = 4
+CLEAR_QUEUE_CONTEXT_ROUND_SIZE = 15
 
 
 def clear_queue(device_id, token=None):
@@ -1098,22 +1123,37 @@ def clear_queue(device_id, token=None):
     own ad-hoc sessions - rather than guessing from a flat cap. Confirmed
     live the old flat 20-item cap wasn't enough: a radio session running
     long enough to queue more than that over its lifetime left genuine
-    residue behind that resurfaced under a later session. Still floored at
-    CLEAR_QUEUE_MIN_DRAIN (covers the common one-or-two-item case even if
-    the counter somehow undercounts) and ceilinged at CLEAR_QUEUE_SAFETY_CAP
-    (so a runaway count, or a real context playlist's own remaining tracks
-    mixed into GET /me/player/queue's response, can't turn this into an
-    extremely slow walk through an entire playlist before the actual play
-    call ever lands).
+    residue behind that resurfaced under a later session. Ceilinged at
+    CLEAR_QUEUE_SAFETY_CAP (so a runaway count, or a real context
+    playlist's own remaining tracks mixed into GET /me/player/queue's
+    response, can't turn this into an extremely slow walk through an entire
+    playlist before the actual play call ever lands).
+
+    That single pass is only ever as good as its one up-front guess, which
+    confirmed-live can badly undercount: a device with its own actively-
+    refilling context (someone shuffling Liked Songs directly in the real
+    Spotify app on that device, say) makes GET /me/player/queue's "next few"
+    preview refill to roughly the same shallow depth after every skip,
+    since there's no fixed amount left to run out of. So after the initial
+    pass, this checks GET /me/player's own context field - if a context is
+    still actively driving playback, that's real, different evidence beyond
+    ordinary residue, and it's worth a few more bounded rounds
+    (CLEAR_QUEUE_MAX_CONTEXT_ROUNDS x CLEAR_QUEUE_CONTEXT_ROUND_SIZE) rather
+    than giving up after one guessed count. Still bounded overall, since a
+    genuinely endless shuffle can't be fully escaped this way no matter how
+    many rounds are tried - at that point the caller's own play()/play_uris()
+    ad-hoc list has to just try to win the override directly instead.
 
     Called via play()/play_uris()'s drain_queue=True, itself only passed for
     a genuinely new ad-hoc session (a fresh track/Shuffle All/Play All click,
     switching the destination to Spotify, or restoring a session on Play) -
     not for in-session Next/Prev or the near-end lookahead handoff
     (playback_advancer._advance_spotify), which intentionally rely on the
-    single lookahead track add_to_queue just placed there. Best-effort: any
-    failure just leaves the residue for next time rather than blocking
-    playback.
+    single lookahead track add_to_queue just placed there. Also callable
+    directly (see clear_queue_for_device) for the Settings "Clear queue"
+    button, a manual escape hatch for whenever the automatic drain still
+    isn't enough. Best-effort: any failure just leaves the residue for next
+    time rather than blocking playback.
 
     token: the caller's own _start_intent token, if it has one (play()/
     play_uris() do) - lets a multi-step drain bail out immediately if a
@@ -1122,10 +1162,13 @@ def clear_queue(device_id, token=None):
     (and waste time ahead of) the newer call's own attempt.
 
     Caller must already have transferred to device_id (see play()/play_uris())
-    before calling this - GET /me/player/queue and the `next` calls this
-    drains with both act on whatever device is *currently* active
-    account-wide, not necessarily device_id, so calling this against a device
-    that isn't already active drains (or reads) the wrong device's queue."""
+    before calling this - GET /me/player/queue, GET /me/player, and the
+    `next` calls this drains with all act on whatever device is *currently*
+    active account-wide, not necessarily device_id, so calling this against
+    a device that isn't already active drains (or reads) the wrong device's
+    queue.
+
+    Returns how many tracks were actually skipped."""
     tracked_pending = database.take_pending_queue_adds()
     data = _api_request('GET', '/me/player/queue')
     reported_pending = len(data.get('queue') or []) if data else 0
@@ -1138,16 +1181,49 @@ def clear_queue(device_id, token=None):
     # can turn this into an extremely slow drain.
     pending = min(max(tracked_pending, reported_pending), CLEAR_QUEUE_SAFETY_CAP)
     drained = 0
-    for _ in range(pending):
-        if token is not None and not _is_current_intent(device_id, token):
-            logger.info("clear_queue %s: superseded by a newer call mid-drain, bailing out", device_id)
-            return
-        if not next_track(device_id):
+
+    def _skip_batch(count):
+        nonlocal drained
+        for _ in range(count):
+            if token is not None and not _is_current_intent(device_id, token):
+                logger.info("clear_queue %s: superseded by a newer call mid-drain, bailing out", device_id)
+                return False
+            if not next_track(device_id):
+                break
+            drained += 1
+            time.sleep(CLEAR_QUEUE_STEP_DELAY_SECONDS)
+        return True
+
+    if not _skip_batch(pending):
+        return drained
+
+    for _ in range(CLEAR_QUEUE_MAX_CONTEXT_ROUNDS):
+        status_data = _api_request('GET', '/me/player')
+        if not status_data or not status_data.get('context'):
             break
-        drained += 1
-        time.sleep(CLEAR_QUEUE_STEP_DELAY_SECONDS)
+        logger.info("clear_queue %s: context still active after %d skips, trying another round", device_id, drained)
+        if not _skip_batch(CLEAR_QUEUE_CONTEXT_ROUND_SIZE):
+            return drained
+
     if drained:
         time.sleep(CLEAR_QUEUE_SETTLE_DELAY_SECONDS)
+    return drained
+
+
+def clear_queue_for_device(device_id):
+    """Manual entry point for the Settings "Clear queue" button - unlike
+    clear_queue itself (normally only called from inside play()/play_uris(),
+    which already transfer to device_id first as part of starting a new
+    session), this has to do that transfer itself since it isn't part of an
+    actual play call - just a standalone maintenance action for whenever
+    residue is suspected (or confirmed) outside of starting anything new.
+    Returns how many tracks were skipped, or None if Spotify isn't even
+    connected."""
+    if not is_connected():
+        return None
+    token = _start_intent(device_id)
+    _transfer_to_device(device_id)
+    return clear_queue(device_id, token=token)
 
 
 def _artist_guard_passes(local_artist, bridged_artist):

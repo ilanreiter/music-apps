@@ -356,6 +356,19 @@ main.with-player {
   color: var(--text-muted);
 }
 
+.play-log-reason {
+  color: var(--text-muted);
+  max-width: 260px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.play-log-engine {
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
 .settings-section {
   margin-top: 24px;
   padding-top: 20px;
@@ -379,11 +392,38 @@ main.with-player {
 .device-row {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 10px;
   padding: 9px 12px;
   background: var(--bg-input);
   border-radius: 8px;
   font-size: 0.85rem;
+}
+
+.device-row-clear-queue-btn {
+  flex-shrink: 0;
+  padding: 5px 10px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text-muted);
+  font-size: 0.76rem;
+  cursor: pointer;
+}
+
+.device-row-clear-queue-btn:hover:not(:disabled) {
+  color: var(--text-main);
+  background: var(--bg-card-hover);
+}
+
+.device-row-clear-queue-btn:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.device-row-clear-queue-result {
+  flex-basis: 100%;
+  margin: 0;
 }
 
 .device-row-icon {

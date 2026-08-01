@@ -527,14 +527,31 @@ function YtMusicPushPanel({ apiBase, onPush, pushing, onClose }) {
 // update live while you're browsing it. Sorting/filtering all happen
 // client-side over the one fetched batch (see GET /api/play-log's own
 // comment on why) - instant, no round trip per filter/sort change.
-const PLAY_LOG_SOURCE_LABELS = { library: 'Library', radio_discovered: 'Radio discovery' };
+// Source is purely about ownership - does the underlying audio file live in
+// your library or not - never about how/why a track was picked (that's the
+// Engine/Reason columns' job). Deliberately not "cached" for the non-owned
+// value either - a library track only ever plays via Spotify Connect
+// because it's *already* cached too (spotify_checked/spotify_track_id), so
+// "cached" wouldn't actually distinguish the two values, just reintroduce
+// the same ambiguity a plain "Library"/"Last.fm recommendation" pairing had
+// (one side describing ownership, the other describing a discovery
+// mechanism that belongs in the Engine column instead).
+const PLAY_LOG_SOURCE_LABELS = { library: 'In library', radio_discovered: 'Not in library' };
+// Engine is blank/null for anything that wasn't actually a recommendation
+// at all (a direct library click, a playlist track, the literal seed
+// track/artist you picked) - '(none)' is the filter/sort label for that
+// state, never sent to or stored by the backend as a literal string.
+const PLAY_LOG_ENGINE_LABELS = { 'Last.fm': 'Last.fm', 'App logic': 'App logic', 'Spotify': 'Spotify' };
+const PLAY_LOG_NO_ENGINE_LABEL = '(none)';
 
 function PlayLogTab({ apiBase }) {
   const [entries, setEntries] = useState(null);
   const [error, setError] = useState(null);
   const [artistFilter, setArtistFilter] = useState('');
   const [trackFilter, setTrackFilter] = useState('');
+  const [engineFilter, setEngineFilter] = useState('all');
   const [sourceFilter, setSourceFilter] = useState('all');
+  const [reasonFilter, setReasonFilter] = useState('');
   const [startDate, setStartDate] = useState('');
   const [endDate, setEndDate] = useState('');
   const [sortField, setSortField] = useState('played_at');
@@ -562,11 +579,13 @@ function PlayLogTab({ apiBase }) {
     }
   };
 
-  const hasActiveFilters = artistFilter || trackFilter || sourceFilter !== 'all' || startDate || endDate;
+  const hasActiveFilters = artistFilter || trackFilter || engineFilter !== 'all' || sourceFilter !== 'all' || reasonFilter || startDate || endDate;
   const clearFilters = () => {
     setArtistFilter('');
     setTrackFilter('');
+    setEngineFilter('all');
     setSourceFilter('all');
+    setReasonFilter('');
     setStartDate('');
     setEndDate('');
   };
@@ -575,6 +594,7 @@ function PlayLogTab({ apiBase }) {
     if (!entries) return [];
     const artistNeedle = artistFilter.trim().toLowerCase();
     const trackNeedle = trackFilter.trim().toLowerCase();
+    const reasonNeedle = reasonFilter.trim().toLowerCase();
     // datetime-local gives "YYYY-MM-DDTHH:MM" (no seconds); played_at is
     // "YYYY-MM-DD HH:MM:SS". Swapping the separator makes both directly
     // string-comparable - startDate as-is is already an inclusive lower
@@ -588,20 +608,26 @@ function PlayLogTab({ apiBase }) {
     let rows = entries.filter((e) => {
       if (artistNeedle && !e.artist_name.toLowerCase().includes(artistNeedle)) return false;
       if (trackNeedle && !e.track_name.toLowerCase().includes(trackNeedle)) return false;
+      if (engineFilter !== 'all' && (e.engine || PLAY_LOG_NO_ENGINE_LABEL) !== engineFilter) return false;
       if (sourceFilter !== 'all' && e.source !== sourceFilter) return false;
+      if (reasonNeedle && !(e.reason || '').toLowerCase().includes(reasonNeedle)) return false;
       const normalizedPlayedAt = e.played_at.replace(' ', 'T');
       if (startDate && normalizedPlayedAt < startDate) return false;
       if (endBound && normalizedPlayedAt > endBound) return false;
       return true;
     });
     rows = [...rows].sort((a, b) => {
-      const av = sortField === 'source' ? (PLAY_LOG_SOURCE_LABELS[a.source] || a.source) : a[sortField];
-      const bv = sortField === 'source' ? (PLAY_LOG_SOURCE_LABELS[b.source] || b.source) : b[sortField];
+      const av = sortField === 'source' ? (PLAY_LOG_SOURCE_LABELS[a.source] || a.source)
+        : sortField === 'engine' ? (a.engine || PLAY_LOG_NO_ENGINE_LABEL)
+        : (a[sortField] ?? '');
+      const bv = sortField === 'source' ? (PLAY_LOG_SOURCE_LABELS[b.source] || b.source)
+        : sortField === 'engine' ? (b.engine || PLAY_LOG_NO_ENGINE_LABEL)
+        : (b[sortField] ?? '');
       const cmp = String(av).localeCompare(String(bv), undefined, { numeric: true, sensitivity: 'base' });
       return sortDir === 'asc' ? cmp : -cmp;
     });
     return rows;
-  }, [entries, artistFilter, trackFilter, sourceFilter, startDate, endDate, sortField, sortDir]);
+  }, [entries, artistFilter, trackFilter, engineFilter, sourceFilter, reasonFilter, startDate, endDate, sortField, sortDir]);
 
   const SortHeader = ({ field, children }) => (
     <th className="play-log-sortable" onClick={() => toggleSort(field)}>
@@ -625,11 +651,24 @@ function PlayLogTab({ apiBase }) {
           value={trackFilter}
           onChange={(e) => setTrackFilter(e.target.value)}
         />
+        <select value={engineFilter} onChange={(e) => setEngineFilter(e.target.value)}>
+          <option value="all">All engines</option>
+          {Object.values(PLAY_LOG_ENGINE_LABELS).map((label) => (
+            <option key={label} value={label}>{label}</option>
+          ))}
+          <option value={PLAY_LOG_NO_ENGINE_LABEL}>{PLAY_LOG_NO_ENGINE_LABEL}</option>
+        </select>
         <select value={sourceFilter} onChange={(e) => setSourceFilter(e.target.value)}>
           <option value="all">All sources</option>
-          <option value="library">Library</option>
-          <option value="radio_discovered">Radio discovery</option>
+          <option value="library">{PLAY_LOG_SOURCE_LABELS.library}</option>
+          <option value="radio_discovered">{PLAY_LOG_SOURCE_LABELS.radio_discovered}</option>
         </select>
+        <input
+          type="text"
+          placeholder="Filter by reason…"
+          value={reasonFilter}
+          onChange={(e) => setReasonFilter(e.target.value)}
+        />
         <label className="play-log-date-label">
           From
           <input type="datetime-local" value={startDate} onChange={(e) => setStartDate(e.target.value)} />
@@ -658,10 +697,12 @@ function PlayLogTab({ apiBase }) {
               <thead>
                 <tr>
                   <th className="play-log-artwork-col" />
-                  <SortHeader field="played_at">Played (NY time)</SortHeader>
                   <SortHeader field="artist_name">Artist</SortHeader>
                   <SortHeader field="track_name">Track</SortHeader>
+                  <SortHeader field="engine">Engine</SortHeader>
                   <SortHeader field="source">Source</SortHeader>
+                  <SortHeader field="reason">Reason</SortHeader>
+                  <SortHeader field="played_at">Played (NY time)</SortHeader>
                 </tr>
               </thead>
               <tbody>
@@ -683,14 +724,16 @@ function PlayLogTab({ apiBase }) {
                           <div className="play-log-artwork play-log-artwork-fallback" aria-hidden="true">♪</div>
                         )}
                       </td>
-                      <td className="play-log-time">{entry.played_at}</td>
                       <td>{entry.artist_name}</td>
                       <td>{entry.track_name}</td>
+                      <td className="play-log-engine">{entry.engine || PLAY_LOG_NO_ENGINE_LABEL}</td>
                       <td>
                         <span className={`play-log-source play-log-source-${entry.source}`}>
                           {PLAY_LOG_SOURCE_LABELS[entry.source] || entry.source}
                         </span>
                       </td>
+                      <td className="play-log-reason" title={entry.reason || ''}>{entry.reason || '—'}</td>
+                      <td className="play-log-time">{entry.played_at}</td>
                     </tr>
                   );
                 })}
@@ -2640,6 +2683,17 @@ function App() {
     // existing cache-hit path resolve it with zero new Spotify searches.
     known_track_id: t.id ?? null,
     artwork_url: t.artwork_url ?? null,
+    // The same pre-resolved-cache-hit idea as known_track_id above, for a
+    // radio_discovered_tracks match instead (a track not in the library at
+    // all, so it has no known_tracks id to carry) - see the Track model's
+    // own comment in main.py on why this needs to be declared there too,
+    // not just produced by radio_engine.py. selection_reason/selection_engine
+    // ride along so whichever candidate actually gets played can stamp them
+    // onto the Play Log via database._record_track_played.
+    spotify_uri: t.spotify_uri ?? null,
+    radio_track_id: t.radio_track_id ?? null,
+    selection_reason: t.selection_reason ?? null,
+    selection_engine: t.selection_engine ?? null,
   }));
 
   // Resolves whatever track the user actually picked (or a representative
@@ -2657,19 +2711,19 @@ function App() {
     // without it here that effect would fire on the *very first* track a
     // session ever plays, since nothing else tags the seed track itself.
     if (destinationType === 'browser') {
-      if (!seedTrack.source) return { ...seedTrack, radio_session_id: sessionId }; // plain local library track - streams directly
-      if (seedTrack.local_id != null) return { ...seedTrack, id: seedTrack.local_id, radio_session_id: sessionId }; // has a local match - stream that instead
+      if (!seedTrack.source) return { ...seedTrack, radio_session_id: sessionId, selection_reason: 'Radio seed' }; // plain local library track - streams directly
+      if (seedTrack.local_id != null) return { ...seedTrack, id: seedTrack.local_id, radio_session_id: sessionId, selection_reason: 'Radio seed' }; // has a local match - stream that instead
       return null; // a bare Spotify/YT Music playlist track has no preview mechanism of its own
     }
     if (destinationType === 'spotify') {
-      if (seedTrack.source === 'spotify') return { ...seedTrack, radio_session_id: sessionId }; // already Spotify-native (has its own uri)
+      if (seedTrack.source === 'spotify') return { ...seedTrack, radio_session_id: sessionId, selection_reason: 'Radio seed' }; // already Spotify-native (has its own uri)
       if (!seedTrack.source) {
         // Genuine local library track - the real cached local-track match
         // endpoint (keyed by known_tracks.id, caches its result there),
         // same one a direct library-tab click would use.
         try {
           const response = await axios.post(`${API_BASE_URL}/spotify/tracks/${seedTrack.id}/match`);
-          if (response.data.matched) return { ...mapMatchedLocalTrack(seedTrack, response.data), radio_session_id: sessionId };
+          if (response.data.matched) return { ...mapMatchedLocalTrack(seedTrack, response.data), radio_session_id: sessionId, selection_reason: 'Radio seed' };
         } catch (err) {
           console.error('Error matching radio seed track to Spotify:', err);
         }
@@ -2683,7 +2737,7 @@ function App() {
           if (response.data.matched) {
             return {
               id: response.data.uri, source: 'spotify', uri: response.data.uri, context_uri: null,
-              ytmusic_id: seedTrack.id, radio_session_id: sessionId,
+              ytmusic_id: seedTrack.id, radio_session_id: sessionId, selection_reason: 'Radio seed',
               track_name: seedTrack.track_name, artist_name: seedTrack.artist_name,
               artwork_url: response.data.artwork_url,
               radio_track_id: response.data.radio_track_id ?? null,
@@ -2705,14 +2759,21 @@ function App() {
   // that's what lets the advancer's existing cache-hit path
   // (_match_local_track_cached) resolve it with zero new Spotify searches,
   // instead of every candidate needing a fresh text search
-  // (_match_text_candidate). null when there's nothing left to hand off (an
-  // empty starting batch) - that's still meaningful, since passing it
-  // clears any pool from a previous session/flow rather than silently
-  // preserving one.
+  // (_match_text_candidate). spotify_uri/radio_track_id are the same idea
+  // for a radio_discovered_tracks match instead (a track not in the
+  // library, so no known_tracks id to carry) - playback_advancer's matching
+  // loop checks for these directly. selection_reason/selection_engine ride
+  // along so whichever candidate actually plays can stamp the Play Log
+  // with the real reason/engine instead of a generic default. null when
+  // there's nothing left to hand off (an empty starting batch) - that's
+  // still meaningful, since passing it clears any pool from a previous
+  // session/flow rather than silently preserving one.
   const buildRadioSpotifyPool = (sessionId, remaining) => (
     remaining.length > 0 ? {
       candidates: remaining.map((t) => ({
         id: t.known_track_id ?? null, track_name: t.track_name, artist_name: t.artist_name, album_name: t.album_name,
+        spotify_uri: t.spotify_uri ?? null, radio_track_id: t.radio_track_id ?? null, selection_reason: t.selection_reason ?? null,
+        selection_engine: t.selection_engine ?? null,
       })),
       cursor: 0,
       radio_session_id: sessionId,
@@ -2820,19 +2881,26 @@ function App() {
     for (let i = 0; i < candidates.length; i++) {
       const candidate = candidates[i];
       let matchResult;
-      try {
-        if (candidate.known_track_id != null) {
-          const matchResponse = await axios.post(`${API_BASE_URL}/spotify/tracks/${candidate.known_track_id}/match`);
-          matchResult = matchResponse.data;
-        } else {
-          const matchResponse = await axios.post(`${API_BASE_URL}/spotify/discover-match`, {
-            track_name: candidate.track_name, artist_name: candidate.artist_name,
-          });
-          matchResult = matchResponse.data;
+      if (candidate.spotify_uri) {
+        // Already resolved by radio_engine.generate_radio_batch_track_first's
+        // own cache check (a radio_discovered_tracks match - see
+        // mapRadioTracks) - no live search needed at all.
+        matchResult = { matched: true, uri: candidate.spotify_uri, radio_track_id: candidate.radio_track_id, artwork_url: candidate.artwork_url };
+      } else {
+        try {
+          if (candidate.known_track_id != null) {
+            const matchResponse = await axios.post(`${API_BASE_URL}/spotify/tracks/${candidate.known_track_id}/match`);
+            matchResult = matchResponse.data;
+          } else {
+            const matchResponse = await axios.post(`${API_BASE_URL}/spotify/discover-match`, {
+              track_name: candidate.track_name, artist_name: candidate.artist_name,
+            });
+            matchResult = matchResponse.data;
+          }
+        } catch (err) {
+          console.error('Error matching radio track to Spotify:', err);
+          break;
         }
-      } catch (err) {
-        console.error('Error matching radio track to Spotify:', err);
-        break;
       }
       if (matchResult.reason === 'unavailable') {
         try {
@@ -2856,7 +2924,9 @@ function App() {
         radio_id: candidate.id, radio_session_id: sessionId,
         track_name: candidate.track_name, artist_name: candidate.artist_name,
         album_name: candidate.album_name, artwork_url: matchResult.artwork_url,
-        radio_track_id: matchResult.radio_track_id ?? null,
+        radio_track_id: matchResult.radio_track_id ?? candidate.radio_track_id ?? null,
+        selection_reason: candidate.selection_reason ?? null,
+        selection_engine: candidate.selection_engine ?? null,
       };
       commitRadioSession(sessionId, seed, destinationType);
       startQueue([firstEntry], { spotifyMatchPool: buildRadioSpotifyPool(sessionId, candidates.slice(i + 1)) });
@@ -2874,19 +2944,25 @@ function App() {
   const resolveFirstSpotifyMatch = async (sessionId, candidates) => {
     for (const candidate of candidates) {
       let matchResult;
-      try {
-        if (candidate.known_track_id != null) {
-          const matchResponse = await axios.post(`${API_BASE_URL}/spotify/tracks/${candidate.known_track_id}/match`);
-          matchResult = matchResponse.data;
-        } else {
-          const matchResponse = await axios.post(`${API_BASE_URL}/spotify/discover-match`, {
-            track_name: candidate.track_name, artist_name: candidate.artist_name,
-          });
-          matchResult = matchResponse.data;
+      if (candidate.spotify_uri) {
+        // Already resolved by radio_engine.generate_radio_batch_track_first's
+        // own cache check - no live search needed at all.
+        matchResult = { matched: true, uri: candidate.spotify_uri, radio_track_id: candidate.radio_track_id, artwork_url: candidate.artwork_url };
+      } else {
+        try {
+          if (candidate.known_track_id != null) {
+            const matchResponse = await axios.post(`${API_BASE_URL}/spotify/tracks/${candidate.known_track_id}/match`);
+            matchResult = matchResponse.data;
+          } else {
+            const matchResponse = await axios.post(`${API_BASE_URL}/spotify/discover-match`, {
+              track_name: candidate.track_name, artist_name: candidate.artist_name,
+            });
+            matchResult = matchResponse.data;
+          }
+        } catch (err) {
+          console.error('Error matching a Spotify Radio seed fallback candidate:', err);
+          continue;
         }
-      } catch (err) {
-        console.error('Error matching a Spotify Radio seed fallback candidate:', err);
-        continue;
       }
       if (!matchResult.matched) continue;
       return {
@@ -2894,7 +2970,9 @@ function App() {
         radio_session_id: sessionId,
         track_name: candidate.track_name, artist_name: candidate.artist_name,
         album_name: candidate.album_name, artwork_url: matchResult.artwork_url,
-        radio_track_id: matchResult.radio_track_id ?? null,
+        radio_track_id: matchResult.radio_track_id ?? candidate.radio_track_id ?? null,
+        selection_reason: candidate.selection_reason ?? null,
+        selection_engine: candidate.selection_engine ?? null,
       };
     }
     return null;
@@ -4878,6 +4956,31 @@ function SettingsPanel({
 }) {
   const [prewarmStatus, setPrewarmStatus] = useState(null);
   const [matchPrewarmStatus, setMatchPrewarmStatus] = useState(null);
+  // Manual escape hatch for when a new session's automatic queue drain
+  // still wasn't enough (see spotify_connect.clear_queue's own comment on
+  // why an actively-refilling native context can outlast a single guessed
+  // skip-count) - keyed by device id so clicking one Spotify device's
+  // button doesn't show a stale result/spinner on another.
+  const [clearingQueueFor, setClearingQueueFor] = useState(null);
+  const [clearQueueResult, setClearQueueResult] = useState(null);
+
+  const handleClearQueue = (device) => {
+    setClearingQueueFor(device.id);
+    setClearQueueResult(null);
+    axios.post(`${apiBase}/spotify/devices/${device.id}/clear-queue`)
+      .then((response) => {
+        const drained = response.data.drained || 0;
+        setClearQueueResult({
+          deviceId: device.id,
+          message: drained > 0 ? `Cleared ${drained} track${drained === 1 ? '' : 's'} from the queue.` : 'Nothing to clear - queue was already empty.',
+        });
+      })
+      .catch((err) => {
+        console.error('Error clearing Spotify queue:', err);
+        setClearQueueResult({ deviceId: device.id, message: "Couldn't clear the queue - try again." });
+      })
+      .finally(() => setClearingQueueFor(null));
+  };
 
   useEffect(() => {
     if (!spotifyConnected) return;
@@ -4959,6 +5062,20 @@ function SettingsPanel({
                       className={`device-status-dot ${d.status}`}
                       title={d.status === 'failed' ? 'Last playback attempt on this device failed' : 'Last playback attempt on this device succeeded'}
                     />
+                  )}
+                  {d.type === 'spotify' && (
+                    <button
+                      type="button"
+                      className="device-row-clear-queue-btn"
+                      onClick={() => handleClearQueue(d)}
+                      disabled={clearingQueueFor === d.id}
+                      title="Skip past anything left over from a previous session on this device"
+                    >
+                      {clearingQueueFor === d.id ? 'Clearing…' : 'Clear queue'}
+                    </button>
+                  )}
+                  {clearQueueResult && clearQueueResult.deviceId === d.id && (
+                    <p className="device-row-clear-queue-result hint">{clearQueueResult.message}</p>
                   )}
                 </div>
               ))}

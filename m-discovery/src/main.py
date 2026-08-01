@@ -13,9 +13,9 @@ from .database import (
     list_pending_ytmusic_push_jobs, delete_ytmusic_push_job,
     get_playlist_track_cache, replace_playlist_track_cache,
     find_known_track_external_match, backfill_known_track_ids, backfill_ytmusic_cache_match,
-    create_radio_session, get_radio_session, append_seen_track_keys,
+    create_radio_session, get_radio_session, append_seen_track_keys, set_radio_session_track_state,
     set_radio_session_ytmusic_job, stop_radio_session, append_tracks_to_ytmusic_push_job,
-    has_active_spotify_radio_session, count_searches_since_ny_midnight, get_spotify_quota_state,
+    has_active_spotify_radio_session, count_searches_since_last_reset, get_spotify_quota_state,
     set_prewarm_paused, is_prewarm_paused, upsert_radio_discovered_track,
     get_radio_cooldown_days, set_radio_cooldown_days,
 )
@@ -239,6 +239,31 @@ class Track(BaseModel):
     # use them if ever populated, but they're currently always None.
     native_track_name: Optional[str] = None
     native_artist_name: Optional[str] = None
+    # Populated only for a radio_engine.generate_radio_batch_track_first
+    # candidate - id above already carries a known_tracks id for a library
+    # cache hit, but a radio_discovered_tracks cache hit (a track not in the
+    # library) has no known_tracks id to put there at all, so it needs its
+    # own pre-resolved spotify_uri/radio_track_id instead. Without these on
+    # this model, RadioStartResponse/RadioMoreResponse's List[Track]
+    # serialization silently dropped both - confirmed live this meant the
+    # seed-track-fallback and ytmusic-push paths (the only consumers of
+    # these routes' HTTP response, as opposed to playback_advancer's
+    # background refill, which reads radio_engine's raw dicts directly and
+    # was never affected) always needed a live search even for an already-
+    # cached discovered track, undermining the same "use cached ids to cut
+    # search rate" goal everywhere else in Radio already follows.
+    spotify_uri: Optional[str] = None
+    radio_track_id: Optional[int] = None
+    # Why this specific candidate was suggested (e.g. "Discovered - similar
+    # track") and which mechanism produced it ("Last.fm", "App logic") -
+    # see radio_engine.generate_radio_batch_track_first's own
+    # selection_reason/selection_engine tagging. Also needed here for the
+    # same reason as spotify_uri/radio_track_id above - without a declared
+    # field, it was silently dropped before reaching the frontend, so the
+    # seed-track-fallback and ytmusic-push paths' plays showed the Play
+    # Log's generic default reason instead of the real one.
+    selection_reason: Optional[str] = None
+    selection_engine: Optional[str] = None
 
 class DiscoveryHistoryEntry(BaseModel):
     id: Optional[int] = None
@@ -1426,6 +1451,20 @@ def spotify_get_status(device_id: str):
         return {"reachable": False}
     return result
 
+@app.post("/api/spotify/devices/{device_id}/clear-queue")
+def spotify_clear_queue(device_id: str):
+    """Manual escape hatch for whenever a new session's automatic drain
+    (play()/play_uris()'s drain_queue=True) still wasn't enough - see
+    spotify_connect.clear_queue_for_device/clear_queue's own docstrings for
+    why that can happen (an actively-refilling native context, not just
+    ordinary leftover residue). Skips ahead on the real device right now,
+    independent of starting anything new."""
+    _get_spotify_device_or_404(device_id)
+    drained = spotify_connect.clear_queue_for_device(device_id)
+    if drained is None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Spotify not connected")
+    return {"drained": drained}
+
 @app.get("/api/spotify/playlists", response_model=List[SpotifyPlaylist])
 def list_spotify_playlists():
     if not spotify_connect.is_connected():
@@ -2125,12 +2164,12 @@ async def get_play_log(limit: int = 2000, db: psycopg2.extensions.connection = D
     cur = db.cursor()
     cur.execute("""
         SELECT id AS known_track_id, track_name, artist_name, last_played_at,
-               'library' AS source, NULL::TEXT AS artwork_url
+               'library' AS source, NULL::TEXT AS artwork_url, last_played_reason, last_played_engine
         FROM known_tracks
         WHERE last_played_at IS NOT NULL
         UNION ALL
         SELECT NULL::INTEGER AS known_track_id, track_name, artist_name, last_played_at,
-               'radio_discovered' AS source, spotify_album_art_url AS artwork_url
+               'radio_discovered' AS source, spotify_album_art_url AS artwork_url, last_played_reason, last_played_engine
         FROM radio_discovered_tracks
         WHERE last_played_at IS NOT NULL
         ORDER BY last_played_at DESC
@@ -2146,8 +2185,10 @@ async def get_play_log(limit: int = 2000, db: psycopg2.extensions.connection = D
             "played_at": last_played_at.strftime("%Y-%m-%d %H:%M:%S"),
             "source": source,
             "artwork_url": artwork_url,
+            "reason": reason,
+            "engine": engine,
         }
-        for known_track_id, track_name, artist_name, last_played_at, source, artwork_url in rows
+        for known_track_id, track_name, artist_name, last_played_at, source, artwork_url, reason, engine in rows
     ]
 
 @app.get("/api/spotify/prewarm/stats")
@@ -2182,13 +2223,16 @@ async def get_spotify_search_budget():
     _learn_from_quota_exceeded) and back up once a day after a clean
     stretch (database.maybe_recover_spotify_quota_estimate) -
     last_adjusted_at/last_adjustment_reason show when/why it last moved,
-    if ever. "used" counts since midnight America/New_York, not a rolling
-    24h window, so it resets for free at that boundary. Polled by the
-    Radio tab's traffic-light meter and shown alongside the Cleanup tab's
+    if ever. "used" counts since the last reset - per explicit user
+    request, that's only ever a real, confirmed QUOTA_EXCEEDED transition
+    (spotify_connect._learn_from_quota_exceeded/database.reset_search_count),
+    NOT a calendar-day boundary - so it keeps climbing across midnight and
+    across days until Spotify actually pushes back. Polled by the Radio
+    tab's traffic-light meter and shown alongside the Cleanup tab's
     prewarm status, since every Spotify-search consumer in the app
     (Discover, Radio, library matching, both prewarm jobs) shares all of
     this."""
-    used = count_searches_since_ny_midnight()
+    used = count_searches_since_last_reset()
     blocked_seconds = spotify_connect.search_block_remaining_seconds()
     quota_state = get_spotify_quota_state()
     return {
@@ -2832,11 +2876,11 @@ class RadioStartResponse(BaseModel):
     # nothing to queue/play itself for that destination, it just polls
     # /api/ytmusic/push-job/status using this id's job.
     ytmusic_push_job_id: Optional[int] = None
-    # True when Spotify's search is rate-limited or this session's share of
-    # the self-imposed budget is spent, so this batch is cached-library-only
-    # (see radio_engine.generate_radio_batch_for_spotify) rather than fresh
-    # Last.fm suggestions - always False for browser/ytmusic destinations,
-    # which never touch Spotify's search at all.
+    # True only when both of radio_engine.generate_radio_batch_track_first's
+    # Last.fm-driven tiers (track-level recursion, then the artist-level
+    # reserve) came up genuinely empty and it had to fall back to an
+    # untargeted cached-library track - always False for browser/ytmusic
+    # destinations, which never touch Spotify's search at all.
     degraded: bool = False
 
 class RadioMoreResponse(BaseModel):
@@ -2878,7 +2922,7 @@ def start_radio(params: RadioStartRequest, db: psycopg2.extensions.connection = 
 
     # spotify_native seeds Spotify's own account-level autoplay with a single
     # track and leaves it entirely alone from there - it never needs a batch
-    # of its own candidates at all (no Last.fm call, no generate_radio_batch_for_spotify),
+    # of its own candidates at all (no Last.fm call, no generate_radio_batch_track_first),
     # unlike 'discovery' which drives every track itself.
     if engine == 'spotify_native':
         session_id = create_radio_session(
@@ -2897,8 +2941,21 @@ def start_radio(params: RadioStartRequest, db: psycopg2.extensions.connection = 
     # track_name/artist_name reconstruction.
     initial_seen = [seed_key] if seed_key else []
     degraded = False
+    track_frontier = []
+    fallback_expanded_artists = []
     if params.destination_type == 'spotify':
-        track_dicts, degraded = radio_engine.generate_radio_batch_for_spotify(params.seed_artists, initial_seen, 15, db)
+        # No session row exists yet to read persisted track_frontier/
+        # fallback_expanded_artists from - a bare in-memory stand-in with
+        # just the seed info is enough for generate_radio_batch_track_first
+        # to bootstrap its own frontier from scratch (see
+        # radio_engine._bootstrap_track_frontier).
+        pending_session = {
+            'seed_artists': params.seed_artists, 'seed_track_name': params.seed_track_name,
+            'seed_artist_name': params.seed_artist_name, 'track_frontier': [], 'fallback_expanded_artists': [],
+        }
+        track_dicts, track_frontier, fallback_expanded_artists, degraded = radio_engine.generate_radio_batch_track_first(
+            pending_session, initial_seen, 15, db,
+        )
     else:
         track_dicts = radio_engine.generate_fresh_radio_tracks(params.seed_artists, params.destination_type, initial_seen, 15, db)
     seen_keys = [radio_engine.radio_track_key(t['track_name'], t['artist_name']) for t in track_dicts]
@@ -2911,9 +2968,14 @@ def start_radio(params: RadioStartRequest, db: psycopg2.extensions.connection = 
         seed_artists=params.seed_artists,
         destination_type=params.destination_type,
         seen_track_keys=seen_keys,
+        seed_track_name=params.seed_track_name,
+        seed_artist_name=params.seed_artist_name,
+        track_frontier=track_frontier,
     )
     if session_id is None:
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Could not start a radio session")
+    if fallback_expanded_artists:
+        set_radio_session_track_state(session_id, track_frontier, fallback_expanded_artists)
 
     if params.destination_type == 'ytmusic':
         if not ytmusic_connect.is_connected():
@@ -2946,9 +3008,10 @@ def get_more_radio_tracks(session_id: int, params: RadioMoreRequest, db: psycopg
     count = max(1, min(params.count or 10, 30))
     degraded = False
     if session['destination_type'] == 'spotify':
-        track_dicts, degraded = radio_engine.generate_radio_batch_for_spotify(
-            session['seed_artists'], session['seen_track_keys'] or [], count, db,
+        track_dicts, track_frontier, fallback_expanded_artists, degraded = radio_engine.generate_radio_batch_track_first(
+            session, session['seen_track_keys'] or [], count, db,
         )
+        set_radio_session_track_state(session_id, track_frontier, fallback_expanded_artists)
     else:
         track_dicts = radio_engine.generate_fresh_radio_tracks(
             session['seed_artists'], session['destination_type'], session['seen_track_keys'] or [], count, db,

@@ -78,7 +78,9 @@ def create_tables():
                     ADD COLUMN IF NOT EXISTS isrc TEXT,
                     ADD COLUMN IF NOT EXISTS ytmusic_video_id TEXT,
                     ADD COLUMN IF NOT EXISTS ytmusic_checked BOOLEAN DEFAULT FALSE,
-                    ADD COLUMN IF NOT EXISTS last_played_at TIMESTAMP;
+                    ADD COLUMN IF NOT EXISTS last_played_at TIMESTAMP,
+                    ADD COLUMN IF NOT EXISTS last_played_reason TEXT,
+                    ADD COLUMN IF NOT EXISTS last_played_engine TEXT;
             """)
             cur.execute("""
                 ALTER TABLE known_tracks
@@ -292,6 +294,23 @@ def create_tables():
             # tracks after it, at near-zero ongoing /search cost since
             # nothing past the seed goes through this app's own matching.
             cur.execute("ALTER TABLE radio_session ADD COLUMN IF NOT EXISTS engine TEXT NOT NULL DEFAULT 'discovery';")
+            # Track-first 'discovery' engine state (radio_engine.generate_radio_batch_track_first) -
+            # seed_track_name/seed_artist_name is the literal seed track (when
+            # one exists) that track_frontier bootstraps from. track_frontier
+            # is the persisted BFS queue of {artist_name, track_name, depth}
+            # dicts still awaiting a track.getSimilar call - has to survive
+            # across /more calls and playback_advancer refill ticks the same
+            # way seen_track_keys already does, or every call would restart
+            # the walk from the seed instead of continuing it.
+            # fallback_expanded_artists tracks which artists the artist-level
+            # reserve tier (points 1+2+3 - wider similar-artists, deeper
+            # top-tracks, neighborhood expansion) has already pulled from, so
+            # a later fallback trigger doesn't redundantly re-expand the same
+            # artist.
+            cur.execute("ALTER TABLE radio_session ADD COLUMN IF NOT EXISTS seed_track_name TEXT;")
+            cur.execute("ALTER TABLE radio_session ADD COLUMN IF NOT EXISTS seed_artist_name TEXT;")
+            cur.execute("ALTER TABLE radio_session ADD COLUMN IF NOT EXISTS track_frontier JSONB DEFAULT '[]'::jsonb;")
+            cur.execute("ALTER TABLE radio_session ADD COLUMN IF NOT EXISTS fallback_expanded_artists JSONB DEFAULT '[]'::jsonb;")
             print("Table 'radio_session' checked/created successfully.")
 
             # One row per real (non-short-circuited) Spotify /search call -
@@ -340,6 +359,18 @@ def create_tables():
             # only ever evaluates once per day.
             cur.execute("ALTER TABLE spotify_quota_estimate ADD COLUMN IF NOT EXISTS blocked_until TIMESTAMP;")
             cur.execute("ALTER TABLE spotify_quota_estimate ADD COLUMN IF NOT EXISTS last_recovery_check_date DATE;")
+            # Anchor for the "used" search counter (count_searches_since_last_reset) -
+            # per explicit user request, this counter must NOT reset at NY
+            # midnight just because a new calendar day started (confirmed
+            # live it previously did, via the now-removed
+            # count_searches_since_ny_midnight/_ny_midnight_as_naive_utc
+            # boundary) - only a real, confirmed QUOTA_EXCEEDED transition
+            # is meaningful evidence the count so far is done mattering
+            # (spotify_connect._learn_from_quota_exceeded calls
+            # reset_search_count right after learning from one). Defaults to
+            # NOW() so an existing/fresh install starts counting from
+            # whenever this migration runs, not further back.
+            cur.execute("ALTER TABLE spotify_quota_estimate ADD COLUMN IF NOT EXISTS search_count_reset_at TIMESTAMP DEFAULT NOW();")
             print("Table 'spotify_quota_estimate' checked/created successfully.")
 
             # A manual, explicit "stop consuming search budget" switch for
@@ -443,6 +474,8 @@ def create_tables():
                 CREATE INDEX IF NOT EXISTS radio_discovered_tracks_artist_idx
                     ON radio_discovered_tracks (LOWER(artist_name));
             """)
+            cur.execute("ALTER TABLE radio_discovered_tracks ADD COLUMN IF NOT EXISTS last_played_reason TEXT;")
+            cur.execute("ALTER TABLE radio_discovered_tracks ADD COLUMN IF NOT EXISTS last_played_engine TEXT;")
             print("Table 'radio_discovered_tracks' checked/created successfully.")
 
             # Single settable knob for Radio's own play-cooldown - a track
@@ -1072,12 +1105,51 @@ def _record_track_played(cur, now_playing):
     whether this tab or playback_advancer's own background thread changed
     now_playing - already funnels through, so this covers all of them at
     once rather than needing a hook at every individual play/queue call
-    site."""
+    site.
+
+    Also stamps last_played_reason/last_played_engine - two separate axes,
+    not one conflated string: reason is *why* this specific play was picked
+    ("Discovered - similar track", "library fallback", "Radio seed", ...),
+    engine is *which mechanism* produced it ("Last.fm", "App logic",
+    "Spotify", or blank when nothing was actually recommended - a direct
+    click, a playlist track). now_playing['selection_reason']/
+    ['selection_engine'] carry these when a caller set them explicitly
+    (radio_engine.generate_radio_batch_track_first tags every candidate it
+    produces, threaded through by playback_advancer into the found/
+    now_playing dict) - otherwise this falls back to a sensible label built
+    from whichever other tag is already present on now_playing, so the Play
+    Log always has something meaningful to show even for play paths that
+    don't set these explicitly (a plain library click, a Spotify/YT Music
+    playlist track, a Discover pick)."""
     played_at = now_ny_naive()
+    reason = now_playing.get('selection_reason')
+    engine = now_playing.get('selection_engine')
+    if not reason:
+        if now_playing.get('radio_session_id') is not None:
+            # The literal seed track/artist the user picked to start a
+            # session with - App.js's resolveSeedTrackForPlayback tags this
+            # explicitly too, this is the fallback for whenever that
+            # somehow didn't reach here (e.g. a stale frontend bundle).
+            reason = 'Radio seed'
+        elif now_playing.get('discover_id') is not None:
+            reason, engine = 'Discover suggestion', (engine or 'Last.fm')
+        elif now_playing.get('ytmusic_id') is not None:
+            reason = 'YouTube Music playlist'
+        elif now_playing.get('playlist_name'):
+            reason = f"Playlist: {now_playing['playlist_name']}"
+        else:
+            # A genuine local-file play, or a library track cast to
+            # Spotify/matched from a playlist (origin_library) - either
+            # way, a plain direct play with no recommendation engine
+            # involved at all.
+            reason = 'library playback'
     radio_track_id = now_playing.get('radio_track_id')
     if radio_track_id is not None:
         try:
-            cur.execute("UPDATE radio_discovered_tracks SET last_played_at = %s WHERE id = %s", (played_at, radio_track_id))
+            cur.execute(
+                "UPDATE radio_discovered_tracks SET last_played_at = %s, last_played_reason = %s, last_played_engine = %s WHERE id = %s",
+                (played_at, reason, engine, radio_track_id),
+            )
         except Error as e:
             print(f"Error recording last played time for discovered track {radio_track_id}: {e}")
         return
@@ -1087,7 +1159,10 @@ def _record_track_played(cur, now_playing):
     if known_track_id is None:
         return
     try:
-        cur.execute("UPDATE known_tracks SET last_played_at = %s WHERE id = %s", (played_at, known_track_id))
+        cur.execute(
+            "UPDATE known_tracks SET last_played_at = %s, last_played_reason = %s, last_played_engine = %s WHERE id = %s",
+            (played_at, reason, engine, known_track_id),
+        )
     except Error as e:
         print(f"Error recording last played time for track {known_track_id}: {e}")
 
@@ -1382,11 +1457,18 @@ def clear_playback_session():
 RADIO_SEEN_TRACK_KEYS_CAP = 500
 
 
-def create_radio_session(seed_type, seed_description, seed_artists, destination_type, seen_track_keys, engine='discovery'):
+def create_radio_session(seed_type, seed_description, seed_artists, destination_type, seen_track_keys, engine='discovery',
+                          seed_track_name=None, seed_artist_name=None, track_frontier=None):
     """Starts a new radio_session row. seen_track_keys is the caller's
     already-lowercased list of "track|||artist" keys for the first batch of
     tracks it just generated, so a subsequent /more call's dedup starts from
     a non-empty set rather than repeating the very first batch.
+
+    seed_track_name/seed_artist_name/track_frontier are the track-first
+    engine's own persisted state (see radio_engine.generate_radio_batch_track_first) -
+    None/empty for a spotify_native session or one with no literal seed
+    track, in which case the generator bootstraps its own starting track on
+    the first call that needs one.
 
     Retires every other still-'active' session first, in the same
     transaction - this is a personal single-user tool, so only one radio
@@ -1404,10 +1486,14 @@ def create_radio_session(seed_type, seed_description, seed_artists, destination_
         cur = conn.cursor()
         cur.execute("UPDATE radio_session SET status = 'stopped', updated_at = NOW() WHERE status = 'active'")
         cur.execute("""
-            INSERT INTO radio_session (seed_type, seed_description, seed_artists, seen_track_keys, destination_type, engine, status)
-            VALUES (%s, %s, %s, %s, %s, %s, 'active')
+            INSERT INTO radio_session (seed_type, seed_description, seed_artists, seen_track_keys, destination_type, engine, status,
+                                        seed_track_name, seed_artist_name, track_frontier)
+            VALUES (%s, %s, %s, %s, %s, %s, 'active', %s, %s, %s)
             RETURNING id
-        """, (seed_type, seed_description, Json(seed_artists), Json(seen_track_keys[-RADIO_SEEN_TRACK_KEYS_CAP:]), destination_type, engine))
+        """, (
+            seed_type, seed_description, Json(seed_artists), Json(seen_track_keys[-RADIO_SEEN_TRACK_KEYS_CAP:]), destination_type, engine,
+            seed_track_name, seed_artist_name, Json(track_frontier or []),
+        ))
         session_id = cur.fetchone()[0]
         conn.commit()
         cur.close()
@@ -1427,7 +1513,8 @@ def get_radio_session(session_id):
         cur = conn.cursor()
         cur.execute("""
             SELECT id, seed_type, seed_description, seed_artists, seen_track_keys, destination_type,
-                   ytmusic_playlist_id, ytmusic_push_job_id, status, engine
+                   ytmusic_playlist_id, ytmusic_push_job_id, status, engine,
+                   seed_track_name, seed_artist_name, track_frontier, fallback_expanded_artists
             FROM radio_session WHERE id = %s
         """, (session_id,))
         row = cur.fetchone()
@@ -1438,6 +1525,8 @@ def get_radio_session(session_id):
             'id': row[0], 'seed_type': row[1], 'seed_description': row[2], 'seed_artists': row[3],
             'seen_track_keys': row[4], 'destination_type': row[5], 'ytmusic_playlist_id': row[6],
             'ytmusic_push_job_id': row[7], 'status': row[8], 'engine': row[9],
+            'seed_track_name': row[10], 'seed_artist_name': row[11],
+            'track_frontier': row[12] or [], 'fallback_expanded_artists': row[13] or [],
         }
     except Error as e:
         print(f"Error reading radio session {session_id}: {e}")
@@ -1472,6 +1561,29 @@ def append_seen_track_keys(session_id, new_keys):
         cur.close()
     except Error as e:
         print(f"Error appending seen track keys for radio session {session_id}: {e}")
+    finally:
+        if conn:
+            conn.close()
+
+
+def set_radio_session_track_state(session_id, track_frontier, fallback_expanded_artists):
+    """Overwrite (not merge) - unlike seen_track_keys, both of these are
+    whole-state snapshots the generator recomputes in full on every call
+    (radio_engine.generate_radio_batch_track_first pops from/pushes onto its
+    own in-memory copy of track_frontier during a single call, and this just
+    persists wherever it ended up), not accumulating sets."""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE radio_session SET track_frontier = %s, fallback_expanded_artists = %s, updated_at = NOW() WHERE id = %s",
+            (Json(track_frontier), Json(fallback_expanded_artists), session_id),
+        )
+        conn.commit()
+        cur.close()
+    except Error as e:
+        print(f"Error saving track-first state for radio session {session_id}: {e}")
     finally:
         if conn:
             conn.close()
@@ -1534,16 +1646,18 @@ def has_active_spotify_radio_session():
 
 def record_spotify_search():
     """Logs one real (non-short-circuited) Spotify /search call - see
-    spotify_connect.py's _search_and_score. Prunes rows older than 24h on
-    every insert so this never needs a separate cleanup job; nothing reads
-    further back than the rolling window it's checked against
-    (SEARCH_BUDGET_WINDOW_MINUTES)."""
+    spotify_connect.py's _search_and_score. No time-based pruning here
+    (deliberately removed) - count_searches_since_last_reset() below can
+    legitimately need to count back across multiple calendar days now (a
+    QUOTA_EXCEEDED might not happen for a while), so an unconditional "older
+    than 24h" delete would have silently capped that count regardless of
+    the real reset anchor. reset_search_count() is what actually prunes,
+    once a row is genuinely unreachable (older than the current anchor)."""
     conn = None
     try:
         conn = get_db_connection()
         cur = conn.cursor()
         cur.execute("INSERT INTO spotify_search_log DEFAULT VALUES")
-        cur.execute("DELETE FROM spotify_search_log WHERE requested_at < NOW() - INTERVAL '24 hours'")
         conn.commit()
         cur.close()
     except Error as e:
@@ -1578,23 +1692,75 @@ def _ny_midnight_as_naive_utc(days_ago=0):
     return start_ny.astimezone(timezone.utc).replace(tzinfo=None)
 
 
-def count_searches_since_ny_midnight():
-    """How many real Spotify /search calls have been logged since midnight,
-    America/New_York - the daily counter resets for free at that boundary
-    (nothing to explicitly clear - rows before it just fall outside the
-    query), per the user's request to align the day boundary to NY time
-    rather than a rolling 24h window."""
+def _get_search_count_reset_at(cur):
+    """Reads the persisted anchor for count_searches_since_last_reset,
+    self-healing the same way get_spotify_quota_estimate does if the row
+    doesn't exist yet. Takes an already-open cursor rather than opening its
+    own connection - always called from within another function's
+    transaction (count_searches_since_last_reset, reset_search_count)."""
+    cur.execute("SELECT search_count_reset_at FROM spotify_quota_estimate WHERE id = 1")
+    row = cur.fetchone()
+    if row is not None and row[0] is not None:
+        return row[0]
+    now = datetime.utcnow()
+    cur.execute(
+        "INSERT INTO spotify_quota_estimate (id, search_count_reset_at) VALUES (1, %s) "
+        "ON CONFLICT (id) DO UPDATE SET search_count_reset_at = COALESCE(spotify_quota_estimate.search_count_reset_at, EXCLUDED.search_count_reset_at)",
+        (now,),
+    )
+    return now
+
+
+def count_searches_since_last_reset():
+    """How many real Spotify /search calls have been logged since the last
+    reset anchor - NOT a calendar-day boundary (see search_count_reset_at's
+    own comment on the table migration): per explicit user request, this
+    must only ever reset on a real, confirmed QUOTA_EXCEEDED transition
+    (spotify_connect._learn_from_quota_exceeded calls reset_search_count),
+    never just because a new NY day started."""
     conn = None
     try:
         conn = get_db_connection()
         cur = conn.cursor()
-        cur.execute("SELECT COUNT(*) FROM spotify_search_log WHERE requested_at >= %s", (_ny_midnight_as_naive_utc(),))
+        reset_at = _get_search_count_reset_at(cur)
+        conn.commit()
+        cur.execute("SELECT COUNT(*) FROM spotify_search_log WHERE requested_at >= %s", (reset_at,))
         count = cur.fetchone()[0]
         cur.close()
         return count
     except Error as e:
-        print(f"Error counting today's Spotify searches: {e}")
+        print(f"Error counting Spotify searches since last reset: {e}")
         return 0
+    finally:
+        if conn:
+            conn.close()
+
+
+def reset_search_count(reason):
+    """Moves the "used" counter's reset anchor forward to now, and prunes
+    every spotify_search_log row older than it (they're now permanently
+    unreachable - nothing will ever query further back than the current
+    anchor again, so there's no reason to keep them, same role the old
+    24h-rolling prune used to serve, just tied to a real event instead of a
+    fixed window). Called only from spotify_connect._learn_from_quota_exceeded,
+    right after a genuine new QUOTA_EXCEEDED transition - never on a timer,
+    never at a calendar boundary."""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        now = datetime.utcnow()
+        cur.execute(
+            "INSERT INTO spotify_quota_estimate (id, search_count_reset_at) VALUES (1, %s) "
+            "ON CONFLICT (id) DO UPDATE SET search_count_reset_at = EXCLUDED.search_count_reset_at",
+            (now,),
+        )
+        cur.execute("DELETE FROM spotify_search_log WHERE requested_at < %s", (now,))
+        conn.commit()
+        cur.close()
+        print(f"Spotify search counter reset: {reason}")
+    except Error as e:
+        print(f"Error resetting Spotify search counter: {e}")
     finally:
         if conn:
             conn.close()
@@ -1900,6 +2066,42 @@ def set_radio_cooldown_days(days):
         cur.close()
     except Error as e:
         print(f"Error setting radio cooldown days: {e}")
+    finally:
+        if conn:
+            conn.close()
+
+
+def get_recently_played_keys(cutoff):
+    """{"track|||artist", ...} for every known_tracks/radio_discovered_tracks
+    row whose last_played_at falls within the cooldown window (i.e. >=
+    cutoff) - used by radio_engine.generate_radio_batch_track_first to
+    exclude a recently-played track from fresh Last.fm-driven suggestions
+    too, not just from the cached-library tiers (find_cached_artist_tracks
+    etc. already exclude these via their own SQL WHERE clause, but a track
+    surfaced by track.getSimilar/artist-fallback text has no such query to
+    filter it - this set is what lets the generator drop it just as early).
+    Inlines the same "track|||artist" normalization radio_engine.radio_track_key
+    uses rather than importing that module - see upsert_radio_discovered_track's
+    own comment on why database.py never imports radio_engine.py."""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT track_name, artist_name FROM known_tracks WHERE last_played_at >= %s",
+            (cutoff,),
+        )
+        rows = cur.fetchall()
+        cur.execute(
+            "SELECT track_name, artist_name FROM radio_discovered_tracks WHERE last_played_at >= %s",
+            (cutoff,),
+        )
+        rows += cur.fetchall()
+        cur.close()
+        return {f"{track_name.strip().lower()}|||{artist_name.strip().lower()}" for track_name, artist_name in rows}
+    except Error as e:
+        print(f"Error reading recently-played keys: {e}")
+        return set()
     finally:
         if conn:
             conn.close()

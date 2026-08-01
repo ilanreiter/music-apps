@@ -47,6 +47,23 @@ MAX_SIMILAR_ARTISTS_PER_SEED_BY_RANK = SIMILAR_ARTISTS_PER_SEED
 # still vary without reaching into the weak tail of the pool at all.
 SHORTLIST_SIZE = 25
 
+# track.getSimilar's own "match" score has the exact same relative-to-the-
+# best-match compression MIN_ARTIST_MATCH_SCORE's own comment describes for
+# artists - confirmed live: track.getSimilar(ABBA, "Dancing Queen") scored
+# "Mamma Mia" (the same artist's own other song) 1.0, compressing everything
+# else (Gloria Gaynor 0.35, Earth Wind & Fire 0.35, Michael Jackson 0.29...)
+# well below what a strict cutoff would keep. Same fix, same reasoning: a
+# low floor for genuinely unrelated noise only, not a quality bar.
+MIN_TRACK_MATCH_SCORE = 0.10
+# How many similar tracks to pull per track.getSimilar call - this is
+# radio_engine.generate_radio_batch_track_first's primary discovery
+# mechanism (track-level, not artist-level), so it doesn't need the same
+# over-fetch-then-rank-cap pattern SIMILAR_ARTISTS_PER_SEED/
+# MAX_SIMILAR_ARTISTS_PER_SEED_BY_RANK use - each track.getSimilar call
+# already returns its own independent ranked list, not one that gets merged
+# with other seeds' lists the way artist-level similarity does.
+TRACK_SIMILAR_LIMIT = 15
+
 
 def is_configured():
     return bool(LASTFM_API_KEY)
@@ -100,6 +117,39 @@ def _get_top_tracks(artist_name, limit=TOP_TRACKS_PER_ARTIST):
         return []
     tracks = ((data.get('toptracks') or {}).get('track')) or []
     return [t['name'] for t in tracks if t.get('name')]
+
+
+def track_similar_tracks(artist_name, track_name, limit=TRACK_SIMILAR_LIMIT):
+    """[{'track_name', 'artist_name', 'match'}, ...] similar to this exact
+    track - a genuinely different signal from artist-level similarity (see
+    MIN_TRACK_MATCH_SCORE's own comment): reaches material by artists that
+    would never show up via artist.getSimilar at all (confirmed live:
+    track.getSimilar(ABBA, "Dancing Queen") surfaced Michael Jackson and
+    Earth Wind & Fire, neither anywhere near ABBA's own top-50 similar-
+    artist list). This is radio_engine.generate_radio_batch_track_first's
+    primary mechanism - see that function for how repeatedly calling this on
+    each newly-discovered track (rather than just once per seed) is what
+    makes the pool functionally unbounded instead of capped at one artist
+    neighborhood's own top-N tracks. Filtered by MIN_TRACK_MATCH_SCORE,
+    ordered strongest-match-first (Last.fm's own order, not re-sorted)."""
+    data = _request('track.getSimilar', artist=artist_name, track=track_name, limit=limit, autocorrect=1)
+    if not data:
+        return []
+    tracks = ((data.get('similartracks') or {}).get('track')) or []
+    results = []
+    for t in tracks:
+        name = t.get('name')
+        artist = (t.get('artist') or {}).get('name')
+        if not name or not artist:
+            continue
+        try:
+            match = float(t.get('match') or 0)
+        except (TypeError, ValueError):
+            match = 0.0
+        if match < MIN_TRACK_MATCH_SCORE:
+            continue
+        results.append({'track_name': name, 'artist_name': artist, 'match': match})
+    return results
 
 
 def _pick_top_track(top_tracks):
