@@ -3067,6 +3067,28 @@ function App() {
       return;
     }
     setRadioStatus(null);
+    // Confirmed live this matters: leftover residue from an earlier session
+    // (or a real context still active on the device from outside this app
+    // entirely) can survive the cast effect's own clear_queue:true and
+    // resurface as "Radio started, but it's still playing the old thing" -
+    // see spotify_connect.clear_queue's own comment. Doing an explicit,
+    // awaited drain here first - before either engine's own start flow
+    // even begins - means the device is verified clear (or as clear as the
+    // adaptive multi-round drain can get it) before anything new is asked
+    // to play on it, rather than racing a fire-and-forget drain against
+    // the actual play command the way the generic cast effect alone does.
+    // Only meaningful for a real Spotify Connect device - "This Browser"
+    // has no device-side queue at all, and ytmusic pushes to a playlist,
+    // not a live device.
+    if (destinationType === 'spotify' && outputDevice) {
+      setRadioStatus('Clearing the queue before starting…');
+      try {
+        await axios.post(`${API_BASE_URL}/spotify/devices/${outputDevice.id}/clear-queue`);
+      } catch (err) {
+        console.error('Error clearing the Spotify queue before starting radio:', err);
+      }
+      setRadioStatus(null);
+    }
     if (seed.engine === 'spotify_native' && destinationType === 'spotify') {
       return startNativeSpotifyRadio(seed, destinationType);
     }
@@ -3185,15 +3207,27 @@ function App() {
     // rather than waiting for the advancer to notice the session was
     // stopped (it only checks on its next refill, once whatever's already
     // loaded runs out) or for some other action to naturally replace it.
-    // Whatever's currently playing/already queued keeps playing out - this
-    // only stops *future* refilling.
+    // Whatever's currently *playing* keeps playing out (interrupting
+    // mid-song would be its own jarring surprise) - but the lookahead
+    // buffer gets cleared too, not just the match pool. Confirmed live
+    // this was a real bug: clearing only spotify_match_pool left
+    // playback_advancer._advance_spotify's near-end branch with nothing
+    // to stop it - that branch's own "is this session still current" guard
+    // only checks the *match pool's* radio_session_id tag, and a cleared
+    // pool has none at all (reads as "not tied to any session, fine to
+    // play"), so it kept explicitly driving through whatever was still
+    // sitting in queue regardless of the session being stopped. Got more
+    // noticeable once the lookahead buffer deepened from 1 track to 2 -
+    // "Stop" started visibly playing two more tracks afterward instead of
+    // being barely perceptible.
     if (outputDevice?.type === 'spotify') {
       spotifyLookaheadRef.current = null;
+      setQueue([]);
       axios.post(`${API_BASE_URL}/playback-session`, {
         destination_type: outputDevice.type,
         destination_id: outputDevice.id,
         now_playing: nowPlaying,
-        queue: queue.slice(0, QUEUE_PERSIST_CAP),
+        queue: [],
         shuffle_enabled: shuffleEnabled,
         clear_spotify_match_pool: true,
       }).catch((err) => console.error('Error clearing radio pool:', err));
