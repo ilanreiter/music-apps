@@ -516,6 +516,16 @@ def create_tables():
                     cooldown_days INTEGER NOT NULL DEFAULT 7
                 );
             """)
+            # User-adjustable versions of lastfm.py's own tuning constants
+            # (MIN_TRACK_MATCH_SCORE/MIN_ARTIST_MATCH_SCORE/TRACK_SIMILAR_LIMIT/
+            # SIMILAR_ARTISTS_PER_SEED) - see get_radio_tuning/set_radio_tuning.
+            # Column defaults match those constants' own current values, so an
+            # existing row (or a fresh install that's never touched Settings)
+            # behaves identically to before this was made configurable.
+            cur.execute("ALTER TABLE radio_settings ADD COLUMN IF NOT EXISTS min_track_match_score REAL NOT NULL DEFAULT 0.10;")
+            cur.execute("ALTER TABLE radio_settings ADD COLUMN IF NOT EXISTS min_artist_match_score REAL NOT NULL DEFAULT 0.15;")
+            cur.execute("ALTER TABLE radio_settings ADD COLUMN IF NOT EXISTS track_similar_limit INTEGER NOT NULL DEFAULT 15;")
+            cur.execute("ALTER TABLE radio_settings ADD COLUMN IF NOT EXISTS similar_artists_per_seed INTEGER NOT NULL DEFAULT 10;")
             print("Table 'radio_settings' checked/created successfully.")
 
             # Cache for the Playlists tab's "All Tracks" mode - flattening
@@ -1318,7 +1328,17 @@ def take_pending_queue_adds():
     add_to_queue calls add during/after that drain starts counting fresh
     rather than being folded into what the drain was already accounting
     for. Returns 0 on any error, same as "nothing tracked" - clear_queue
-    still has its own flat floor/API-reported-length fallback either way."""
+    still has its own flat floor/API-reported-length fallback either way.
+
+    Resetting to 0 unconditionally here is deliberate and still correct -
+    see restore_pending_queue_adds, which clear_queue calls afterward with
+    whatever this batch didn't actually manage to drain (bounded by
+    CLEAR_QUEUE_SAFETY_CAP, or cut short by a superseding call). Without
+    that follow-up call, a backlog bigger than one bounded pass could reach
+    used to just vanish from tracking the moment this function ran, even
+    though it was still genuinely sitting in Spotify's real queue - the next
+    drain attempt (a new session, or a retry) started blind at 0 with no
+    memory a backlog was still owed."""
     conn = None
     try:
         conn = get_db_connection()
@@ -1332,6 +1352,31 @@ def take_pending_queue_adds():
     except Error as e:
         print(f"Error reading/resetting pending_queue_adds: {e}")
         return 0
+    finally:
+        if conn:
+            conn.close()
+
+
+def restore_pending_queue_adds(count):
+    """Adds count back onto pending_queue_adds (increment, not overwrite) -
+    called by clear_queue with whatever a drain didn't actually manage to
+    skip past. Increments rather than sets, since take_pending_queue_adds
+    already reset the live counter to 0 right as this drain started - any
+    add_to_queue calls that happened concurrently during the drain (a
+    different session/tick topping up its own lookahead) have already been
+    counted fresh into that counter by the time this runs, and should be
+    added to, not clobbered by, whatever this drain still owes."""
+    if count <= 0:
+        return
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("UPDATE playback_session SET pending_queue_adds = pending_queue_adds + %s WHERE id = 1", (count,))
+        conn.commit()
+        cur.close()
+    except Error as e:
+        print(f"Error restoring pending_queue_adds: {e}")
     finally:
         if conn:
             conn.close()
@@ -2212,6 +2257,63 @@ def set_radio_cooldown_days(days):
         cur.close()
     except Error as e:
         print(f"Error setting radio cooldown days: {e}")
+    finally:
+        if conn:
+            conn.close()
+
+
+def get_radio_tuning():
+    """The user-adjustable versions of lastfm.py's own MIN_TRACK_MATCH_SCORE/
+    MIN_ARTIST_MATCH_SCORE/TRACK_SIMILAR_LIMIT/SIMILAR_ARTISTS_PER_SEED
+    constants - lastfm.py reads this (not the bare constants) at call time,
+    so a change here takes effect on the next Last.fm call, no restart
+    needed. Self-seeds the row (using the same defaults as those constants,
+    matching this table's own column DEFAULTs) on first read, same pattern
+    as get_radio_cooldown_days."""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT min_track_match_score, min_artist_match_score, track_similar_limit, similar_artists_per_seed
+            FROM radio_settings WHERE id = 1
+        """)
+        row = cur.fetchone()
+        if row is None:
+            cur.execute("INSERT INTO radio_settings (id) VALUES (1) ON CONFLICT (id) DO NOTHING")
+            conn.commit()
+            row = (0.10, 0.15, 15, 10)
+        cur.close()
+        return {
+            'min_track_match_score': row[0], 'min_artist_match_score': row[1],
+            'track_similar_limit': row[2], 'similar_artists_per_seed': row[3],
+        }
+    except Error as e:
+        print(f"Error reading radio tuning settings: {e}")
+        return {'min_track_match_score': 0.10, 'min_artist_match_score': 0.15, 'track_similar_limit': 15, 'similar_artists_per_seed': 10}
+    finally:
+        if conn:
+            conn.close()
+
+
+def set_radio_tuning(min_track_match_score, min_artist_match_score, track_similar_limit, similar_artists_per_seed):
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO radio_settings (id, min_track_match_score, min_artist_match_score, track_similar_limit, similar_artists_per_seed)
+            VALUES (1, %s, %s, %s, %s)
+            ON CONFLICT (id) DO UPDATE SET
+                min_track_match_score = EXCLUDED.min_track_match_score,
+                min_artist_match_score = EXCLUDED.min_artist_match_score,
+                track_similar_limit = EXCLUDED.track_similar_limit,
+                similar_artists_per_seed = EXCLUDED.similar_artists_per_seed
+        """, (min_track_match_score, min_artist_match_score, track_similar_limit, similar_artists_per_seed))
+        conn.commit()
+        cur.close()
+    except Error as e:
+        print(f"Error setting radio tuning settings: {e}")
     finally:
         if conn:
             conn.close()

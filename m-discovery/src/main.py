@@ -18,7 +18,7 @@ from .database import (
     set_radio_session_ytmusic_job, stop_radio_session, append_tracks_to_ytmusic_push_job,
     has_active_spotify_radio_session, count_searches_since_last_reset, get_spotify_quota_state,
     set_prewarm_paused, is_prewarm_paused, upsert_radio_discovered_track,
-    get_radio_cooldown_days, set_radio_cooldown_days,
+    get_radio_cooldown_days, set_radio_cooldown_days, get_radio_tuning, set_radio_tuning,
 )
 from .library_scanner import run_scan
 from .artwork import get_or_create_thumbnail, check_artwork_presence, cache_key_for, normalize_album_name, normalized_album_sql, save_thumbnail
@@ -2148,6 +2148,35 @@ async def set_radio_cooldown_days_route(params: RadioCooldownRequest):
     set_radio_cooldown_days(params.cooldown_days)
     return {"cooldown_days": params.cooldown_days}
 
+class RadioTuning(BaseModel):
+    min_track_match_score: float
+    min_artist_match_score: float
+    track_similar_limit: int
+    similar_artists_per_seed: int
+
+@app.get("/api/radio/tuning", response_model=RadioTuning)
+async def get_radio_tuning_route():
+    """The user-adjustable versions of lastfm.py's own MIN_TRACK_MATCH_SCORE/
+    MIN_ARTIST_MATCH_SCORE/TRACK_SIMILAR_LIMIT/SIMILAR_ARTISTS_PER_SEED
+    constants - see database.get_radio_tuning and lastfm._tuning."""
+    return get_radio_tuning()
+
+@app.post("/api/radio/tuning", response_model=RadioTuning)
+async def set_radio_tuning_route(params: RadioTuning):
+    if not (0 <= params.min_track_match_score <= 1):
+        raise HTTPException(status_code=400, detail="min_track_match_score must be between 0 and 1")
+    if not (0 <= params.min_artist_match_score <= 1):
+        raise HTTPException(status_code=400, detail="min_artist_match_score must be between 0 and 1")
+    if not (1 <= params.track_similar_limit <= 50):
+        raise HTTPException(status_code=400, detail="track_similar_limit must be between 1 and 50")
+    if not (1 <= params.similar_artists_per_seed <= 50):
+        raise HTTPException(status_code=400, detail="similar_artists_per_seed must be between 1 and 50")
+    set_radio_tuning(
+        params.min_track_match_score, params.min_artist_match_score,
+        params.track_similar_limit, params.similar_artists_per_seed,
+    )
+    return params
+
 @app.get("/api/play-log")
 async def get_play_log(limit: int = 2000, db: psycopg2.extensions.connection = Depends(get_db)):
     """Every track with a recorded last_played_at (see database._record_track_played),
@@ -2927,6 +2956,12 @@ class RadioPlaylistItem(BaseModel):
     spotify_uri: Optional[str] = None
     radio_track_id: Optional[int] = None
     artwork_url: Optional[str] = None
+    # Last.fm's own track.getSimilar score (0-1, relative to the seed track
+    # it was found from - see lastfm.track_similar_tracks) - only present
+    # for a tier-1 (track-level) pick; None for a tier-2 artist-fallback or
+    # tier-3 library-fallback pick, which have no per-track similarity
+    # concept at all.
+    match: Optional[float] = None
 
 class RadioSessionInfo(BaseModel):
     id: int
@@ -3197,13 +3232,12 @@ def play_radio_session(session_id: int, params: RadioPlayRequest):
 
     # Spec point 1: clear, then actually verify it's clear - today's
     # pre-start clear (frontend, handleStartRadio) fires clear_queue_for_device
-    # and moves on with no readback at all. One extra bounded pass if the
-    # first one didn't fully settle (still bounded by clear_queue's own
-    # internal caps - not a retry loop).
-    spotify_connect.clear_queue_for_device(params.device_id)
-    verify = spotify_connect.get_queue()
-    if verify and verify.get('queue'):
-        spotify_connect.clear_queue_for_device(params.device_id)
+    # and moves on with no readback at all. clear_queue_for_device_verified
+    # is a genuine multi-attempt retry (see its own docstring), not just one
+    # extra hardcoded pass.
+    _drained, fully_cleared = spotify_connect.clear_queue_for_device_verified(params.device_id)
+    if not fully_cleared:
+        print(f"radio play {session_id}: queue still not empty on {params.device_id} after {spotify_connect.CLEAR_QUEUE_VERIFY_MAX_ATTEMPTS} clear attempts - starting anyway")
 
     first_item = playlist[0]
     match_result = playback_advancer.resolve_playlist_item(first_item)
@@ -3225,6 +3259,7 @@ def play_radio_session(session_id: int, params: RadioPlayRequest):
         'album_name': first_item.get('album_name'), 'artwork_url': match_result.get('artwork_url'),
         'radio_session_id': session_id,
         'selection_reason': first_item.get('selection_reason'), 'selection_engine': first_item.get('selection_engine'),
+        'match': first_item.get('match'),
     }
     if first_item.get('id') is not None:
         now_playing['local_id'] = first_item['id']
@@ -3278,10 +3313,9 @@ def switch_radio_device(session_id: int, params: RadioSwitchDeviceRequest):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="This radio session isn't the one currently playing")
 
     # Same clear-then-verify as /play.
-    spotify_connect.clear_queue_for_device(params.device_id)
-    verify = spotify_connect.get_queue()
-    if verify and verify.get('queue'):
-        spotify_connect.clear_queue_for_device(params.device_id)
+    _drained, fully_cleared = spotify_connect.clear_queue_for_device_verified(params.device_id)
+    if not fully_cleared:
+        print(f"radio switch-device {session_id}: queue still not empty on {params.device_id} after {spotify_connect.CLEAR_QUEUE_VERIFY_MAX_ATTEMPTS} clear attempts - switching anyway")
 
     play_result = spotify_connect.play_uris(params.device_id, [now_playing['uri']])
     if play_result == 'superseded':
@@ -3407,4 +3441,20 @@ def stop_radio(session_id: int):
     if session is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No radio session with that id")
     stop_radio_session(session_id)
+    if session['destination_type'] == 'spotify':
+        playback = get_playback_session() or {}
+        now_playing = playback.get('now_playing') or {}
+        if now_playing.get('radio_session_id') == session_id and playback.get('destination_id'):
+            # Actually pauses the device, not just stops feeding it new
+            # tracks - confirmed live this matters now: the pre-generated-
+            # playlist flow always keeps a couple of tracks already
+            # add_to_queue'd ahead of time on the real device, so letting
+            # the current track "just finish naturally" (the old behavior)
+            # rolled straight into that leftover committed queue and kept
+            # playing indefinitely - Stop looked like it did nothing at all.
+            # pause() also records this app's own play/pause intent
+            # (spotify_connect._desired_state) as 'pause', so
+            # playback_advancer's auto-resume health check won't silently
+            # undo this a few seconds later.
+            spotify_connect.pause(playback['destination_id'])
     return {"status": "stopped"}

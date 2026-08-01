@@ -38,6 +38,20 @@ body {
   padding: 20px;
 }
 
+/* Scoped to the Radio tab only (see App.js's activeTab check) - .app's own
+   900px cap is what actually kept every tab narrower than the player
+   control bar (.player-bar, width: 66.67% of the *viewport* - it's rendered
+   in .player-root, position: fixed spanning the full viewport, entirely
+   outside .app's own constrained width). Removing radio-section's own
+   sub-cap wasn't enough on a wide screen since .app's cap was still the
+   real bottleneck underneath it. 66.67vw mirrors player-bar's own width
+   formula directly, so they align at any viewport size instead of just
+   matching by coincidence at one specific width. Only radio, not every
+   tab, so Library/Play Log/etc. keep their existing 900px layout. */
+.app.app-radio-wide {
+  max-width: 66.67vw;
+}
+
 main.with-player {
   padding-bottom: 108px;
 }
@@ -436,6 +450,12 @@ main.with-player {
   white-space: nowrap;
 }
 
+.radio-playlist-match-col {
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
 .radio-playlist-action-btn {
   background: none;
   border: none;
@@ -471,6 +491,39 @@ main.with-player {
   font-size: 0.85rem;
   color: var(--text-muted);
   margin-bottom: 10px;
+}
+
+.radio-tuning-sliders {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.radio-tuning-row-label {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 0.85rem;
+  margin-bottom: 4px;
+}
+
+.radio-tuning-value {
+  color: var(--accent-hover);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.radio-tuning-row input[type="range"] {
+  width: 100%;
+  accent-color: var(--accent);
+}
+
+.radio-tuning-row .hint {
+  margin-top: 4px;
+}
+
+.radio-tuning-saved {
+  color: var(--accent-hover);
 }
 
 .device-list {
@@ -2985,8 +3038,13 @@ main.with-player {
 }
 
 .radio-section {
-  max-width: 720px;
-  margin: 0 auto;
+  /* Previously capped at 720px, narrower than every other tab (Library,
+     Play Log, etc. use the full .app content width) and noticeably
+     narrower than the player control bar below it (.player-bar,
+     width: 66.67% of the viewport) - most visible once the playlist
+     preview grid (RadioPlaylistPreview) was added, a wide table that
+     benefits from the extra room. Matches the other tabs' unconstrained
+     width instead. */
   padding: 8px 0 32px;
 }
 

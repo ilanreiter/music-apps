@@ -1424,6 +1424,24 @@ function App() {
       shuffleEnabled,
       outputDevice,
     });
+    // An active radio session on Spotify (either engine) is already kept
+    // correct server-side by /api/radio/{id}/play, /switch-device, and
+    // playback_advancer's own background loop, independent of this tab -
+    // *except* spotify_native, which still genuinely needs this exact
+    // effect to deliver its match pool once, right after it goes dirty (see
+    // the spotifyMatchPoolDirtyRef branch below - that's the only thing
+    // that ever sets spotify_match_pool for that engine at all). Skipping
+    // whenever nothing fresh is actually pending avoids echoing this tab's
+    // own *local* nowPlaying/queue snapshot back on every later poll-driven
+    // update - confirmed live that's a real race against a fresh /play call
+    // landing moments earlier: this tab's still-stale nowPlaying/queue (from
+    // before the new session started, or mid-transition) can resolve *after*
+    // /play's own save and silently clobber it back to the wrong session's
+    // content with a corrupted (over-length) queue. Same fix already applied
+    // to the generic cast-on-change effect and togglePlay's cold-cast branch
+    // (see their own comments) - this was a third, previously-missed call
+    // site doing the same unsafe echo-back.
+    if (nowPlaying?.radio_session_id != null && outputDevice?.type === 'spotify' && !spotifyMatchPoolDirtyRef.current) return;
     // Mirrors the same state server-side (playback_session table) so a
     // background job can keep advancing the queue even once this tab goes
     // to sleep - see src/playback_advancer.py. "This Browser" playback has
@@ -4226,7 +4244,7 @@ function App() {
   }
 
   return (
-    <div className="app">
+    <div className={`app${activeTab === 'radio' ? ' app-radio-wide' : ''}`}>
       <header className="app-header">
         <div className="app-brand">
           <svg className="app-logo" viewBox="0 0 64 64" aria-hidden="true">
@@ -5077,6 +5095,30 @@ function SettingsPanel({
 }) {
   const [prewarmStatus, setPrewarmStatus] = useState(null);
   const [matchPrewarmStatus, setMatchPrewarmStatus] = useState(null);
+  // Radio playlist tuning - the user-adjustable versions of lastfm.py's own
+  // MIN_TRACK_MATCH_SCORE/MIN_ARTIST_MATCH_SCORE/TRACK_SIMILAR_LIMIT/
+  // SIMILAR_ARTISTS_PER_SEED constants (see database.get_radio_tuning).
+  // Local state updates live while dragging a slider for instant feedback;
+  // the actual save only fires on release (onMouseUp/onTouchEnd/onKeyUp -
+  // range inputs' onChange fires continuously during a drag, which would
+  // otherwise mean one POST per pixel moved) - keyed the same way
+  // clearQueueResult etc. above are, one shared object rather than 4
+  // separate useState calls since these always load/save together.
+  const [radioTuning, setRadioTuning] = useState(null);
+  const [radioTuningSaved, setRadioTuningSaved] = useState(false);
+
+  useEffect(() => {
+    axios.get(`${apiBase}/radio/tuning`).then((r) => setRadioTuning(r.data)).catch(() => {});
+  }, [apiBase]);
+
+  const saveRadioTuning = (next) => {
+    axios.post(`${apiBase}/radio/tuning`, next)
+      .then(() => {
+        setRadioTuningSaved(true);
+        setTimeout(() => setRadioTuningSaved(false), 1500);
+      })
+      .catch((err) => console.error('Error saving radio tuning settings:', err));
+  };
   // Manual escape hatch for when a new session's automatic queue drain
   // still wasn't enough (see spotify_connect.clear_queue's own comment on
   // why an actively-refilling native context can outlast a single guessed
@@ -5247,6 +5289,87 @@ function SettingsPanel({
             onDisconnect={onYtMusicDisconnect}
             matchPrewarmStatus={matchPrewarmStatus}
           />
+        </div>
+
+        <div className="settings-section">
+          <label>Radio playlist tuning</label>
+          <p className="hint">
+            Controls how Radio's Last.fm Discover engine picks candidates when generating a playlist. These are deliberately low
+            by default - Last.fm's match score compresses relative to each seed's own single best match, so raising them much
+            further can starve results for a seed with one unusually strong match. Takes effect on the next generated playlist,
+            not a session already in progress.
+          </p>
+          {radioTuning === null ? (
+            <p className="hint">Loading…</p>
+          ) : (
+            <div className="radio-tuning-sliders">
+              <div className="radio-tuning-row">
+                <div className="radio-tuning-row-label">
+                  <span>Min track match score</span>
+                  <span className="radio-tuning-value">{Math.round(radioTuning.min_track_match_score * 100)}%</span>
+                </div>
+                <input
+                  type="range" min="0" max="0.5" step="0.01"
+                  value={radioTuning.min_track_match_score}
+                  onChange={(e) => setRadioTuning((prev) => ({ ...prev, min_track_match_score: Number(e.target.value) }))}
+                  onMouseUp={(e) => saveRadioTuning({ ...radioTuning, min_track_match_score: Number(e.target.value) })}
+                  onTouchEnd={(e) => saveRadioTuning({ ...radioTuning, min_track_match_score: Number(e.target.value) })}
+                  onKeyUp={(e) => saveRadioTuning({ ...radioTuning, min_track_match_score: Number(e.target.value) })}
+                />
+                <p className="hint">Floor for a track.getSimilar result to be kept at all (default 10%).</p>
+              </div>
+
+              <div className="radio-tuning-row">
+                <div className="radio-tuning-row-label">
+                  <span>Min artist match score</span>
+                  <span className="radio-tuning-value">{Math.round(radioTuning.min_artist_match_score * 100)}%</span>
+                </div>
+                <input
+                  type="range" min="0" max="0.5" step="0.01"
+                  value={radioTuning.min_artist_match_score}
+                  onChange={(e) => setRadioTuning((prev) => ({ ...prev, min_artist_match_score: Number(e.target.value) }))}
+                  onMouseUp={(e) => saveRadioTuning({ ...radioTuning, min_artist_match_score: Number(e.target.value) })}
+                  onTouchEnd={(e) => saveRadioTuning({ ...radioTuning, min_artist_match_score: Number(e.target.value) })}
+                  onKeyUp={(e) => saveRadioTuning({ ...radioTuning, min_artist_match_score: Number(e.target.value) })}
+                />
+                <p className="hint">Floor for an artist.getSimilar result to be kept, used by the artist-fallback tier (default 15%).</p>
+              </div>
+
+              <div className="radio-tuning-row">
+                <div className="radio-tuning-row-label">
+                  <span>Similar tracks per lookup</span>
+                  <span className="radio-tuning-value">{radioTuning.track_similar_limit}</span>
+                </div>
+                <input
+                  type="range" min="1" max="50" step="1"
+                  value={radioTuning.track_similar_limit}
+                  onChange={(e) => setRadioTuning((prev) => ({ ...prev, track_similar_limit: Number(e.target.value) }))}
+                  onMouseUp={(e) => saveRadioTuning({ ...radioTuning, track_similar_limit: Number(e.target.value) })}
+                  onTouchEnd={(e) => saveRadioTuning({ ...radioTuning, track_similar_limit: Number(e.target.value) })}
+                  onKeyUp={(e) => saveRadioTuning({ ...radioTuning, track_similar_limit: Number(e.target.value) })}
+                />
+                <p className="hint">How many candidates each track.getSimilar call asks for (default 15).</p>
+              </div>
+
+              <div className="radio-tuning-row">
+                <div className="radio-tuning-row-label">
+                  <span>Similar artists per seed</span>
+                  <span className="radio-tuning-value">{radioTuning.similar_artists_per_seed}</span>
+                </div>
+                <input
+                  type="range" min="1" max="50" step="1"
+                  value={radioTuning.similar_artists_per_seed}
+                  onChange={(e) => setRadioTuning((prev) => ({ ...prev, similar_artists_per_seed: Number(e.target.value) }))}
+                  onMouseUp={(e) => saveRadioTuning({ ...radioTuning, similar_artists_per_seed: Number(e.target.value) })}
+                  onTouchEnd={(e) => saveRadioTuning({ ...radioTuning, similar_artists_per_seed: Number(e.target.value) })}
+                  onKeyUp={(e) => saveRadioTuning({ ...radioTuning, similar_artists_per_seed: Number(e.target.value) })}
+                />
+                <p className="hint">How many candidates each artist.getSimilar call asks for (default 10).</p>
+              </div>
+
+              {radioTuningSaved && <p className="hint radio-tuning-saved">Saved.</p>}
+            </div>
+          )}
         </div>
       </div>
     </div>
@@ -6591,6 +6714,9 @@ function RadioPlaylistPreview({ session, onPlaylistChange, onReorder, onRemove, 
         })()}
       </td>
       <td className="play-log-reason" title={item.selection_reason || ''}>{item.selection_reason || '—'}</td>
+      <td className="radio-playlist-match-col" title={item.match != null ? "Last.fm's own similarity score, relative to the track it was found from - not comparable across different seeds" : ''}>
+        {item.match != null ? `${Math.round(item.match * 100)}%` : '—'}
+      </td>
     </tr>
   );
 
@@ -6615,6 +6741,7 @@ function RadioPlaylistPreview({ session, onPlaylistChange, onReorder, onRemove, 
               <th>Engine</th>
               <th>Source</th>
               <th>Reason</th>
+              <th title="Last.fm's own similarity score, relative to the track it was found from">Match</th>
             </tr>
           </thead>
           <tbody>

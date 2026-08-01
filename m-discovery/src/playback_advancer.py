@@ -553,6 +553,7 @@ def _advance_spotify_radio_playlist(save_session, destination_id, queue, radio_s
                     'track_name': item.get('track_name'), 'artist_name': item.get('artist_name'),
                     'album_name': item.get('album_name'), 'artwork_url': match_result.get('artwork_url'),
                     'selection_reason': item.get('selection_reason'), 'selection_engine': item.get('selection_engine'),
+                    'match': item.get('match'),
                     'radio_session_id': radio_session_id,
                     # Carried forward from the playlist item so main.py's
                     # /reorder and /remove routes can still address an

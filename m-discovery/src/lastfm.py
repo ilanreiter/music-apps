@@ -6,6 +6,7 @@ import requests
 # Reusing _normalize/_tokens_contained rather than a 4th copy of the same
 # word-containment logic - see _dedupe_seed_artists below for why it's needed.
 from . import spotify_connect
+from . import database
 
 REQUEST_TIMEOUT = 10
 LASTFM_API_KEY = os.environ.get('LASTFM_API_KEY')
@@ -65,6 +66,26 @@ MIN_TRACK_MATCH_SCORE = 0.10
 TRACK_SIMILAR_LIMIT = 15
 
 
+def _tuning():
+    """Live values for MIN_TRACK_MATCH_SCORE/MIN_ARTIST_MATCH_SCORE/
+    TRACK_SIMILAR_LIMIT/SIMILAR_ARTISTS_PER_SEED - user-adjustable via
+    Settings (see database.get_radio_tuning), read fresh on every call
+    rather than the bare module constants above so a Settings change takes
+    effect on the very next Last.fm call, no restart needed. The constants
+    themselves still document the original/default values and back this
+    table's own column defaults - they're just no longer what the code
+    below actually filters/limits by."""
+    return database.get_radio_tuning()
+
+
+def min_artist_match_score():
+    """Public accessor for the live min_artist_match_score - radio_engine.py's
+    artist-fallback tier reads this directly (the same floor
+    _get_similar_artists/discover_tracks already apply internally) rather
+    than a frozen module constant."""
+    return _tuning()['min_artist_match_score']
+
+
 def is_configured():
     return bool(LASTFM_API_KEY)
 
@@ -89,10 +110,12 @@ def _request(method, **params):
         return None
 
 
-def _get_similar_artists(artist_name, limit=SIMILAR_ARTISTS_PER_SEED):
+def _get_similar_artists(artist_name, limit=None):
     """[(name, match_score), ...] - match_score is Last.fm's own 0-1
     relative-similarity score for this seed artist, used below to filter out
     weak matches and weight selection toward the strong ones."""
+    if limit is None:
+        limit = _tuning()['similar_artists_per_seed']
     data = _request('artist.getSimilar', artist=artist_name, limit=limit, autocorrect=1)
     if not data:
         return []
@@ -119,7 +142,7 @@ def _get_top_tracks(artist_name, limit=TOP_TRACKS_PER_ARTIST):
     return [t['name'] for t in tracks if t.get('name')]
 
 
-def track_similar_tracks(artist_name, track_name, limit=TRACK_SIMILAR_LIMIT):
+def track_similar_tracks(artist_name, track_name, limit=None):
     """[{'track_name', 'artist_name', 'match'}, ...] similar to this exact
     track - a genuinely different signal from artist-level similarity (see
     MIN_TRACK_MATCH_SCORE's own comment): reaches material by artists that
@@ -132,6 +155,9 @@ def track_similar_tracks(artist_name, track_name, limit=TRACK_SIMILAR_LIMIT):
     makes the pool functionally unbounded instead of capped at one artist
     neighborhood's own top-N tracks. Filtered by MIN_TRACK_MATCH_SCORE,
     ordered strongest-match-first (Last.fm's own order, not re-sorted)."""
+    tuning = _tuning()
+    if limit is None:
+        limit = tuning['track_similar_limit']
     data = _request('track.getSimilar', artist=artist_name, track=track_name, limit=limit, autocorrect=1)
     if not data:
         return []
@@ -146,7 +172,7 @@ def track_similar_tracks(artist_name, track_name, limit=TRACK_SIMILAR_LIMIT):
             match = float(t.get('match') or 0)
         except (TypeError, ValueError):
             match = 0.0
-        if match < MIN_TRACK_MATCH_SCORE:
+        if match < tuning['min_track_match_score']:
             continue
         results.append({'track_name': name, 'artist_name': artist, 'match': match})
     return results
@@ -209,7 +235,7 @@ def _dedupe_seed_artists(seed_artists):
     return kept
 
 
-def similar_artist_names(seed_artists, limit_per_seed=SIMILAR_ARTISTS_PER_SEED):
+def similar_artist_names(seed_artists, limit_per_seed=None):
     """Flat, deduped list of artist names similar to seed_artists (just the
     names, no track lookups), filtered by MIN_ARTIST_MATCH_SCORE and capped
     per seed by MAX_SIMILAR_ARTISTS_PER_SEED_BY_RANK, ordered strongest-
@@ -219,13 +245,16 @@ def similar_artist_names(seed_artists, limit_per_seed=SIMILAR_ARTISTS_PER_SEED):
     fallback when Spotify's search is rate-limited: Last.fm itself isn't,
     so this still works to find more on-theme candidates when Spotify can't
     be searched at all)."""
+    tuning = _tuning()
+    if limit_per_seed is None:
+        limit_per_seed = tuning['similar_artists_per_seed']
     seed_artists = _dedupe_seed_artists(seed_artists)
     seed_set = {a.lower() for a in seed_artists}
     candidates = {}
     for seed_artist in seed_artists:
         ranked = [
             (name, match) for name, match in _get_similar_artists(seed_artist, limit=limit_per_seed)
-            if name.lower() not in seed_set and match >= MIN_ARTIST_MATCH_SCORE
+            if name.lower() not in seed_set and match >= tuning['min_artist_match_score']
         ]
         for name, match in ranked[:MAX_SIMILAR_ARTISTS_PER_SEED_BY_RANK]:
             key = name.lower()
@@ -262,6 +291,7 @@ def discover_tracks(seed_artists, target_count=10, tracks_per_artist=1):
     tracks_per_artist of their actual top tracks (deterministic, most-popular-
     first - unlike the single-track case, showing an artist's genuinely best-
     known songs together reads better than a random pick)."""
+    tuning = _tuning()
     seed_artists = _dedupe_seed_artists(seed_artists)
     seed_set = {a.lower() for a in seed_artists}
 
@@ -272,11 +302,11 @@ def discover_tracks(seed_artists, target_count=10, tracks_per_artist=1):
     # per seed artist too, not just a bigger shortlist to choose from. The
     # per-seed rank cap right below is what keeps that deeper pull from
     # translating into a proportionally larger share of the final pool.
-    per_seed_limit = max(SIMILAR_ARTISTS_PER_SEED, target_count * 2)
+    per_seed_limit = max(tuning['similar_artists_per_seed'], target_count * 2)
     for seed_artist in seed_artists:
         ranked = [
             (name, match) for name, match in _get_similar_artists(seed_artist, limit=per_seed_limit)
-            if name.lower() not in seed_set and match >= MIN_ARTIST_MATCH_SCORE
+            if name.lower() not in seed_set and match >= tuning['min_artist_match_score']
         ]
         for name, match in ranked[:MAX_SIMILAR_ARTISTS_PER_SEED_BY_RANK]:
             key = name.lower()

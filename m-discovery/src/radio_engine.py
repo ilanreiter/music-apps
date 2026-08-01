@@ -288,7 +288,7 @@ def _artist_fallback_candidates(session, artists_encountered, fallback_expanded)
                 'selection_reason': 'Discovered - similar artist', 'selection_engine': 'Last.fm',
             })
         for name, match in lastfm._get_similar_artists(artist, limit=ARTIST_FALLBACK_SIMILAR_LIMIT):
-            if match < lastfm.MIN_ARTIST_MATCH_SCORE or name.strip().lower() in expanded_lower:
+            if match < lastfm.min_artist_match_score() or name.strip().lower() in expanded_lower:
                 continue
             bootstrap = lastfm._get_top_tracks(name, limit=1)
             if not bootstrap:
@@ -371,12 +371,18 @@ def generate_radio_batch_track_first(session, seen_keys, count, db):
     collected = []
     artists_encountered = []
 
-    def try_add(artist_name, track_name, reason, engine):
+    def try_add(artist_name, track_name, reason, engine, match=None):
         key = radio_track_key(track_name, artist_name)
         if key in seen or key in cooldown_keys:
             return None
         seen.add(key)
-        entry = {'artist_name': artist_name, 'track_name': track_name, 'selection_reason': reason, 'selection_engine': engine}
+        # match is Last.fm's own track.getSimilar score (0-1, relative to
+        # this seed's own best match - see lastfm.track_similar_tracks'
+        # docstring) - only tier 1 has one at all; tier 2's top-tracks/
+        # similar-artist bootstrap and tier 3's library fallback have no
+        # per-track similarity concept, so this stays None for those,
+        # surfaced honestly as "-" rather than a fabricated number.
+        entry = {'artist_name': artist_name, 'track_name': track_name, 'selection_reason': reason, 'selection_engine': engine, 'match': match}
         collected.append(entry)
         artists_encountered.append(artist_name)
         return entry
@@ -401,7 +407,7 @@ def generate_radio_batch_track_first(session, seen_keys, count, db):
 
         parent = frontier.pop(0)
         for s in lastfm.track_similar_tracks(parent['artist_name'], parent['track_name']):
-            entry = try_add(s['artist_name'], s['track_name'], 'Discovered - similar track', 'Last.fm')
+            entry = try_add(s['artist_name'], s['track_name'], 'Discovered - similar track', 'Last.fm', match=s.get('match'))
             if entry is not None and parent['depth'] + 1 <= TRACK_HOP_MAX_DEPTH:
                 frontier.append({'artist_name': s['artist_name'], 'track_name': s['track_name'], 'depth': parent['depth'] + 1})
             if len(collected) >= count:
@@ -433,7 +439,7 @@ def generate_radio_batch_track_first(session, seen_keys, count, db):
             continue
         cached = cached_by_key.get((c['track_name'].lower(), c['artist_name'].lower()))
         final.append(
-            {**cached, 'selection_reason': c['selection_reason'], 'selection_engine': c.get('selection_engine')}
+            {**cached, 'selection_reason': c['selection_reason'], 'selection_engine': c.get('selection_engine'), 'match': c.get('match')}
             if cached else c
         )
 

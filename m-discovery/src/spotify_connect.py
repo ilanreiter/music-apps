@@ -1215,6 +1215,7 @@ def clear_queue(device_id, token=None):
         return True
 
     if not _skip_batch(pending):
+        database.restore_pending_queue_adds(max(0, pending - drained))
         return drained
 
     for _ in range(CLEAR_QUEUE_MAX_CONTEXT_ROUNDS):
@@ -1223,10 +1224,16 @@ def clear_queue(device_id, token=None):
             break
         logger.info("clear_queue %s: context still active after %d skips, trying another round", device_id, drained)
         if not _skip_batch(CLEAR_QUEUE_CONTEXT_ROUND_SIZE):
+            database.restore_pending_queue_adds(max(0, pending - drained))
             return drained
 
     if drained:
         time.sleep(CLEAR_QUEUE_SETTLE_DELAY_SECONDS)
+    # Whatever this pass intended to skip (pending) but didn't actually
+    # reach (drained) is still genuinely sitting in the real queue - carry
+    # it forward instead of letting take_pending_queue_adds' own reset
+    # silently forget it (see that function's own comment).
+    database.restore_pending_queue_adds(max(0, pending - drained))
     return drained
 
 
@@ -1244,6 +1251,49 @@ def clear_queue_for_device(device_id):
     token = _start_intent(device_id)
     _transfer_to_device(device_id)
     return clear_queue(device_id, token=token)
+
+
+# How many total clear_queue_for_device rounds clear_queue_for_device_verified
+# will try before giving up - a genuine multi-attempt retry (not just the
+# single hardcoded extra pass main.py's /play and /switch-device routes used
+# to do inline), for when one bounded pass genuinely wasn't enough (see
+# clear_queue's own docstring on why a single guess can undercount). Still
+# bounded, not unbounded - see the function's own docstring for why more
+# rounds can't help against an actively-refilling native context.
+CLEAR_QUEUE_VERIFY_MAX_ATTEMPTS = 3
+
+
+def clear_queue_for_device_verified(device_id, max_attempts=CLEAR_QUEUE_VERIFY_MAX_ATTEMPTS):
+    """Repeats clear_queue_for_device, checking via get_queue() after each
+    round and stopping as soon as it genuinely reports empty - answers "can
+    we make a 2nd (or 3rd) clear attempt" with yes, this is that loop,
+    replacing the single hardcoded extra pass /play and /switch-device used
+    to do inline.
+
+    Still fundamentally bounded, not a fix for every case: an actively-
+    refilling native context (Spotify's own Autoplay, or Liked Songs being
+    shuffled directly on the device) never actually reaches empty no matter
+    how many rounds run, since there's no fixed backlog to exhaust in the
+    first place - see clear_queue's own docstring. This gives up after
+    max_attempts rather than chasing a moving target forever.
+
+    Returns (total_drained, fully_cleared) - fully_cleared is only True when
+    the last verify genuinely came back empty, so a caller can tell "queue
+    may still have residue" apart from "definitely cleared" instead of
+    assuming success just because this returned without raising."""
+    total_drained = 0
+    for attempt in range(1, max_attempts + 1):
+        drained = clear_queue_for_device(device_id)
+        total_drained += drained or 0
+        verify = get_queue()
+        if verify is not None and not verify.get('queue'):
+            return total_drained, True
+        if attempt < max_attempts:
+            logger.info(
+                "clear_queue_for_device_verified %s: still not empty after attempt %d/%d, retrying",
+                device_id, attempt, max_attempts,
+            )
+    return total_drained, False
 
 
 def _artist_guard_passes(local_artist, bridged_artist):
