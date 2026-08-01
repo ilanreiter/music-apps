@@ -6499,7 +6499,7 @@ function RadioPlaylistPreview({ session, onPlaylistChange, onReorder, onRemove, 
   const [busyItemId, setBusyItemId] = useState(null);
   const isLive = nowPlaying !== undefined;
 
-  const handleRowClick = async (itemId) => {
+  const handlePromoteClick = async (itemId) => {
     if (busyItemId != null) return;
     setBusyItemId(itemId);
     onPlaylistChange((prev) => {
@@ -6517,8 +6517,7 @@ function RadioPlaylistPreview({ session, onPlaylistChange, onReorder, onRemove, 
     }
   };
 
-  const handleRemoveClick = (itemId, e) => {
-    e.stopPropagation();
+  const handleRemoveClick = (itemId) => {
     onPlaylistChange((prev) => prev.filter((p) => p.item_id !== itemId));
     onRemove(itemId);
   };
@@ -6546,8 +6545,30 @@ function RadioPlaylistPreview({ session, onPlaylistChange, onReorder, onRemove, 
     <tr
       key={item.item_id ?? item.id}
       className={`radio-playlist-preview-row${playingNow ? ' radio-playlist-preview-nowplaying' : ''}${clickable ? '' : ' radio-playlist-preview-row-static'}`}
-      onClick={clickable ? () => handleRowClick(item.item_id) : undefined}
     >
+      <td className="radio-playlist-preview-actions-col">
+        {clickable && item.item_id != null && (
+          <>
+            <button
+              type="button"
+              className="radio-playlist-action-btn"
+              title="Play next"
+              disabled={busyItemId === item.item_id}
+              onClick={() => handlePromoteClick(item.item_id)}
+            >
+              ⬆
+            </button>
+            <button
+              type="button"
+              className="radio-playlist-action-btn radio-playlist-remove-btn"
+              title="Remove"
+              onClick={() => handleRemoveClick(item.item_id)}
+            >
+              ✕
+            </button>
+          </>
+        )}
+      </td>
       <td className="play-log-artwork-col">
         {item.artwork_url ? (
           <img className="play-log-artwork" src={item.artwork_url} alt="" onError={(e) => { e.target.style.visibility = 'hidden'; }} />
@@ -6567,18 +6588,6 @@ function RadioPlaylistPreview({ session, onPlaylistChange, onReorder, onRemove, 
         })()}
       </td>
       <td className="play-log-reason" title={item.selection_reason || ''}>{item.selection_reason || '—'}</td>
-      <td className="radio-playlist-preview-remove-col">
-        {clickable && item.item_id != null && (
-          <button
-            type="button"
-            className="radio-playlist-remove-btn"
-            title="Remove"
-            onClick={(e) => handleRemoveClick(item.item_id, e)}
-          >
-            ✕
-          </button>
-        )}
-      </td>
     </tr>
   );
 
@@ -6591,18 +6600,18 @@ function RadioPlaylistPreview({ session, onPlaylistChange, onReorder, onRemove, 
         </h3>
         {headerAction}
       </div>
-      <p className="hint">Click a track to play it next. {isLive ? 'Already-queued tracks may briefly skip when reordered or removed.' : ''}</p>
+      <p className="hint">⬆ moves a track to play next, ✕ removes it. {isLive ? 'Already-queued tracks may briefly skip when reordered or removed.' : ''}</p>
       <div className="play-log-table-wrap radio-playlist-preview-table-wrap">
         <table className="play-log-table">
           <thead>
             <tr>
+              <th className="radio-playlist-preview-actions-col" />
               <th className="play-log-artwork-col" />
               <th>Artist</th>
               <th>Track</th>
               <th>Engine</th>
               <th>Source</th>
               <th>Reason</th>
-              <th />
             </tr>
           </thead>
           <tbody>

@@ -419,16 +419,8 @@ main.with-player {
   overflow-y: auto;
 }
 
-.radio-playlist-preview-row {
-  cursor: pointer;
-}
-
 .radio-playlist-preview-row:hover {
   background: var(--bg-card-hover);
-}
-
-.radio-playlist-preview-row-static {
-  cursor: default;
 }
 
 .radio-playlist-preview-row-static:hover {
@@ -439,24 +431,33 @@ main.with-player {
   background: var(--accent-soft);
 }
 
-.radio-playlist-preview-remove-col {
-  width: 32px;
-  text-align: right;
+.radio-playlist-preview-actions-col {
+  width: 60px;
+  white-space: nowrap;
 }
 
-.radio-playlist-remove-btn {
+.radio-playlist-action-btn {
   background: none;
   border: none;
-  color: var(--text-muted);
+  color: var(--accent-hover);
   font-size: 0.9rem;
   cursor: pointer;
   padding: 2px 6px;
   border-radius: 6px;
 }
 
-.radio-playlist-remove-btn:hover {
-  color: var(--text-main);
-  background: var(--bg-card-hover);
+.radio-playlist-action-btn:hover:not(:disabled) {
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.radio-playlist-action-btn:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.radio-playlist-remove-btn:hover:not(:disabled) {
+  color: #e05252;
 }
 
 .settings-section {
