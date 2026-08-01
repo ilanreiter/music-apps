@@ -962,7 +962,7 @@ function App() {
   const [spotifyConnected, setSpotifyConnected] = useState(false);
   const [ytMusicConnected, setYtMusicConnected] = useState(false);
   const outputDevices = [...wiimDevices, ...chromecastDevices, ...spotifyDevices];
-  const [outputDevice, setOutputDevice] = useState(() => loadSession()?.outputDevice || null);
+  const [outputDevice, setOutputDeviceRaw] = useState(() => loadSession()?.outputDevice || null);
   const [destStatus, setDestStatus] = useState(null);
 
   // Radio: a continuous, auto-refilling similar-music stream seeded from a
@@ -1072,6 +1072,21 @@ function App() {
       skipNextCastPushRef.current = false;
       return;
     }
+    // An active radio session (either engine) is already being driven
+    // server-side by playback_advancer, independent of this tab - unlike
+    // every other case here, there's no fixed queue to bulk re-cast: the
+    // pre-generated-playlist flow's queue is built one track at a time via
+    // its own paced add_to_queue calls (see radio_session.playlist /
+    // _advance_spotify_radio_playlist), and this effect firing right after
+    // a page-refresh restore (nowPlaying changing from null to the
+    // restored session's track) sent a bulk {uris:[...], clear_queue:true}
+    // that raced the server's own reconciliation (_reconcile_radio_queue) -
+    // confirmed live: it collided mid-drain and left the device stuck on
+    // the wrong track. Nothing to do here for a same-device restore (the
+    // backend's own auto-resume/reconciliation already keeps it healthy);
+    // a genuine device *switch* mid-radio-session isn't handled by this
+    // effect at all now - a known gap, not silently worse than before.
+    if (nowPlaying.radio_session_id != null && outputDevice.type === 'spotify') return;
     if (nowPlaying.source === 'spotify') {
       if (outputDevice.type !== 'spotify') {
         // Switched away from Spotify to a local-only destination. If this
@@ -3238,6 +3253,66 @@ function App() {
     setRadioStatus(null);
   };
 
+  // The explicit "start playback" step for the new pre-generated-playlist
+  // Radio flow (RadioTab's own generate/preview UI calls /api/radio/{id}/generate
+  // and /reorder /remove directly - this is the one step that also needs to
+  // update this component's own nowPlaying/queue/radioSessionId, the same
+  // three things handleStartRadio's old flow set via commitRadioSession +
+  // startQueue). The backend's /play route already did the clear-then-verify
+  // and the first play_uris call - this just syncs this tab's own state to
+  // match what the server now has, the same way a page-refresh's session-
+  // restore effect already does.
+  const handlePlayGeneratedRadio = async (sessionId, seed) => {
+    if (!outputDevice || outputDevice.type !== 'spotify') return false;
+    try {
+      await axios.post(`${API_BASE_URL}/radio/${sessionId}/play`, { device_id: outputDevice.id });
+    } catch (err) {
+      console.error('Error starting the generated radio playlist:', err);
+      setRadioStatus('Failed to start playback. Please try again.');
+      return false;
+    }
+    try {
+      const response = await axios.get(`${API_BASE_URL}/playback-session`);
+      setNowPlaying(response.data.now_playing || null);
+      setQueue(response.data.queue || []);
+      setIsPlaying(true);
+    } catch (err) {
+      console.error('Error syncing playback state after starting radio:', err);
+    }
+    commitRadioSession(sessionId, seed, 'spotify');
+    return true;
+  };
+
+  // Wraps the raw outputDevice setter so switching between two Spotify
+  // Connect devices *during an active radio session* re-targets playback
+  // there properly (clear-then-verify, then continue from whatever's
+  // currently playing - see main.py's switch_radio_device) instead of just
+  // updating which device is selected and leaving actual playback stranded
+  // on the old one. The generic "cast to device on change" effect
+  // deliberately does nothing for an active radio session (see that
+  // effect's own comment) - blindly re-sending [now_playing, ...queue]
+  // there raced this session's own reconciliation and corrupted the queue,
+  // confirmed live. Every existing device-picker call site keeps working
+  // unchanged, since this has the exact same setOutputDevice(device)
+  // signature they already call.
+  const setOutputDevice = (device) => {
+    const activeRadioSessionId = nowPlaying?.radio_session_id;
+    const isRadioDeviceSwitch = outputDevice?.type === 'spotify' && device?.type === 'spotify' && activeRadioSessionId != null;
+    setOutputDeviceRaw(device);
+    if (!isRadioDeviceSwitch) return;
+    axios.post(`${API_BASE_URL}/radio/${activeRadioSessionId}/switch-device`, { device_id: device.id })
+      .then(() => axios.get(`${API_BASE_URL}/playback-session`))
+      .then((response) => {
+        setNowPlaying(response.data.now_playing || null);
+        setQueue(response.data.queue || []);
+        setIsPlaying(true);
+      })
+      .catch((err) => {
+        console.error('Error switching radio to a new device:', err);
+        setRadioStatus('Failed to switch devices. Please try again.');
+      });
+  };
+
   // Samples up to this many distinct artist names from a playlist's tracks
   // to seed Radio - shared by the Radio tab's own playlist picker and the
   // "Start Radio" button on a Playlists-tab group card (see
@@ -3350,6 +3425,17 @@ function App() {
       // (load + play) rather than just resume a stream that was never sent.
       if (destNeedsInitialCastRef.current && nowPlaying) {
         destNeedsInitialCastRef.current = false;
+        // Same reasoning as the cast-on-change effect above - an active
+        // radio session doesn't have a fixed queue to bulk re-cast, and
+        // doing so here can race the server's own reconciliation. Just
+        // toggle play/pause on whatever the device already has loaded.
+        if (nowPlaying.radio_session_id != null && outputDevice.type === 'spotify') {
+          const action = destStatus?.status === 'play' ? 'pause' : 'resume';
+          axios.post(`${deviceEndpoint(outputDevice)}/${action}`).catch((err) => {
+            console.error('Error toggling playback:', err);
+          });
+          return;
+        }
         if (nowPlaying.source === 'spotify') {
           if (outputDevice.type !== 'spotify') {
             const localId = resolveLocalTrackId(nowPlaying);
@@ -4814,6 +4900,7 @@ function App() {
             onStartRadio={handleStartRadio}
             onStartRadioFromPlaylist={startRadioFromPlaylist}
             onStopRadio={stopRadio}
+            onPlayGeneratedRadio={handlePlayGeneratedRadio}
           />
         ) : activeTab === 'playlog' ? (
           <PlayLogTab apiBase={API_BASE_URL} />
@@ -5703,6 +5790,7 @@ function RadioTab({
   radioDestination, setRadioDestination, radioDestinationType,
   radioSessionId, radioSeed, radioStatus, nowPlaying, queue, isPlaying,
   onDismissRadioStatus, onStartRadio, onStartRadioFromPlaylist, onStopRadio,
+  onPlayGeneratedRadio,
 }) {
   const [seedMode, setSeedMode] = useState('track');
   // 'discovery' (default) - this app's own Last.fm-driven engine, matching/
@@ -5728,6 +5816,122 @@ function RadioTab({
   const [startingSeedKey, setStartingSeedKey] = useState(null);
   const [ytJobStatus, setYtJobStatus] = useState(null);
   const [searchBudget, setSearchBudget] = useState(null);
+
+  // New pre-generated-playlist flow (spotify+discovery only - see
+  // src/main.py's generate_radio_playlist). targetLength is the requested
+  // playlist size; generatingSession holds the session while it's being
+  // built/previewed/edited, before the user presses Play - once played,
+  // radioSessionId (the existing prop, already driving the rest of this
+  // component) takes over and this switches to polling the SAME session id
+  // read-only, to keep the preview grid in sync with what's actually
+  // playing (see the playingPreview effect below).
+  const [targetLength, setTargetLength] = useState(500);
+  const [generatingSession, setGeneratingSession] = useState(null);
+  const [playingPreview, setPlayingPreview] = useState(null);
+  const [startingPlay, setStartingPlay] = useState(false);
+
+  useEffect(() => {
+    if (!generatingSession || generatingSession.generation_status !== 'generating') return;
+    let cancelled = false;
+    const poll = () => {
+      axios.get(`${apiBase}/radio/${generatingSession.id}`).then((r) => {
+        if (cancelled) return;
+        setGeneratingSession((prev) => (prev && prev.id === r.data.id ? { ...r.data, seed: prev.seed } : prev));
+      }).catch(() => {});
+    };
+    const intervalId = setInterval(poll, 2000);
+    return () => { cancelled = true; clearInterval(intervalId); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [generatingSession?.id, generatingSession?.generation_status, apiBase]);
+
+  // Once played, keeps the (now read-only, from this component's side -
+  // playback_advancer owns actually consuming it) generated playlist in
+  // view so "now playing pinned to top, rest below" stays visible instead of
+  // the preview grid just disappearing the moment Play is pressed.
+  useEffect(() => {
+    const previewId = playingPreview?.id;
+    if (previewId == null || radioSessionId !== previewId) { return; }
+    let cancelled = false;
+    const poll = () => {
+      axios.get(`${apiBase}/radio/${previewId}`).then((r) => {
+        if (cancelled || r.data.status !== 'active') return;
+        setPlayingPreview(r.data);
+      }).catch(() => {});
+    };
+    poll();
+    const intervalId = setInterval(poll, 5000);
+    return () => { cancelled = true; clearInterval(intervalId); };
+  }, [playingPreview, radioSessionId, apiBase]);
+
+  // radioSessionId changing away from the session this tab is showing means
+  // either Stop was pressed or a different session took over - either way
+  // the live preview no longer applies.
+  useEffect(() => {
+    if (playingPreview && radioSessionId !== playingPreview.id) setPlayingPreview(null);
+  }, [radioSessionId, playingPreview]);
+
+  // After a page refresh, this component's own state (generatingSession/
+  // playingPreview) always starts fresh at null - only App.js's own
+  // radioSessionId/radioSeed/radioDestinationType restore from the server
+  // (see its own session-restore effect). Without this, a refresh mid-
+  // session made the playlist preview grid vanish and the old Up Next panel
+  // reappear (its hiding condition is `!playingPreview`) even though the
+  // session was still genuinely active server-side the whole time - fetches
+  // it directly the first time radioSessionId shows up pointing at a
+  // discovery-engine Spotify session this component doesn't already have.
+  useEffect(() => {
+    if (!radioSessionId || radioDestinationType !== 'spotify') return;
+    if (playingPreview && playingPreview.id === radioSessionId) return;
+    let cancelled = false;
+    axios.get(`${apiBase}/radio/${radioSessionId}`).then((r) => {
+      if (cancelled) return;
+      if (r.data.engine === 'discovery' && r.data.status === 'active') setPlayingPreview(r.data);
+    }).catch(() => {});
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [radioSessionId, radioDestinationType, apiBase]);
+
+  const startGeneratedRadio = async (seed) => {
+    onDismissRadioStatus();
+    setGeneratingSession(null);
+    try {
+      const response = await axios.post(`${apiBase}/radio/generate`, {
+        seed_type: seed.type, seed_description: seed.description, seed_artists: seed.seedArtists,
+        seed_track_name: seed.seedTrack?.track_name || null, seed_artist_name: seed.seedTrack?.artist_name || null,
+        target_length: targetLength,
+      });
+      setGeneratingSession({ ...response.data, seed });
+    } catch (err) {
+      console.error('Error generating radio playlist:', err);
+      // RadioTab has no setter for the shared radioStatus popup (only
+      // radioStatus/onDismissRadioStatus are passed down) - surfaced via the
+      // tab's own inline preview panel instead (see the 'error' branch
+      // below), same place a genuine generation-side failure shows too.
+      setGeneratingSession({ id: null, generation_status: 'error', playlist: [], seed });
+    }
+  };
+
+  const updateGeneratingPlaylist = (updater) => {
+    setGeneratingSession((prev) => (prev ? { ...prev, playlist: updater(prev.playlist) } : prev));
+  };
+
+  const cancelGeneratedRadio = () => {
+    if (generatingSession?.id) {
+      axios.post(`${apiBase}/radio/${generatingSession.id}/stop`).catch(() => {});
+    }
+    setGeneratingSession(null);
+  };
+
+  const playGeneratedRadio = async () => {
+    if (!generatingSession?.id || startingPlay) return;
+    setStartingPlay(true);
+    const started = await onPlayGeneratedRadio(generatingSession.id, generatingSession.seed);
+    setStartingPlay(false);
+    if (started) {
+      setPlayingPreview(generatingSession);
+      setGeneratingSession(null);
+    }
+  };
 
   useEffect(() => {
     const q = trackQuery.trim();
@@ -5807,10 +6011,19 @@ function RadioTab({
     return () => { cancelled = true; clearInterval(intervalId); };
   }, [apiBase]);
 
+  // spotify+discovery uses the new generate-then-preview flow exclusively
+  // (see startGeneratedRadio) - spotify_native and the browser/ytmusic
+  // destinations keep the old immediate-start behavior unchanged, since
+  // neither has a real device queue to pre-stage a reorderable/deletable
+  // playlist against.
+  const usesGeneratedFlow = outputDevice?.type === 'spotify' && radioEngine === 'discovery';
+
   const startFromTrack = (track) => {
     // track already came from /tracks/known - the exact plain library-track
     // shape onStartRadio/resolveSeedTrackForPlayback expects to play first.
-    onStartRadio({ type: 'track', description: `Radio from "${track.track_name}"`, seedArtists: [track.artist_name], seedTrack: track, engine: radioEngine });
+    const seed = { type: 'track', description: `Radio from "${track.track_name}"`, seedArtists: [track.artist_name], seedTrack: track, engine: radioEngine };
+    if (usesGeneratedFlow) { startGeneratedRadio(seed); return; }
+    onStartRadio(seed);
   };
 
   const startFromArtist = async (artistName) => {
@@ -5829,8 +6042,10 @@ function RadioTab({
     } catch (err) {
       console.error('Error finding a track for this artist:', err);
     }
+    const seed = { type: 'artist', description: `Radio from ${artistName}`, seedArtists: [artistName], seedTrack, engine: radioEngine };
     try {
-      await onStartRadio({ type: 'artist', description: `Radio from ${artistName}`, seedArtists: [artistName], seedTrack, engine: radioEngine });
+      if (usesGeneratedFlow) { await startGeneratedRadio(seed); return; }
+      await onStartRadio(seed);
     } finally {
       setStartingSeedKey(null);
     }
@@ -5984,6 +6199,23 @@ function RadioTab({
         </div>
       )}
 
+      {usesGeneratedFlow && (
+        <div className="radio-destination-row">
+          <span className="radio-destination-label">Playlist length:</span>
+          <input
+            type="number"
+            className="radio-target-length-input"
+            min={1}
+            max={1000}
+            value={targetLength}
+            onChange={(e) => setTargetLength(Math.max(1, Math.min(1000, Number(e.target.value) || 1)))}
+          />
+          <span className="radio-destination-hint">
+            Builds the full playlist up front so you can review, reorder, or remove tracks before anything plays.
+          </span>
+        </div>
+      )}
+
       {radioDestinationType !== 'ytmusic' && (
         // Always rendered, live or not - previously this only existed while
         // radioSessionId was set, so it looked identical (just gone) whether
@@ -6028,10 +6260,14 @@ function RadioTab({
               </div>
             )}
           </div>
-          {radioSessionId && queue.length > 0 && (
+          {radioSessionId && queue.length > 0 && !playingPreview && (
             // Nested in the same panel, directly under the On Air row and
             // above the search budget bar (per user request) - one unified
-            // visual instead of several separate blocks.
+            // visual instead of several separate blocks. Hidden once the
+            // new playlist preview grid (RadioPlaylistPreview) is showing
+            // the same up-next tracks itself, per user request - only
+            // still needed for spotify_native/browser radio, which have no
+            // pre-generated playlist of their own to show instead.
             <div className="radio-upnext">
               <h3>Up Next</h3>
               <div className="radio-upnext-list">
@@ -6111,6 +6347,46 @@ function RadioTab({
         </div>
       )}
 
+      {generatingSession && generatingSession.generation_status === 'generating' && (
+        <div className="radio-playlist-preview radio-playlist-preview-generating">
+          <p className="empty-state">
+            Building your playlist… ({generatingSession.playlist.length}/{generatingSession.target_length || targetLength} so far)
+          </p>
+          <button className="scan-btn radio-stop-btn" onClick={cancelGeneratedRadio}>Cancel</button>
+        </div>
+      )}
+      {generatingSession && generatingSession.generation_status === 'error' && (
+        <div className="radio-playlist-preview radio-playlist-preview-generating">
+          <p className="empty-state">Couldn't generate a playlist for this seed. Please try again.</p>
+          <button className="scan-btn radio-stop-btn" onClick={() => setGeneratingSession(null)}>Dismiss</button>
+        </div>
+      )}
+      {generatingSession && generatingSession.generation_status === 'ready' && (
+        <RadioPlaylistPreview
+          session={generatingSession}
+          onPlaylistChange={updateGeneratingPlaylist}
+          onReorder={(itemId) => axios.post(`${apiBase}/radio/${generatingSession.id}/reorder`, { item_id: itemId }).catch((err) => console.error('Error reordering radio playlist:', err))}
+          onRemove={(itemId) => axios.post(`${apiBase}/radio/${generatingSession.id}/remove`, { item_id: itemId }).catch((err) => console.error('Error removing radio playlist item:', err))}
+          headerAction={(
+            <div className="radio-playlist-preview-actions">
+              <button className="scan-btn" disabled={startingPlay} onClick={playGeneratedRadio}>{startingPlay ? 'Starting…' : '▶ Play'}</button>
+              <button className="scan-btn radio-stop-btn" onClick={cancelGeneratedRadio}>Discard</button>
+            </div>
+          )}
+        />
+      )}
+      {playingPreview && (
+        <RadioPlaylistPreview
+          session={playingPreview}
+          onPlaylistChange={() => {}}
+          onReorder={(itemId) => axios.post(`${apiBase}/radio/${playingPreview.id}/reorder`, { item_id: itemId }).catch((err) => console.error('Error reordering radio playlist:', err))}
+          onRemove={(itemId) => axios.post(`${apiBase}/radio/${playingPreview.id}/remove`, { item_id: itemId }).catch((err) => console.error('Error removing radio playlist item:', err))}
+          nowPlaying={radioSessionId === playingPreview.id ? nowPlaying : null}
+          committedQueue={radioSessionId === playingPreview.id ? queue : []}
+        />
+      )}
+
+      {!generatingSession && !playingPreview && (
       <div className="radio-seed-picker">
         <div className="radio-seed-tabs">
           <button className={seedMode === 'track' ? 'active' : ''} onClick={() => setSeedMode('track')}>🎵 Track</button>
@@ -6198,7 +6474,148 @@ function RadioTab({
           </div>
         )}
       </div>
+      )}
     </section>
+  );
+}
+
+// A radio_session.playlist item hasn't necessarily been checked against
+// Spotify yet at preview time (matching stays deferred/lazy - see
+// src/main.py's generate_radio_playlist) - 'unresolved' is deliberately
+// distinct from PLAY_LOG_SOURCE_LABELS' 'radio_discovered'/"Not in library",
+// which is a claim only earned after an actual search. Local to this
+// component rather than added to PLAY_LOG_SOURCE_LABELS since the Play Log
+// itself never shows a not-yet-resolved row - only things that already played.
+const RADIO_PREVIEW_SOURCE_LABELS = { in_library: 'In library', unresolved: 'Not yet resolved' };
+
+// Renders a radio_session.playlist as a table matching PlayLogTab's own
+// column shape (artwork/artist/track/engine/source/reason) - reused for both
+// the pre-play preview (session.playlist is the whole generated list,
+// reorder/remove freely available) and the live "now playing" view once
+// started (nowPlaying pinned to the top, followed by the already-committed
+// lookahead tracks, then the remaining pending playlist - see RadioTab's own
+// playingPreview poll for how session.playlist stays in sync while playing).
+function RadioPlaylistPreview({ session, onPlaylistChange, onReorder, onRemove, headerAction, nowPlaying, committedQueue }) {
+  const [busyItemId, setBusyItemId] = useState(null);
+  const isLive = nowPlaying !== undefined;
+
+  const handleRowClick = async (itemId) => {
+    if (busyItemId != null) return;
+    setBusyItemId(itemId);
+    onPlaylistChange((prev) => {
+      const idx = prev.findIndex((p) => p.item_id === itemId);
+      if (idx <= 0) return prev;
+      const copy = [...prev];
+      const [moved] = copy.splice(idx, 1);
+      copy.unshift(moved);
+      return copy;
+    });
+    try {
+      await onReorder(itemId);
+    } finally {
+      setBusyItemId(null);
+    }
+  };
+
+  const handleRemoveClick = (itemId, e) => {
+    e.stopPropagation();
+    onPlaylistChange((prev) => prev.filter((p) => p.item_id !== itemId));
+    onRemove(itemId);
+  };
+
+  // A pending playlist item and an already-committed one (queued or now
+  // playing) are two different shapes. Pending items carry the backend's
+  // own 'in_library'/'unresolved' (see main.py's generate_radio_playlist -
+  // 'unresolved' means no Spotify search attempted yet, deliberately not a
+  // claim of "not in library"). A committed item has already been resolved
+  // (playback_advancer's `found` dict) and carries a *different*, generic
+  // 'source' field ('spotify' - "this plays via Spotify," unrelated to
+  // library membership) plus local_id when it's a genuine library match -
+  // falling back to RADIO_PREVIEW_SOURCE_LABELS[item.source] for a
+  // committed item showed that generic 'spotify' value as literal text.
+  const sourceInfo = (item) => {
+    if (item.source === 'in_library' || item.source === 'unresolved') {
+      return { key: item.source, label: RADIO_PREVIEW_SOURCE_LABELS[item.source] };
+    }
+    return item.local_id != null
+      ? { key: 'library', label: 'In library' }
+      : { key: 'radio_discovered', label: 'Not in library' };
+  };
+
+  const renderRow = (item, { clickable, playingNow } = {}) => (
+    <tr
+      key={item.item_id ?? item.id}
+      className={`radio-playlist-preview-row${playingNow ? ' radio-playlist-preview-nowplaying' : ''}${clickable ? '' : ' radio-playlist-preview-row-static'}`}
+      onClick={clickable ? () => handleRowClick(item.item_id) : undefined}
+    >
+      <td className="play-log-artwork-col">
+        {item.artwork_url ? (
+          <img className="play-log-artwork" src={item.artwork_url} alt="" onError={(e) => { e.target.style.visibility = 'hidden'; }} />
+        ) : (
+          <div className="play-log-artwork play-log-artwork-fallback" aria-hidden="true">♪</div>
+        )}
+      </td>
+      <td>{item.artist_name}</td>
+      <td>{item.track_name}</td>
+      <td className="play-log-engine">{item.selection_engine || PLAY_LOG_NO_ENGINE_LABEL}</td>
+      <td>
+        {playingNow ? (
+          <span className="play-log-source play-log-source-library">Now Playing</span>
+        ) : (() => {
+          const { key, label } = sourceInfo(item);
+          return <span className={`play-log-source play-log-source-${key}`}>{label}</span>;
+        })()}
+      </td>
+      <td className="play-log-reason" title={item.selection_reason || ''}>{item.selection_reason || '—'}</td>
+      <td className="radio-playlist-preview-remove-col">
+        {clickable && item.item_id != null && (
+          <button
+            type="button"
+            className="radio-playlist-remove-btn"
+            title="Remove"
+            onClick={(e) => handleRemoveClick(item.item_id, e)}
+          >
+            ✕
+          </button>
+        )}
+      </td>
+    </tr>
+  );
+
+  return (
+    <div className="radio-playlist-preview">
+      <div className="radio-playlist-preview-header">
+        <h3>
+          {isLive ? 'Radio playlist' : 'Generated playlist'}
+          {' '}({session.playlist.length}{!isLive && session.target_length ? `/${session.target_length}` : ''} tracks)
+        </h3>
+        {headerAction}
+      </div>
+      <p className="hint">Click a track to play it next. {isLive ? 'Already-queued tracks may briefly skip when reordered or removed.' : ''}</p>
+      <div className="play-log-table-wrap radio-playlist-preview-table-wrap">
+        <table className="play-log-table">
+          <thead>
+            <tr>
+              <th className="play-log-artwork-col" />
+              <th>Artist</th>
+              <th>Track</th>
+              <th>Engine</th>
+              <th>Source</th>
+              <th>Reason</th>
+              <th />
+            </tr>
+          </thead>
+          <tbody>
+            {isLive && nowPlaying && renderRow(nowPlaying, { clickable: false, playingNow: true })}
+            {isLive && (committedQueue || []).map((item) => renderRow(item, { clickable: item.item_id != null }))}
+            {session.playlist.map((item) => renderRow(item, { clickable: true }))}
+          </tbody>
+        </table>
+      </div>
+      {session.playlist.length === 0 && !(isLive && ((committedQueue || []).length > 0 || nowPlaying)) && (
+        <p className="empty-state">Nothing generated yet.</p>
+      )}
+    </div>
   );
 }
 

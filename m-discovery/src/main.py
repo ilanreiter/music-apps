@@ -14,6 +14,7 @@ from .database import (
     get_playlist_track_cache, replace_playlist_track_cache,
     find_known_track_external_match, backfill_known_track_ids, backfill_ytmusic_cache_match,
     create_radio_session, get_radio_session, append_seen_track_keys, set_radio_session_track_state,
+    set_radio_session_generation_status, append_radio_playlist_items, set_radio_session_playlist,
     set_radio_session_ytmusic_job, stop_radio_session, append_tracks_to_ytmusic_push_job,
     has_active_spotify_radio_session, count_searches_since_last_reset, get_spotify_quota_state,
     set_prewarm_paused, is_prewarm_paused, upsert_radio_discovered_track,
@@ -322,6 +323,17 @@ class RadioStartRequest(BaseModel):
 
 class RadioMoreRequest(BaseModel):
     count: Optional[int] = 10
+
+class RadioGenerateRequest(BaseModel):
+    """Only ever spotify+discovery (see generate_radio_playlist) - unlike
+    RadioStartRequest there's no destination_type/engine field, since this
+    route doesn't support anything else."""
+    seed_type: str
+    seed_description: Optional[str] = None
+    seed_artists: List[str]
+    seed_track_name: Optional[str] = None
+    seed_artist_name: Optional[str] = None
+    target_length: Optional[int] = 500
 
 class LibraryScanRequest(BaseModel):
     root_path: str
@@ -2894,6 +2906,28 @@ class RadioMoreResponse(BaseModel):
     # See RadioStartResponse.degraded.
     degraded: bool = False
 
+class RadioPlaylistItem(BaseModel):
+    """One row of a pre-generated radio_session.playlist - a text-level
+    Last.fm candidate, possibly already cache-resolved to a real Spotify
+    match (id/spotify_uri/radio_track_id set) but not yet actually searched
+    otherwise. item_id is stable identity (radio_session.next_item_id
+    counter), not array position - survives reorder/delete."""
+    item_id: int
+    track_name: str
+    artist_name: str
+    album_name: Optional[str] = None
+    selection_reason: Optional[str] = None
+    selection_engine: Optional[str] = None
+    # 'in_library' (already cache-resolved at generation time) or
+    # 'unresolved' (plain Last.fm text, no Spotify search attempted yet -
+    # deliberately not 'not_in_library', which would be a claim this hasn't
+    # earned).
+    source: Optional[str] = None
+    id: Optional[int] = None
+    spotify_uri: Optional[str] = None
+    radio_track_id: Optional[int] = None
+    artwork_url: Optional[str] = None
+
 class RadioSessionInfo(BaseModel):
     id: int
     status: str  # 'active' | 'stopped'
@@ -2901,6 +2935,119 @@ class RadioSessionInfo(BaseModel):
     seed_description: Optional[str] = None
     destination_type: Optional[str] = None
     engine: str
+    # Pre-generated playlist support - see generate_radio_playlist.
+    generation_status: str = 'ready'  # 'generating' | 'ready' | 'error'
+    target_length: Optional[int] = None
+    playlist: List[RadioPlaylistItem] = []
+
+# How many tracks generate_radio_batch_track_first is asked for per call
+# while building a full pre-generated playlist - small enough that one
+# call's own internal work stays quick and progress can be checked/persisted
+# often, large enough that reaching a few hundred net-new tracks doesn't need
+# an excessive number of round trips through the whole tiered-generation
+# machinery. Reaching a genuinely large target_length (500+) can still mean
+# 10+ of these calls and 100+ underlying Last.fm requests - fine for a
+# background thread, not something to do inside the /generate request itself.
+RADIO_GENERATE_BATCH_SIZE = 40
+# Hard ceiling regardless of what the UI sends - a pathological input
+# shouldn't be able to turn one /generate call into an unbounded background
+# job.
+RADIO_GENERATE_MAX_LENGTH = 1000
+
+def _run_radio_generation(session_id, seed_artists, seed_track_name, seed_artist_name, target_length):
+    """Background job (see generate_radio_playlist) - builds the session's
+    full playlist upfront by repeatedly calling
+    radio_engine.generate_radio_batch_track_first, the same incremental
+    generator /api/radio/{id}/more and playback_advancer's refill already
+    use, just looped here until target_length is reached instead of once per
+    request/tick. Every batch's tracks are tagged with a stable item_id
+    (append_radio_playlist_items) and appended to radio_session.playlist, and
+    the generator's own persisted state (track_frontier/fallback_expanded_artists/
+    seen_track_keys) is saved after every batch so a later low-playlist
+    refill (playback_advancer._advance_spotify) picks up exactly where this
+    left off rather than restarting the walk.
+
+    Runs on its own connection (get_db_connection directly, not the
+    request-scoped Depends(get_db)) since this outlives the HTTP request that
+    kicked it off."""
+    conn = get_db_connection()
+    if conn is None:
+        set_radio_session_generation_status(session_id, 'error')
+        return
+    try:
+        session = {
+            'seed_artists': seed_artists, 'seed_track_name': seed_track_name,
+            'seed_artist_name': seed_artist_name, 'track_frontier': [], 'fallback_expanded_artists': [],
+        }
+        seed_key = radio_engine.radio_track_key(seed_track_name, seed_artist_name) if seed_track_name and seed_artist_name else None
+        seen_keys = [seed_key] if seed_key else []
+        total = 0
+        while total < target_length:
+            batch_count = min(RADIO_GENERATE_BATCH_SIZE, target_length - total)
+            track_dicts, track_frontier, fallback_expanded_artists, _degraded = radio_engine.generate_radio_batch_track_first(
+                session, seen_keys, batch_count, conn,
+            )
+            if not track_dicts:
+                # Genuine exhaustion within one call - all 3 tiers dry, same
+                # signal /more's own `exhausted` flag uses. Nothing more to
+                # generate right now; the session still works with fewer
+                # than target_length tracks, and playback_advancer's own
+                # refill will try again once actual playback catches up.
+                break
+            for t in track_dicts:
+                t['source'] = 'in_library' if ('id' in t or 'spotify_uri' in t) else 'unresolved'
+            append_radio_playlist_items(session_id, track_dicts)
+            new_keys = [radio_engine.radio_track_key(t['track_name'], t['artist_name']) for t in track_dicts]
+            seen_keys.extend(new_keys)
+            append_seen_track_keys(session_id, new_keys)
+            set_radio_session_track_state(session_id, track_frontier, fallback_expanded_artists)
+            session['track_frontier'] = track_frontier
+            session['fallback_expanded_artists'] = fallback_expanded_artists
+            total += len(track_dicts)
+        set_radio_session_generation_status(session_id, 'ready')
+    except Exception as e:
+        print(f"Radio playlist generation failed for session {session_id}: {e}")
+        set_radio_session_generation_status(session_id, 'error')
+    finally:
+        conn.close()
+
+@app.post("/api/radio/generate", response_model=RadioSessionInfo)
+def generate_radio_playlist(params: RadioGenerateRequest):
+    """Kicks off the new pre-generated-playlist flow (spotify+discovery
+    only - other seed/destination combos keep using /api/radio/start's
+    immediate-start behavior, unchanged). Returns as soon as the session row
+    exists, with generation_status='generating' - the frontend polls
+    GET /api/radio/{id} until it flips to 'ready' (or 'error') and renders
+    the resulting playlist before anything plays; see
+    /api/radio/{id}/play for the explicit "start playback" step."""
+    if not lastfm.is_configured():
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Last.fm not configured - set LASTFM_API_KEY")
+    if not params.seed_artists:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No seed artists to start radio from")
+
+    target_length = max(1, min(params.target_length or 500, RADIO_GENERATE_MAX_LENGTH))
+    seed_description = params.seed_description or f"Radio from {', '.join(params.seed_artists[:3])}"
+    seed_key = (
+        radio_engine.radio_track_key(params.seed_track_name, params.seed_artist_name)
+        if params.seed_track_name and params.seed_artist_name else None
+    )
+
+    session_id = create_radio_session(
+        seed_type=params.seed_type, seed_description=seed_description, seed_artists=params.seed_artists,
+        destination_type='spotify', seen_track_keys=[seed_key] if seed_key else [], engine='discovery',
+        seed_track_name=params.seed_track_name, seed_artist_name=params.seed_artist_name,
+        target_length=target_length, generation_status='generating',
+    )
+    if session_id is None:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Could not start a radio session")
+
+    threading.Thread(
+        target=_run_radio_generation,
+        args=(session_id, params.seed_artists, params.seed_track_name, params.seed_artist_name, target_length),
+        daemon=True,
+    ).start()
+
+    return get_radio_session(session_id)
 
 @app.post("/api/radio/start", response_model=RadioStartResponse)
 def start_radio(params: RadioStartRequest, db: psycopg2.extensions.connection = Depends(get_db)):
@@ -3027,6 +3174,138 @@ def get_more_radio_tracks(session_id: int, params: RadioMoreRequest, db: psycopg
 
     return {"tracks": [Track(**t) for t in track_dicts], "exhausted": len(track_dicts) == 0, "degraded": degraded}
 
+class RadioPlayRequest(BaseModel):
+    device_id: str
+
+@app.post("/api/radio/{session_id}/play", response_model=RadioSessionInfo)
+def play_radio_session(session_id: int, params: RadioPlayRequest):
+    """The explicit "start playback" step (spec point 4) - separate from
+    /api/radio/generate on purpose, so a generated playlist can be reviewed/
+    reordered/deleted before anything actually plays. Only for a session
+    built by /api/radio/generate (spotify+discovery, generation_status
+    already 'ready')."""
+    session = get_radio_session(session_id)
+    if session is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No radio session with that id")
+    if session['destination_type'] != 'spotify' or session['engine'] != 'discovery':
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Only spotify+discovery radio sessions support /play")
+    if session['generation_status'] != 'ready':
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Playlist is not ready yet (status: {session['generation_status']})")
+    playlist = session['playlist'] or []
+    if not playlist:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Generated playlist is empty")
+
+    # Spec point 1: clear, then actually verify it's clear - today's
+    # pre-start clear (frontend, handleStartRadio) fires clear_queue_for_device
+    # and moves on with no readback at all. One extra bounded pass if the
+    # first one didn't fully settle (still bounded by clear_queue's own
+    # internal caps - not a retry loop).
+    spotify_connect.clear_queue_for_device(params.device_id)
+    verify = spotify_connect.get_queue()
+    if verify and verify.get('queue'):
+        spotify_connect.clear_queue_for_device(params.device_id)
+
+    first_item = playlist[0]
+    match_result = playback_advancer.resolve_playlist_item(first_item)
+    if not match_result.get('matched'):
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Could not find the first track on Spotify")
+
+    play_result = spotify_connect.play_uris(params.device_id, [match_result['uri']])
+    if play_result == 'superseded':
+        # A newer play()/play_uris() call for this device already won - see
+        # play_uris' own docstring. Not an error; just don't clobber
+        # whatever that newer call already set.
+        return get_radio_session(session_id)
+    if play_result is not True:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Could not start playback on that device")
+
+    now_playing = {
+        'id': match_result['uri'], 'uri': match_result['uri'], 'source': 'spotify', 'context_uri': None,
+        'track_name': first_item['track_name'], 'artist_name': first_item['artist_name'],
+        'album_name': first_item.get('album_name'), 'artwork_url': match_result.get('artwork_url'),
+        'radio_session_id': session_id,
+        'selection_reason': first_item.get('selection_reason'), 'selection_engine': first_item.get('selection_engine'),
+    }
+    if first_item.get('id') is not None:
+        now_playing['local_id'] = first_item['id']
+    if first_item.get('radio_track_id') is not None:
+        now_playing['radio_track_id'] = first_item['radio_track_id']
+
+    # Pops the first item off the persisted playlist - _advance_spotify's
+    # retargeted refill loop (playback_advancer.py) picks up from here on
+    # its very next tick, walking the remainder to (re)fill the lookahead
+    # queue back up to depth 2.
+    set_radio_session_playlist(session_id, playlist[1:])
+    save_playback_session(
+        destination_type='spotify', destination_id=params.device_id,
+        now_playing=now_playing, queue=[], spotify_match_pool={'radio_session_id': session_id},
+    )
+    return get_radio_session(session_id)
+
+class RadioSwitchDeviceRequest(BaseModel):
+    device_id: str
+
+@app.post("/api/radio/{session_id}/switch-device", response_model=RadioSessionInfo)
+def switch_radio_device(session_id: int, params: RadioSwitchDeviceRequest):
+    """Moves an already-*playing* radio session to a different Spotify
+    Connect device, continuing from whatever's currently playing rather than
+    restarting from the top of the playlist - unlike /play (which always
+    pops playlist[0], the "start a brand new session" case), this reuses the
+    existing now_playing/queue as-is and just re-targets which device they
+    play on.
+
+    A previous approach let the frontend's own generic "cast to device on
+    change" effect handle this by blindly re-sending [now_playing, ...queue]
+    - that effect has no concept of radio_session.playlist at all, and
+    racing it against this session's own reconciliation
+    (playback_advancer._reconcile_radio_queue) corrupted the queue and left
+    a device stuck - confirmed live. That effect now skips entirely for an
+    active radio session (see App.js), and this route is the replacement:
+    same clear-then-verify tooling /play uses, then plays the *current*
+    track (not the playlist's next one) and re-establishes the same
+    already-committed lookahead queue on the new device."""
+    session = get_radio_session(session_id)
+    if session is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No radio session with that id")
+    if session['destination_type'] != 'spotify' or session['engine'] != 'discovery':
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Only spotify+discovery radio sessions support switching devices")
+    if session['status'] != 'active':
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="This radio session has been stopped")
+
+    playback = get_playback_session() or {}
+    now_playing = playback.get('now_playing')
+    if not now_playing or now_playing.get('radio_session_id') != session_id:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="This radio session isn't the one currently playing")
+
+    # Same clear-then-verify as /play.
+    spotify_connect.clear_queue_for_device(params.device_id)
+    verify = spotify_connect.get_queue()
+    if verify and verify.get('queue'):
+        spotify_connect.clear_queue_for_device(params.device_id)
+
+    play_result = spotify_connect.play_uris(params.device_id, [now_playing['uri']])
+    if play_result == 'superseded':
+        return get_radio_session(session_id)
+    if play_result is not True:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Could not start playback on that device")
+
+    # The already-committed lookahead (up to 2 tracks, already resolved to
+    # real Spotify URIs) is meaningless on the *old* device now - re-add it
+    # to the new one so Up Next doesn't sit empty until the advancer's next
+    # refill tick happens to top it back up.
+    committed_queue = playback.get('queue') or []
+    for item in committed_queue:
+        if item.get('uri'):
+            spotify_connect.add_to_queue(params.device_id, item['uri'])
+
+    save_playback_session(
+        destination_type='spotify', destination_id=params.device_id,
+        now_playing=now_playing, queue=committed_queue,
+        shuffle_enabled=playback.get('shuffle_enabled', False), spotify_match_pool=playback.get('spotify_match_pool'),
+        chromecast_pushed_count=playback.get('chromecast_pushed_count'), last_status=playback.get('last_status'),
+    )
+    return get_radio_session(session_id)
+
 @app.get("/api/radio/{session_id}", response_model=RadioSessionInfo)
 def get_radio_session_route(session_id: int):
     """Lets the frontend confirm a radio_session_id it already has (from a
@@ -3042,6 +3321,85 @@ def get_radio_session_route(session_id: int):
     if session is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No radio session with that id")
     return session
+
+class RadioQueueItemRequest(BaseModel):
+    item_id: int
+
+def _reorder_or_remove_committed(session_id, item_id, committed_queue, playback, remove):
+    """Shared by /reorder and /remove for the case where item_id is already
+    committed (add_to_queue'd) - present in the singleton playback_session
+    row's own queue, not radio_session.playlist. Returns True if it handled
+    (and persisted) the request, False if item_id wasn't found there (so the
+    caller falls through to check playlist instead). Either way, touching a
+    committed item means Spotify's real device queue no longer necessarily
+    matches - flags reconciliation (spec point 9) rather than fixing it
+    inline here, same edge-triggered check _advance_spotify_radio_playlist
+    already runs each tick."""
+    for i, entry in enumerate(committed_queue):
+        if entry.get('item_id') != item_id:
+            continue
+        if remove:
+            new_queue = committed_queue[:i] + committed_queue[i + 1:]
+        elif i == 0:
+            return True  # reorder to top, already there - nothing to do
+        else:
+            new_queue = [committed_queue[i]] + committed_queue[:i] + committed_queue[i + 1:]
+        save_playback_session(
+            destination_type=playback.get('destination_type'), destination_id=playback.get('destination_id'),
+            now_playing=playback.get('now_playing'), queue=new_queue,
+            shuffle_enabled=playback.get('shuffle_enabled', False), spotify_match_pool=playback.get('spotify_match_pool'),
+            chromecast_pushed_count=playback.get('chromecast_pushed_count'), last_status=playback.get('last_status'),
+        )
+        playback_advancer.flag_radio_reconcile(session_id)
+        return True
+    return False
+
+@app.post("/api/radio/{session_id}/reorder", response_model=RadioSessionInfo)
+def reorder_radio_playlist(session_id: int, params: RadioQueueItemRequest):
+    """Spec point 7 - moves item_id to the front of wherever it currently
+    lives. A not-yet-committed playlist item promotes within the pending
+    list only (cheap, purely local - it becomes whatever the refill loop
+    tries next, no Spotify interaction needed). An already-committed item
+    (one of the up-to-2 already add_to_queue'd lookahead tracks) swaps
+    within that small set instead, since it's already resolved - see
+    _reorder_or_remove_committed."""
+    session = get_radio_session(session_id)
+    if session is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No radio session with that id")
+
+    playback = get_playback_session() or {}
+    if _reorder_or_remove_committed(session_id, params.item_id, playback.get('queue') or [], playback, remove=False):
+        return get_radio_session(session_id)
+
+    playlist = list(session.get('playlist') or [])
+    for i, item in enumerate(playlist):
+        if item.get('item_id') == params.item_id:
+            if i > 0:
+                set_radio_session_playlist(session_id, [playlist[i]] + playlist[:i] + playlist[i + 1:])
+            return get_radio_session(session_id)
+
+    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No playlist item with that id")
+
+@app.post("/api/radio/{session_id}/remove", response_model=RadioSessionInfo)
+def remove_radio_playlist_item(session_id: int, params: RadioQueueItemRequest):
+    """Spec point 8. Same split as reorder - a committed item needs the
+    singleton playback_session.queue touched (and reconciliation flagged)
+    since Spotify's real device was already told to queue it; a pending
+    playlist item is a pure local splice."""
+    session = get_radio_session(session_id)
+    if session is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No radio session with that id")
+
+    playback = get_playback_session() or {}
+    if _reorder_or_remove_committed(session_id, params.item_id, playback.get('queue') or [], playback, remove=True):
+        return get_radio_session(session_id)
+
+    playlist = session.get('playlist') or []
+    new_playlist = [item for item in playlist if item.get('item_id') != params.item_id]
+    if len(new_playlist) == len(playlist):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No playlist item with that id")
+    set_radio_session_playlist(session_id, new_playlist)
+    return get_radio_session(session_id)
 
 @app.post("/api/radio/{session_id}/stop")
 def stop_radio(session_id: int):

@@ -311,6 +311,27 @@ def create_tables():
             cur.execute("ALTER TABLE radio_session ADD COLUMN IF NOT EXISTS seed_artist_name TEXT;")
             cur.execute("ALTER TABLE radio_session ADD COLUMN IF NOT EXISTS track_frontier JSONB DEFAULT '[]'::jsonb;")
             cur.execute("ALTER TABLE radio_session ADD COLUMN IF NOT EXISTS fallback_expanded_artists JSONB DEFAULT '[]'::jsonb;")
+            # Pre-generated, editable playlist support (the whole point being
+            # to generate a full ordered list *before* anything plays, so it
+            # can be reviewed/reordered/deleted, rather than discovering it a
+            # couple tracks at a time as the old model did). playlist is the
+            # ordered list of NOT-YET-PLAYED items, each carrying a stable
+            # item_id (from next_item_id, a per-session counter - identity,
+            # not array position, so reorder/delete-by-id survives reordering
+            # rather than racing a plain index). generation_status lets the
+            # frontend poll a background-generated playlist without blocking
+            # the request that kicked it off.
+            cur.execute("ALTER TABLE radio_session ADD COLUMN IF NOT EXISTS target_length INTEGER DEFAULT 500;")
+            cur.execute("ALTER TABLE radio_session ADD COLUMN IF NOT EXISTS playlist JSONB DEFAULT '[]'::jsonb;")
+            cur.execute("ALTER TABLE radio_session ADD COLUMN IF NOT EXISTS generation_status TEXT DEFAULT 'ready';")
+            cur.execute("ALTER TABLE radio_session ADD COLUMN IF NOT EXISTS next_item_id INTEGER DEFAULT 0;")
+            # A crash mid-generation would otherwise leave generation_status
+            # stuck at 'generating' forever - nothing else would ever set it,
+            # and the frontend's poll would spin indefinitely with no
+            # timeout. Anything still 'generating' at boot definitely isn't
+            # (the thread that was generating it is gone), so it's a genuine
+            # failure, not an in-progress job to wait on.
+            cur.execute("UPDATE radio_session SET generation_status = 'error' WHERE generation_status = 'generating';")
             print("Table 'radio_session' checked/created successfully.")
 
             # One row per real (non-short-circuited) Spotify /search call -
@@ -1458,7 +1479,8 @@ RADIO_SEEN_TRACK_KEYS_CAP = 500
 
 
 def create_radio_session(seed_type, seed_description, seed_artists, destination_type, seen_track_keys, engine='discovery',
-                          seed_track_name=None, seed_artist_name=None, track_frontier=None):
+                          seed_track_name=None, seed_artist_name=None, track_frontier=None,
+                          target_length=None, generation_status='ready'):
     """Starts a new radio_session row. seen_track_keys is the caller's
     already-lowercased list of "track|||artist" keys for the first batch of
     tracks it just generated, so a subsequent /more call's dedup starts from
@@ -1487,12 +1509,12 @@ def create_radio_session(seed_type, seed_description, seed_artists, destination_
         cur.execute("UPDATE radio_session SET status = 'stopped', updated_at = NOW() WHERE status = 'active'")
         cur.execute("""
             INSERT INTO radio_session (seed_type, seed_description, seed_artists, seen_track_keys, destination_type, engine, status,
-                                        seed_track_name, seed_artist_name, track_frontier)
-            VALUES (%s, %s, %s, %s, %s, %s, 'active', %s, %s, %s)
+                                        seed_track_name, seed_artist_name, track_frontier, target_length, generation_status)
+            VALUES (%s, %s, %s, %s, %s, %s, 'active', %s, %s, %s, %s, %s)
             RETURNING id
         """, (
             seed_type, seed_description, Json(seed_artists), Json(seen_track_keys[-RADIO_SEEN_TRACK_KEYS_CAP:]), destination_type, engine,
-            seed_track_name, seed_artist_name, Json(track_frontier or []),
+            seed_track_name, seed_artist_name, Json(track_frontier or []), target_length, generation_status,
         ))
         session_id = cur.fetchone()[0]
         conn.commit()
@@ -1514,7 +1536,8 @@ def get_radio_session(session_id):
         cur.execute("""
             SELECT id, seed_type, seed_description, seed_artists, seen_track_keys, destination_type,
                    ytmusic_playlist_id, ytmusic_push_job_id, status, engine,
-                   seed_track_name, seed_artist_name, track_frontier, fallback_expanded_artists
+                   seed_track_name, seed_artist_name, track_frontier, fallback_expanded_artists,
+                   target_length, playlist, generation_status, next_item_id
             FROM radio_session WHERE id = %s
         """, (session_id,))
         row = cur.fetchone()
@@ -1527,6 +1550,8 @@ def get_radio_session(session_id):
             'ytmusic_push_job_id': row[7], 'status': row[8], 'engine': row[9],
             'seed_track_name': row[10], 'seed_artist_name': row[11],
             'track_frontier': row[12] or [], 'fallback_expanded_artists': row[13] or [],
+            'target_length': row[14], 'playlist': row[15] or [], 'generation_status': row[16],
+            'next_item_id': row[17] or 0,
         }
     except Error as e:
         print(f"Error reading radio session {session_id}: {e}")
@@ -1584,6 +1609,127 @@ def set_radio_session_track_state(session_id, track_frontier, fallback_expanded_
         cur.close()
     except Error as e:
         print(f"Error saving track-first state for radio session {session_id}: {e}")
+    finally:
+        if conn:
+            conn.close()
+
+
+def set_radio_session_generation_status(session_id, generation_status):
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE radio_session SET generation_status = %s, updated_at = NOW() WHERE id = %s",
+            (generation_status, session_id),
+        )
+        conn.commit()
+        cur.close()
+    except Error as e:
+        print(f"Error setting generation status for radio session {session_id}: {e}")
+    finally:
+        if conn:
+            conn.close()
+
+
+def append_radio_playlist_items(session_id, items):
+    """Assigns each item a stable item_id (from the session's own
+    next_item_id counter) and appends it to the session's playlist -
+    identity, not array position, so a later reorder/remove-by-id survives
+    the list being reordered or partially consumed in between. Read-merge-
+    write, same lost-write race tolerance as append_seen_track_keys (no
+    locking) - acceptable here since this is only ever called by the single
+    background generation thread or the single advancer thread for a given
+    session, never concurrently with itself.
+
+    Returns the items with their assigned item_id, so the caller (the
+    generation background job) can use them without a second read."""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT playlist, next_item_id FROM radio_session WHERE id = %s", (session_id,))
+        row = cur.fetchone()
+        if not row:
+            cur.close()
+            return []
+        existing_playlist = row[0] or []
+        next_id = row[1] or 0
+        tagged = []
+        for item in items:
+            tagged_item = dict(item)
+            tagged_item['item_id'] = next_id
+            next_id += 1
+            tagged.append(tagged_item)
+        cur.execute(
+            "UPDATE radio_session SET playlist = %s, next_item_id = %s, updated_at = NOW() WHERE id = %s",
+            (Json(existing_playlist + tagged), next_id, session_id),
+        )
+        conn.commit()
+        cur.close()
+        return tagged
+    except Error as e:
+        print(f"Error appending playlist items for radio session {session_id}: {e}")
+        return []
+    finally:
+        if conn:
+            conn.close()
+
+
+def assign_radio_playlist_item_ids(session_id, items):
+    """Tags items with fresh stable item_ids and advances next_item_id -
+    unlike append_radio_playlist_items, does NOT touch the playlist column
+    at all. Needed by playback_advancer's consumption tick specifically:
+    that tick trims its own in-memory copy of playlist as it goes (popping
+    matched/discarded items) *in the same tick* it might also extend the
+    list, so a read-modify-write against the DB's playlist column here would
+    race against - and undo - that in-memory trimming. The caller merges
+    these tagged items into its own already-correct in-memory list and
+    persists the whole thing once via set_radio_session_playlist."""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT next_item_id FROM radio_session WHERE id = %s", (session_id,))
+        row = cur.fetchone()
+        if not row:
+            cur.close()
+            return []
+        next_id = row[0] or 0
+        tagged = []
+        for item in items:
+            tagged_item = dict(item)
+            tagged_item['item_id'] = next_id
+            next_id += 1
+            tagged.append(tagged_item)
+        cur.execute("UPDATE radio_session SET next_item_id = %s WHERE id = %s", (next_id, session_id))
+        conn.commit()
+        cur.close()
+        return tagged
+    except Error as e:
+        print(f"Error assigning playlist item ids for radio session {session_id}: {e}")
+        return []
+    finally:
+        if conn:
+            conn.close()
+
+
+def set_radio_session_playlist(session_id, playlist):
+    """Overwrite (not merge) - callers (the advancer's consumption loop,
+    reorder/remove routes) always compute the full resulting list themselves
+    first, same idiom as set_radio_session_track_state."""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE radio_session SET playlist = %s, updated_at = NOW() WHERE id = %s",
+            (Json(playlist), session_id),
+        )
+        conn.commit()
+        cur.close()
+    except Error as e:
+        print(f"Error saving playlist for radio session {session_id}: {e}")
     finally:
         if conn:
             conn.close()

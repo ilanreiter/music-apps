@@ -369,6 +369,96 @@ main.with-player {
   white-space: nowrap;
 }
 
+.radio-target-length-input {
+  width: 80px;
+  padding: 6px 8px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--bg-input);
+  color: var(--text-main);
+}
+
+.radio-playlist-preview {
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px solid var(--border);
+}
+
+.radio-playlist-preview-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-bottom: 4px;
+}
+
+.radio-playlist-preview-header h3 {
+  margin: 0;
+}
+
+.radio-playlist-preview-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.radio-playlist-preview-generating {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.radio-playlist-preview-generating .empty-state {
+  margin: 0;
+}
+
+.radio-playlist-preview-table-wrap {
+  max-height: 480px;
+  overflow-y: auto;
+}
+
+.radio-playlist-preview-row {
+  cursor: pointer;
+}
+
+.radio-playlist-preview-row:hover {
+  background: var(--bg-card-hover);
+}
+
+.radio-playlist-preview-row-static {
+  cursor: default;
+}
+
+.radio-playlist-preview-row-static:hover {
+  background: none;
+}
+
+.radio-playlist-preview-nowplaying {
+  background: var(--accent-soft);
+}
+
+.radio-playlist-preview-remove-col {
+  width: 32px;
+  text-align: right;
+}
+
+.radio-playlist-remove-btn {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  font-size: 0.9rem;
+  cursor: pointer;
+  padding: 2px 6px;
+  border-radius: 6px;
+}
+
+.radio-playlist-remove-btn:hover {
+  color: var(--text-main);
+  background: var(--bg-card-hover);
+}
+
 .settings-section {
   margin-top: 24px;
   padding-top: 20px;

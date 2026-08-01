@@ -447,6 +447,22 @@ _intent_lock = threading.Lock()
 _intent_counter = 0
 _latest_intent = {}  # device_id -> int, the most recent play()/play_uris() call for that device
 
+# This app's own goal state per device - 'play' from the moment play()/
+# play_uris() is called (regardless of whether that specific attempt ends up
+# confirmed - the *intent* is still "should be playing" until an explicit
+# pause() succeeds), 'pause' only once pause() actually confirms. Lets a
+# poller (playback_advancer._maybe_auto_resume) tell "this device silently
+# dropped out of playback on its own" apart from "this app told it to pause"
+# - confirmed live (Office Streamer onn) that a device can genuinely
+# confirm-play and then drop back to paused a while later with nothing
+# noticing, since near_end/passive-reconciliation only react to the *track*
+# changing, not playback silently stopping while the same one stays loaded.
+_desired_state = {}  # device_id -> 'play' | 'pause'
+
+
+def get_desired_state(device_id):
+    return _desired_state.get(device_id)
+
 
 def _start_intent(device_id):
     """Claims this call as the newest thing that should be playing on
@@ -506,6 +522,7 @@ def play(device_id, context_uri, track_uri=None, drain_queue=False):
     for what was actually just a normal race between two of their own quick
     actions (e.g. pressing Next twice)."""
     token = _start_intent(device_id)
+    _desired_state[device_id] = 'play'
     if drain_queue:
         # Must transfer first - clear_queue's GET /me/player/queue and the
         # `next` calls it drains with both act on whatever device is
@@ -528,6 +545,8 @@ def play(device_id, context_uri, track_uri=None, drain_queue=False):
 
 def pause(device_id):
     result = _api_request('PUT', '/me/player/pause', params={'device_id': device_id})
+    if result is not None:
+        _desired_state[device_id] = 'pause'
     return result is not None
 
 
@@ -998,6 +1017,7 @@ def play_uris(device_id, uris, drain_queue=False):
     previously conflated, surfacing a misleading error to the user for a
     normal race between two of their own quick actions)."""
     token = _start_intent(device_id)
+    _desired_state[device_id] = 'play'
     if drain_queue:
         # Must transfer first - see the matching comment in play().
         _transfer_to_device(device_id)

@@ -1,6 +1,7 @@
 import os
 import re
 import time
+import traceback
 
 from . import wiim
 from . import chromecast
@@ -9,6 +10,7 @@ from . import radio_engine
 from .database import (
     get_db_connection, get_radio_session, append_seen_track_keys, upsert_radio_discovered_track,
     set_radio_session_track_state, find_known_track_external_match,
+    set_radio_session_playlist, assign_radio_playlist_item_ids,
 )
 
 PUBLIC_BASE_URL = os.environ.get('PUBLIC_BASE_URL', 'http://localhost:8001')
@@ -68,6 +70,13 @@ RADIO_ADVANCER_REFILL_BATCH = 10
 # buffered means there's always still something to advance to immediately,
 # even if a given tick's refill is slow, misses, or is briefly rate-limited.
 SPOTIFY_QUEUE_LOOKAHEAD_DEPTH = 2
+
+# How long to wait between auto-resume attempts for the same device - see
+# _maybe_auto_resume. Bounded so a genuinely offline/broken device doesn't
+# get a fresh resume() call hammered at it every single 5s poll tick forever;
+# 15s still recovers well within the span of a typical track.
+AUTO_RESUME_COOLDOWN_SECONDS = 15
+_last_auto_resume_attempt = {}  # device_id -> time.time() of the last attempt
 
 
 def _track_to_cast_item(track):
@@ -318,6 +327,75 @@ def _match_text_candidate(track_name, artist_name):
     return {"matched": True, "uri": match['uri'], "artwork_url": match.get('artwork_url')}
 
 
+def resolve_playlist_item(item):
+    """Resolves one radio_session.playlist item to a playable Spotify URI -
+    the exact 3-way branch _advance_spotify's own refill loop uses (a
+    radio_discovered_tracks cache hit needs no lookup at all, a known_tracks
+    id uses the cache-first matcher, a plain text candidate gets a live
+    search), pulled out so main.py's /api/radio/{id}/play route (resolving
+    just the first item, before the refill loop's own tick ever runs) and
+    the refill loop itself share one implementation instead of two copies
+    drifting apart. No underscore prefix - called from main.py."""
+    if item.get('spotify_uri') is not None:
+        return {"matched": True, "uri": item['spotify_uri'], "artwork_url": item.get('artwork_url')}
+    if item.get('id') is not None:
+        return _match_local_track_cached(item['id'], item.get('track_name'), item.get('artist_name'))
+    return _match_text_candidate(item.get('track_name'), item.get('artist_name'))
+
+
+def _maybe_auto_resume(destination_id, result, is_radio_session=False):
+    """Detects a Spotify Connect device silently reporting 'pause' even
+    though this app's own last play()/play_uris() call for it was never
+    followed by a real pause() - see spotify_connect.get_desired_state.
+    Confirmed live (a budget streamer on this account, "Office Streamer
+    onn"), twice: a device can genuinely confirm-play, then drop back to
+    paused a while later entirely on its own (real device/network flakiness)
+    - and separately, a *natural* track-to-track advance (passive
+    reconciliation, not this app's own play_uris call - see _advance_spotify)
+    can itself land the new track paused-at-position-0 instead of playing.
+    Neither is caught by near_end/passive-reconciliation, which only react
+    to the *track* changing, not playback silently stopping while the
+    current (or a just-advanced-to) one stays loaded.
+
+    Deliberately treats *any* pause this app didn't itself issue as
+    something to recover from, including one from outside this app entirely
+    (a voice command, another Spotify client, a physical remote) - same
+    "keep playing unless explicitly told to stop" principle already applied
+    to Radio elsewhere (never stop on its own). A user who genuinely wants
+    to stop has this app's own Pause/Stop controls for that, which set
+    desired_state to 'pause' and are always respected here.
+
+    For a radio session specifically, desired_state of None (nothing ever
+    explicitly recorded - e.g. right after this process restarted, or the
+    pause happened via the passive-reconciliation path above rather than a
+    tracked play_uris call) is treated the same as 'play', not "unknown,
+    don't touch": an active radio session's whole premise is continuous
+    playback, so silence with no recorded intent either way defaults to
+    "should be playing," not to leaving it paused indefinitely. Non-radio
+    playback keeps the stricter check (desired_state must be exactly
+    'play') - there's no equivalent "must never stop" guarantee made for a
+    plain single-track cast, so an unrecorded pause there is left alone
+    rather than assumed to need fixing.
+
+    resume() already re-fetches the paused position and replays it exactly
+    (not from 0), and already runs the device through _transfer_to_device
+    first - the same recovery play_uris' own docstring documents needing for
+    this class of device. Bounded by AUTO_RESUME_COOLDOWN_SECONDS so a
+    genuinely offline device doesn't get hammered every tick."""
+    if result.get('status') != 'pause':
+        return
+    desired = spotify_connect.get_desired_state(destination_id)
+    should_be_playing = desired == 'play' or (is_radio_session and desired is None)
+    if not should_be_playing:
+        return
+    last_attempt = _last_auto_resume_attempt.get(destination_id, 0)
+    if time.time() - last_attempt < AUTO_RESUME_COOLDOWN_SECONDS:
+        return
+    _last_auto_resume_attempt[destination_id] = time.time()
+    print(f"auto-resume {destination_id}: found paused (desired={desired!r}, radio={is_radio_session}) at {result.get('track_uri')!r}, resuming")
+    spotify_connect.resume(destination_id)
+
+
 def _advance_spotify_native(save_session, destination_id, match_pool):
     """Mirrors a spotify_native radio session's state instead of driving it -
     this app only ever plays the seed track (see main.py's start_radio_native),
@@ -335,6 +413,7 @@ def _advance_spotify_native(save_session, destination_id, match_pool):
     status_result = spotify_connect.get_status(destination_id)
     if status_result is not None:
         save_session(last_status=status_result)
+        _maybe_auto_resume(destination_id, status_result, is_radio_session=True)
 
     queue_result = spotify_connect.get_queue()
     if queue_result is None:
@@ -362,6 +441,182 @@ def _advance_spotify_native(save_session, destination_id, match_pool):
         # its own fresh state while this tick was waiting on them.
         return match_pool
     save_session(now_playing=now_playing, queue=tagged_queue)
+    return match_pool
+
+
+# Session ids flagged by main.py's /api/radio/{id}/reorder or /remove routes
+# when the edited item was already committed (add_to_queue'd) to Spotify's
+# real queue - consumed (checked-and-cleared) once by _advance_spotify's next
+# tick for that session, see flag_radio_reconcile/_reconcile_radio_queue.
+# Plain in-memory set, no lock - same lost-write race tolerance already
+# accepted elsewhere in this codebase (append_seen_track_keys); worst case a
+# flag added the same instant a tick reads it waits one more 5s tick.
+_reconcile_pending = set()
+
+
+def flag_radio_reconcile(radio_session_id):
+    _reconcile_pending.add(radio_session_id)
+
+
+def _reconcile_radio_queue(destination_id, radio_session_id, committed_queue):
+    """Spec point 9, corrected version: verifies every track this session has
+    committed (add_to_queue'd) is actually present in Spotify's real
+    upcoming queue, adding whichever ones are missing. Deliberately additive
+    only - never drains/skips.
+
+    The first version of this used clear_queue_for_device to fix a mismatch,
+    which was a real, confirmed-live bug: clear_queue_for_device transfers to
+    the device with `'play': False` and then drains by repeatedly calling
+    Spotify's own `next` - which advances *whatever's currently playing*,
+    not just queued residue behind it. Reconciliation never re-asserts the
+    current track afterward the way /play and /switch-device do (they
+    immediately follow their own drain with a fresh play_uris call) - so
+    every "correction" was actually skipping straight past the real
+    currently-playing track into arbitrary further tracks, then pausing on
+    top of it. That's what surfaced as repeated restarts and now_playing
+    jumping to an unrelated track.
+
+    Trade-off accepted: this can no longer fix the *order* of two tracks
+    that are both already sitting in Spotify's real queue (e.g. undoing a
+    reorder-to-top click on an already-committed item) - there's no safe way
+    to do that without skip-based draining, which is exactly what's unsafe
+    here. A missing track still gets added; an existing one just can't be
+    reordered without risking exactly the corruption above. Correctness of
+    what's *currently playing* wins over strict queue ordering.
+
+    Callers are responsible for only invoking this on a genuine edge (a
+    transition just happened, or a committed item was just added/removed)
+    and never on every idle tick - see _advance_spotify_radio_playlist,
+    which also guarantees this never runs on the same tick as a fresh
+    add_to_queue (get_queue() is laggy relative to a just-issued write -
+    reconciling immediately after one would see the app's own pending add as
+    "missing" and duplicate it)."""
+    expected_uris = [t.get('uri') for t in committed_queue if t.get('uri')]
+    if not expected_uris:
+        return
+    real = spotify_connect.get_queue()
+    if real is None:
+        print(f"radio reconcile {radio_session_id}: get_queue() failed, skipping this round")
+        return
+    real_uris = [t.get('uri') for t in (real.get('queue') or [])]
+    missing = [uri for uri in expected_uris if uri not in real_uris]
+    if not missing:
+        return
+    print(f"radio reconcile {radio_session_id}: {missing} missing from Spotify's real queue (real: {real_uris}) - adding")
+    for uri in missing:
+        ok = spotify_connect.add_to_queue(destination_id, uri)
+        if not ok:
+            print(f"radio reconcile {radio_session_id}: add_to_queue failed for {uri}")
+
+
+def _advance_spotify_radio_playlist(save_session, destination_id, queue, radio_session_id, match_pool, should_reconcile):
+    """Consumes radio_session.playlist directly - the new pre-generated,
+    externally reorderable/deletable list (main.py's /api/radio/generate,
+    /reorder, /remove) - instead of match_pool.candidates/cursor. Same
+    algorithm the old candidates/cursor loop used (every examined item is
+    discarded exactly once, matched or not - see the plain-pool loop below
+    this function, which still uses that model for non-radio pools): pop
+    from the front, resolve, either queue it and stop for this tick, or
+    count a miss and keep going up to SPOTIFY_MATCH_CONSECUTIVE_CAP. Reads
+    the playlist once, walks an in-memory copy, and persists the trimmed/
+    extended result in as few writes as possible.
+
+    Runs should_reconcile's check *before* attempting any match this tick
+    (using `queue` as it stood at the *start* of this tick, i.e. describing
+    the previous tick's already-settled state) - never after a fresh
+    add_to_queue in the same call, which would race get_queue()'s lag."""
+    if should_reconcile:
+        _reconcile_radio_queue(destination_id, radio_session_id, queue)
+
+    session = get_radio_session(radio_session_id)
+    if session is None or session.get('status') != 'active':
+        return match_pool
+    if len(queue) >= SPOTIFY_QUEUE_LOOKAHEAD_DEPTH:
+        return match_pool
+
+    playlist = list(session.get('playlist') or [])
+    consecutive_misses = 0
+    extended_once = False
+
+    while True:
+        while playlist and consecutive_misses < SPOTIFY_MATCH_CONSECUTIVE_CAP:
+            item = playlist.pop(0)
+            match_result = resolve_playlist_item(item)
+            if match_result.get('reason') == 'unavailable':
+                # Same rule as the plain-pool loop - doesn't count toward
+                # consecutive_misses, and this item simply isn't retried
+                # (spotify_prewarm.py's own sweep picks it up eventually).
+                continue
+            if match_result.get('matched'):
+                found = {
+                    'id': match_result['uri'], 'source': 'spotify', 'uri': match_result['uri'], 'context_uri': None,
+                    'track_name': item.get('track_name'), 'artist_name': item.get('artist_name'),
+                    'album_name': item.get('album_name'), 'artwork_url': match_result.get('artwork_url'),
+                    'selection_reason': item.get('selection_reason'), 'selection_engine': item.get('selection_engine'),
+                    'radio_session_id': radio_session_id,
+                    # Carried forward from the playlist item so main.py's
+                    # /reorder and /remove routes can still address an
+                    # already-committed (add_to_queue'd) entry by the same id
+                    # the frontend already has for it - it doesn't stop being
+                    # "the same row" just because it moved from playlist into
+                    # the committed lookahead buffer.
+                    'item_id': item.get('item_id'),
+                }
+                if item.get('id') is not None:
+                    found['local_id'] = item['id']
+                elif item.get('spotify_uri') is not None:
+                    found['radio_track_id'] = item.get('radio_track_id')
+                else:
+                    remembered_id = upsert_radio_discovered_track(
+                        item.get('track_name'), item.get('artist_name'), item.get('album_name'),
+                        match_result['uri'], match_result.get('artwork_url'),
+                    )
+                    if remembered_id is not None:
+                        found['radio_track_id'] = remembered_id
+                if not _radio_session_still_current(radio_session_id):
+                    return match_pool
+                spotify_connect.add_to_queue(destination_id, match_result['uri'])
+                set_radio_session_playlist(radio_session_id, playlist)
+                save_session(queue=queue + [found])
+                return match_pool
+            consecutive_misses += 1
+
+        if extended_once or playlist:
+            break
+        session = get_radio_session(radio_session_id)
+        if session is None or session.get('status') != 'active':
+            break
+        conn = get_db_connection()
+        if conn is None:
+            break
+        try:
+            # Same tiered generator /api/radio/generate's own background job
+            # uses, called here so a long unattended run keeps extending past
+            # whatever length was originally generated - "Radio must never
+            # just stop" applies here exactly as it did for the old
+            # candidates/cursor model.
+            new_tracks, track_frontier, fallback_expanded_artists, _degraded = radio_engine.generate_radio_batch_track_first(
+                session, session.get('seen_track_keys') or [], RADIO_ADVANCER_REFILL_BATCH, conn,
+            )
+            set_radio_session_track_state(radio_session_id, track_frontier, fallback_expanded_artists)
+        finally:
+            conn.close()
+        extended_once = True
+        if not new_tracks:
+            break
+        append_seen_track_keys(radio_session_id, [radio_engine.radio_track_key(t['track_name'], t['artist_name']) for t in new_tracks])
+        for t in new_tracks:
+            t['source'] = 'in_library' if (t.get('id') is not None or t.get('spotify_uri') is not None) else 'unresolved'
+        # assign_radio_playlist_item_ids only touches next_item_id, not the
+        # playlist column itself - this tick's own in-memory trims (the pops
+        # above) haven't been persisted yet, so a read-modify-write against
+        # the DB's playlist column here would silently undo them.
+        tagged = assign_radio_playlist_item_ids(radio_session_id, new_tracks)
+        playlist = playlist + tagged
+
+    if not _radio_session_still_current(radio_session_id):
+        return match_pool
+    set_radio_session_playlist(radio_session_id, playlist)
     return match_pool
 
 
@@ -407,6 +662,7 @@ def _advance_spotify(save_session, destination_id, now_playing, queue, match_poo
     if result is None:
         return match_pool
     save_session(last_status=result)
+    _maybe_auto_resume(destination_id, result, is_radio_session=radio_session_id is not None)
 
     is_context = bool((now_playing or {}).get('context_uri'))
     duration = result.get('duration_ms') or 0
@@ -431,6 +687,13 @@ def _advance_spotify(save_session, destination_id, now_playing, queue, match_poo
     # playing" differently).
     stopped_on_its_own = result.get('status') == 'stop' and now_playing is not None
 
+    # Tracks whether *this tick* actually changed now_playing (either
+    # branch below) - drives the reconciliation edge-trigger (spec point 9,
+    # see _advance_spotify_radio_playlist/_reconcile_radio_queue): checking
+    # Spotify's real queue only makes sense right after a genuine
+    # transition or a flagged edit, never on every idle poll.
+    transitioned = False
+
     if not is_context and queue and (near_end or stopped_on_its_own):
         if not _radio_session_still_current(radio_session_id):
             # Confirmed live: a newer radio session (either engine) can
@@ -445,6 +708,7 @@ def _advance_spotify(save_session, destination_id, now_playing, queue, match_poo
         spotify_connect.play_uris(destination_id, [next_track['uri']])
         now_playing = next_track
         save_session(now_playing=now_playing, queue=queue)
+        transitioned = True
     else:
         track_uri = result.get('track_uri')
         current_uri = (now_playing or {}).get('uri')
@@ -541,6 +805,7 @@ def _advance_spotify(save_session, destination_id, now_playing, queue, match_poo
                 # meantime.
                 return match_pool
             save_session(now_playing=now_playing, queue=queue)
+            transitioned = True
             is_context = bool((now_playing or {}).get('context_uri'))
 
     if not match_pool and not is_context and not queue:
@@ -562,7 +827,24 @@ def _advance_spotify(save_session, destination_id, now_playing, queue, match_poo
         if carried_radio_session_id is not None and _radio_session_still_current(carried_radio_session_id):
             match_pool = {'candidates': [], 'cursor': 0, 'radio_session_id': carried_radio_session_id}
 
-    if is_context or len(queue) >= SPOTIFY_QUEUE_LOOKAHEAD_DEPTH or not match_pool:
+    if is_context or not match_pool:
+        return match_pool
+
+    radio_session_id = match_pool.get('radio_session_id')
+    if radio_session_id is not None:
+        # New pre-generated-playlist flow (main.py's /api/radio/generate +
+        # /api/radio/{id}/play) - consumes radio_session.playlist directly
+        # instead of match_pool.candidates/cursor, since that list is
+        # externally reorderable/deletable (see main.py's /reorder,
+        # /remove) and DB-persisted rather than in-memory-only. Runs on
+        # every tick regardless of queue depth (unlike the plain candidates
+        # path below) so the reconciliation check inside it can fire on a
+        # genuine transition even when there's nothing to refill.
+        should_reconcile = transitioned or radio_session_id in _reconcile_pending
+        _reconcile_pending.discard(radio_session_id)
+        return _advance_spotify_radio_playlist(save_session, destination_id, queue, radio_session_id, match_pool, should_reconcile)
+
+    if len(queue) >= SPOTIFY_QUEUE_LOOKAHEAD_DEPTH:
         return match_pool
 
     candidates = match_pool.get('candidates') or []
@@ -863,5 +1145,15 @@ def run(get_session, save_session, progress):
                 delay = IDLE_POLL_INTERVAL_SECONDS
             progress.update(status='running', error=None)
         except Exception as e:
+            # Previously silent beyond the in-memory progress dict (no API
+            # route ever exposed it, nothing printed) - confirmed live this
+            # let a single persistently-failing tick go unnoticed for hours
+            # (every 5s, forever, since nothing here ever re-raises or kills
+            # the loop - see the try/except itself, that resilience is
+            # intentional) with radio silently stuck on stale content and no
+            # trace of why. Printed so it actually reaches `docker compose
+            # logs` instead of only living in memory no one can query.
+            print(f"playback_advancer tick failed: {e}")
+            traceback.print_exc()
             progress.update(status='error', error=str(e))
         time.sleep(delay)
