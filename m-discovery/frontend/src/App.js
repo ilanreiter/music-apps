@@ -6180,24 +6180,27 @@ function RadioTab({
             {outputDevice.name} can't play Radio directly - pick This Browser, a Spotify Connect device, or YouTube Music above.
           </span>
         )}
+        {outputDevice?.type === 'spotify' && (
+          <>
+            <span className="radio-destination-label radio-engine-label">Engine:</span>
+            <button className={radioEngine === 'discovery' ? 'active' : ''} onClick={() => setRadioEngine('discovery')}>
+              <svg width="14" height="14" viewBox="0 0 24 24" className="lastfm-badge" aria-hidden="true">
+                <circle cx="12" cy="12" r="12" fill="#d51007" />
+                <text x="12" y="16" textAnchor="middle" fontSize="9" fontWeight="700" fill="#fff" fontFamily="Helvetica, Arial, sans-serif">fm</text>
+              </svg>
+              {' '}Last.fm Discover
+            </button>
+            <button className={radioEngine === 'spotify_native' ? 'active' : ''} onClick={() => setRadioEngine('spotify_native')}>
+              🟢 Spotify Radio
+            </button>
+            {radioEngine === 'spotify_native' && (
+              <span className="radio-destination-hint">
+                Plays your pick, then leans on Spotify's own "Autoplay similar songs" (a setting in Spotify's own app) to keep going - uses almost no search budget, but needs that setting turned on.
+              </span>
+            )}
+          </>
+        )}
       </div>
-
-      {outputDevice?.type === 'spotify' && (
-        <div className="radio-destination-row">
-          <span className="radio-destination-label">Engine:</span>
-          <button className={radioEngine === 'discovery' ? 'active' : ''} onClick={() => setRadioEngine('discovery')}>
-            🔎 Discover new music
-          </button>
-          <button className={radioEngine === 'spotify_native' ? 'active' : ''} onClick={() => setRadioEngine('spotify_native')}>
-            🟢 Spotify Radio
-          </button>
-          {radioEngine === 'spotify_native' && (
-            <span className="radio-destination-hint">
-              Plays your pick, then leans on Spotify's own "Autoplay similar songs" (a setting in Spotify's own app) to keep going - uses almost no search budget, but needs that setting turned on.
-            </span>
-          )}
-        </div>
-      )}
 
       {usesGeneratedFlow && (
         <div className="radio-destination-row">

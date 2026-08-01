@@ -3019,6 +3019,15 @@ main.with-player {
   margin-right: 4px;
 }
 
+.radio-engine-label {
+  margin-left: 12px;
+}
+
+.lastfm-badge {
+  vertical-align: middle;
+  margin-bottom: 2px;
+}
+
 .radio-destination-row button,
 .radio-destination-menu button {
   background: var(--bg-card);
