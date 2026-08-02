@@ -4914,6 +4914,7 @@ function App() {
             nowPlaying={nowPlaying}
             queue={queue}
             isPlaying={effectiveIsPlaying}
+            destStatus={destStatus}
             onDismissRadioStatus={() => setRadioStatus(null)}
             onStartRadio={handleStartRadio}
             onStartRadioFromPlaylist={startRadioFromPlaylist}
@@ -5911,7 +5912,7 @@ function BarChart({ title, entries }) {
 function RadioTab({
   apiBase, outputDevice, setOutputDevice, outputDevices, ytMusicConnected,
   radioDestination, setRadioDestination, radioDestinationType,
-  radioSessionId, radioSeed, radioStatus, nowPlaying, queue, isPlaying,
+  radioSessionId, radioSeed, radioStatus, nowPlaying, queue, isPlaying, destStatus,
   onDismissRadioStatus, onStartRadio, onStartRadioFromPlaylist, onStopRadio,
   onPlayGeneratedRadio,
 }) {
@@ -6350,33 +6351,67 @@ function RadioTab({
         // ever mean a real bug again, not the normal no-session case.
         <div className={`radio-now-playing${radioSessionId ? '' : ' radio-now-playing-idle'}`}>
           <div className="radio-now-playing-main">
-            {radioSessionId ? (
-              <>
-                <div className="radio-now-playing-art">
-                  {nowPlaying?.artwork_url ? (
-                    <img src={nowPlaying.artwork_url} alt="" onError={(e) => { e.target.style.display = 'none'; }} />
-                  ) : (
-                    <span className="radio-now-playing-fallback">📻</span>
-                  )}
-                </div>
-                <div className="radio-now-playing-info">
-                  <span className="radio-live-badge">
-                    <span className="radio-live-dot" />
-                    {isPlaying ? 'On Air' : 'Paused'}
-                  </span>
-                  <h3 className="radio-now-playing-title">{nowPlaying?.track_name || 'Starting…'}</h3>
-                  <p className="radio-now-playing-artist">{nowPlaying?.artist_name}</p>
-                  <p className="radio-now-playing-seed">
-                    {radioSeed?.description || 'Radio'}
-                    <span className="radio-destination-tag"> → {destinationLabel}</span>
-                  </p>
-                </div>
-                <div className={`radio-equalizer${isPlaying ? '' : ' paused'}`} aria-hidden="true">
-                  <span /><span /><span /><span />
-                </div>
-                <button className="scan-btn radio-stop-btn" onClick={onStopRadio}>Stop Radio</button>
-              </>
-            ) : (
+            {radioSessionId ? (() => {
+              // playingPreview.live_status is a direct, independent read of
+              // Spotify's real account-wide state (see main.py's
+              // RadioLiveStatus) - not derived from the generic outputDevice/
+              // destStatus/nowPlaying this component shares with every other
+              // playback mode. Preferred whenever available so this panel
+              // stays correct even if the app's generic destination gets
+              // switched to something else entirely (a Chromecast, WiiM) for
+              // an unrelated reason - confirmed live that was a real,
+              // recurring gap: the panel showed "paused, no device" while
+              // this exact radio session was still genuinely playing on
+              // Spotify. Falls back to the generic props for a session that
+              // hasn't reached playingPreview yet (spotify_native, browser,
+              // ytmusic - none of which have live_status at all).
+              const live = playingPreview?.live_status;
+              const nowOnAir = live ? live.is_playing : isPlaying;
+              return (
+                <>
+                  <div className="radio-now-playing-art">
+                    {(live?.artwork_url || nowPlaying?.artwork_url) ? (
+                      <img src={live?.artwork_url || nowPlaying.artwork_url} alt="" onError={(e) => { e.target.style.display = 'none'; }} />
+                    ) : (
+                      <span className="radio-now-playing-fallback">📻</span>
+                    )}
+                  </div>
+                  <div className="radio-now-playing-info">
+                    <span className="radio-live-badge">
+                      <span className="radio-live-dot" />
+                      {nowOnAir ? 'On Air' : 'Paused'}
+                    </span>
+                    <h3 className="radio-now-playing-title">{live?.track_name || nowPlaying?.track_name || 'Starting…'}</h3>
+                    <p className="radio-now-playing-artist">{live?.artist_name || nowPlaying?.artist_name}</p>
+                    <p className="radio-now-playing-seed">
+                      {radioSeed?.description || 'Radio'}
+                      <span className="radio-destination-tag"> → {destinationLabel}</span>
+                    </p>
+                    {live?.active_device_name ? (
+                      <p className="radio-active-device">
+                        Playing on: <span className="radio-active-device-name">{live.active_device_name}</span>
+                      </p>
+                    ) : outputDevice?.type === 'spotify' && destStatus?.active_device_name && (
+                      // Fallback for a session with no live_status yet (still
+                      // starting) - same mismatch framing as before, since
+                      // without an independent read there's nothing better
+                      // to compare destStatus against than the generic pick.
+                      <p className="radio-active-device">
+                        Playing on:{' '}
+                        <span className={destStatus.active_device_name !== outputDevice.name ? 'radio-active-device-mismatch' : 'radio-active-device-name'}>
+                          {destStatus.active_device_name}
+                        </span>
+                        {destStatus.active_device_name !== outputDevice.name && ' (different from selected device)'}
+                      </p>
+                    )}
+                  </div>
+                  <div className={`radio-equalizer${nowOnAir ? '' : ' paused'}`} aria-hidden="true">
+                    <span /><span /><span /><span />
+                  </div>
+                  <button className="scan-btn radio-stop-btn" onClick={onStopRadio}>Stop Radio</button>
+                </>
+              );
+            })() : (
               <div className="radio-now-playing-info">
                 <span className="radio-live-badge radio-live-badge-idle">
                   <span className="radio-live-dot" />

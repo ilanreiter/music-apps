@@ -2963,6 +2963,26 @@ class RadioPlaylistItem(BaseModel):
     # concept at all.
     match: Optional[float] = None
 
+class RadioLiveStatus(BaseModel):
+    """A direct, account-wide read of Spotify's real playback state - not
+    derived from playback_session's own tracked destination_type/
+    destination_id, which is shared with every other playback mode
+    (library casts, Discover, WiiM, Chromecast) and can point at something
+    else entirely if the user switched the app's generic destination for
+    an unrelated reason. Lets the Radio tab answer "is my session actually
+    still going" independent of whatever else the app is currently
+    tracking - confirmed live this was a real, recurring gap: switching
+    the generic destination to a Chromecast (playing nothing) made the
+    Radio tab show "paused, no device" even while this exact radio session
+    was still genuinely playing on Spotify."""
+    is_playing: bool
+    track_name: Optional[str] = None
+    artist_name: Optional[str] = None
+    artwork_url: Optional[str] = None
+    active_device_name: Optional[str] = None
+    position_ms: Optional[int] = None
+    duration_ms: Optional[int] = None
+
 class RadioSessionInfo(BaseModel):
     id: int
     status: str  # 'active' | 'stopped'
@@ -2974,6 +2994,7 @@ class RadioSessionInfo(BaseModel):
     generation_status: str = 'ready'  # 'generating' | 'ready' | 'error'
     target_length: Optional[int] = None
     playlist: List[RadioPlaylistItem] = []
+    live_status: Optional[RadioLiveStatus] = None
 
 # How many tracks generate_radio_batch_track_first is asked for per call
 # while building a full pre-generated playlist - small enough that one
@@ -3354,6 +3375,23 @@ def get_radio_session_route(session_id: int):
     session = get_radio_session(session_id)
     if session is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No radio session with that id")
+    if session['destination_type'] == 'spotify' and session['status'] == 'active':
+        # device_id is unused inside get_status (GET /me/player has always
+        # been account-wide) - this is a direct read of reality, not routed
+        # through playback_session's own tracked destination at all, so it
+        # stays correct even if the generic destination has been switched
+        # to something else entirely (see RadioLiveStatus's own docstring).
+        live = spotify_connect.get_status(None)
+        if live and live.get('reachable'):
+            session['live_status'] = {
+                'is_playing': live.get('status') == 'play',
+                'track_name': live.get('title'),
+                'artist_name': live.get('artist'),
+                'artwork_url': live.get('artwork_url'),
+                'active_device_name': live.get('active_device_name'),
+                'position_ms': live.get('position_ms'),
+                'duration_ms': live.get('duration_ms'),
+            }
     return session
 
 class RadioQueueItemRequest(BaseModel):
@@ -3455,6 +3493,10 @@ def stop_radio(session_id: int):
             # pause() also records this app's own play/pause intent
             # (spotify_connect._desired_state) as 'pause', so
             # playback_advancer's auto-resume health check won't silently
-            # undo this a few seconds later.
-            spotify_connect.pause(playback['destination_id'])
+            # undo this a few seconds later. use_active_device=True - the
+            # goal here is "silence whatever's actually making noise", not
+            # necessarily whichever device this app last tracked, which can
+            # have drifted to a different (or merely mirrored) active device
+            # outside this app's control.
+            spotify_connect.pause(playback['destination_id'], use_active_device=True)
     return {"status": "stopped"}

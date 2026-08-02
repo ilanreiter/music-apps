@@ -543,14 +543,23 @@ def play(device_id, context_uri, track_uri=None, drain_queue=False):
     return result is not None
 
 
-def pause(device_id):
-    result = _api_request('PUT', '/me/player/pause', params={'device_id': device_id})
+def pause(device_id, use_active_device=False):
+    """use_active_device=True omits device_id from the actual API call, so
+    it targets whichever device Spotify itself currently reports as active
+    (see get_status's own active_device_id/active_device_name) rather than
+    this specific id - for a caller that wants to silence "whatever's
+    actually making noise right now" rather than force-target a possibly-
+    stale tracked id. device_id is still used as the _desired_state key
+    either way - that's this app's own bookkeeping of intent, independent of
+    which literal id the API call targeted."""
+    params = {} if use_active_device else {'device_id': device_id}
+    result = _api_request('PUT', '/me/player/pause', params=params)
     if result is not None:
         _desired_state[device_id] = 'pause'
     return result is not None
 
 
-def resume(device_id):
+def resume(device_id, use_active_device=False):
     """A bare PUT /me/player/play with no body restarts the current track
     from 0 instead of continuing - confirmed live on this account's Spotify
     Connect devices: a lone position_ms with no accompanying uris/context_uri
@@ -562,16 +571,29 @@ def resume(device_id):
     quietly dropped its connection, which these budget Connect devices are
     already known to do) isn't reliably woken by /play alone; confirmed live
     that skipping this left the account with no active device at all after
-    a resume, requiring a fresh play_uris call to recover."""
+    a resume, requiring a fresh play_uris call to recover.
+
+    use_active_device=True skips that explicit transfer (there's no single
+    "the" device to wake when the goal is "resume whatever's already active,
+    wherever that is") and omits device_id from the actual play call, same
+    reasoning as pause's own use_active_device. Confirmed live this matters:
+    the account's real active device can drift to a different (or mirrored)
+    id than whatever this app tracked at session start - transferring to
+    that stale id would force playback back onto it instead of just letting
+    whatever's genuinely active keep going."""
     current = get_status(device_id)
     if current and current.get('track_uri') and current.get('position_ms') is not None:
-        _transfer_to_device(device_id)
-        result = _api_request('PUT', '/me/player/play', params={'device_id': device_id}, json_body={
+        params = {}
+        if not use_active_device:
+            _transfer_to_device(device_id)
+            params['device_id'] = device_id
+        result = _api_request('PUT', '/me/player/play', params=params, json_body={
             'uris': [current['track_uri']],
             'position_ms': current['position_ms'],
         })
         return result is not None
-    result = _api_request('PUT', '/me/player/play', params={'device_id': device_id})
+    params = {} if use_active_device else {'device_id': device_id}
+    result = _api_request('PUT', '/me/player/play', params=params)
     return result is not None
 
 
@@ -601,6 +623,19 @@ def previous_track(device_id):
 
 
 def get_status(device_id):
+    """device_id is unused - GET /me/player has always been account-wide,
+    not scoped to any particular device (confirmed live, and already
+    documented elsewhere - see clear_queue's own docstring on GET /me/player/
+    queue behaving the same way). Kept as a parameter since most callers
+    pass their own tracked destination_id and it costs nothing to accept.
+
+    Includes active_device_id/active_device_name - Spotify's own response
+    already carries these on every call (this function just wasn't reading
+    them out before), and they're the authoritative answer to "which device
+    does Spotify itself think is active right now" - not necessarily the
+    same device_id a caller is tracking, which is exactly the gap that let
+    a session go silently untracked when the account's real active device
+    drifted to a different (or mirrored) id outside this app's control."""
     data = _api_request('GET', '/me/player')
     if data is None:
         return None
@@ -608,7 +643,7 @@ def get_status(device_id):
         return {
             'reachable': True, 'status': 'stop', 'position_ms': None, 'duration_ms': None,
             'volume': None, 'track_uri': None, 'title': None, 'artist': None, 'album': None,
-            'artwork_url': None,
+            'artwork_url': None, 'active_device_id': None, 'active_device_name': None,
         }
 
     item = data.get('item') or {}
@@ -627,6 +662,8 @@ def get_status(device_id):
         'artist': ', '.join(a['name'] for a in item.get('artists', [])),
         'album': album.get('name'),
         'artwork_url': images[0]['url'] if images else None,
+        'active_device_id': device.get('id'),
+        'active_device_name': device.get('name'),
     }
 
 
@@ -973,10 +1010,25 @@ def _schedule_sustain_check(device_id, expected_uri):
     threading.Thread(target=_check, daemon=True).start()
 
 
-def play_uris(device_id, uris, drain_queue=False):
+def play_uris(device_id, uris, drain_queue=False, use_active_device=False):
     """Play an explicit ad-hoc list of Spotify track URIs (not a playlist
     context) - used for local-library tracks matched to their Spotify catalog
     equivalent, since there's no existing Spotify playlist backing them.
+
+    use_active_device=True skips _transfer_to_device and omits device_id
+    from every play call in here, so this targets whichever device Spotify
+    already considers active instead of forcing playback onto device_id
+    specifically - same reasoning as pause/resume/add_to_queue's own
+    use_active_device. Confirmed live this matters for a track-to-track
+    transition specifically: the account's real active device can be
+    switched entirely outside this app (the Spotify app's own device
+    picker), and forcing a transfer back onto whatever this app originally
+    tracked overrides that choice the moment the next transition fires,
+    even though everything else (status, queue additions) had already
+    correctly followed the switch. No fallback to a specific device_id if
+    this comes back unconfirmed - see the caller in playback_advancer.py,
+    which retries once with a targeted device_id rather than leaving Radio
+    silently stalled if nothing was genuinely active at that instant.
 
     Confirmed live on this account's devices: the play command intermittently
     "takes" (track loads, correct metadata) without actually starting
@@ -1018,16 +1070,22 @@ def play_uris(device_id, uris, drain_queue=False):
     normal race between two of their own quick actions)."""
     token = _start_intent(device_id)
     _desired_state[device_id] = 'play'
+    play_params = {} if use_active_device else {'device_id': device_id}
     if drain_queue:
-        # Must transfer first - see the matching comment in play().
+        # Must transfer first - see the matching comment in play(). Not
+        # skipped for use_active_device - drain_queue is only ever True for
+        # a genuinely new ad-hoc session start, which use_active_device is
+        # never used for (see this function's own docstring - it's for an
+        # already-running session's transition, never the initial start).
         _transfer_to_device(device_id)
         clear_queue(device_id, token=token)
     for attempt in range(1, PLAY_URIS_MAX_ATTEMPTS + 1):
         if not _is_current_intent(device_id, token):
             logger.info("play_uris %s: superseded by a newer call before attempt %d, bailing out", device_id, attempt)
             return 'superseded'
-        _transfer_to_device(device_id)
-        result = _api_request('PUT', '/me/player/play', params={'device_id': device_id}, json_body={'uris': uris})
+        if not use_active_device:
+            _transfer_to_device(device_id)
+        result = _api_request('PUT', '/me/player/play', params=play_params, json_body={'uris': uris})
         if result is None:
             logger.warning("play_uris %s: attempt %d/%d - request failed", device_id, attempt, PLAY_URIS_MAX_ATTEMPTS)
             continue
@@ -1052,7 +1110,7 @@ def play_uris(device_id, uris, drain_queue=False):
         # attempt at loading the track.
         if confirm_status and confirm_status.get('track_uri') == uris[0] and confirm_status.get('status') == 'pause' \
                 and _is_current_intent(device_id, token):
-            unstick = _api_request('PUT', '/me/player/play', params={'device_id': device_id}, json_body={
+            unstick = _api_request('PUT', '/me/player/play', params=play_params, json_body={
                 'uris': uris, 'position_ms': confirm_status.get('position_ms') or 0,
             })
             if unstick is not None:
@@ -1071,11 +1129,21 @@ def play_uris(device_id, uris, drain_queue=False):
     return False
 
 
-def add_to_queue(device_id, uri):
+def add_to_queue(device_id, uri, use_active_device=False):
     """Appends a single track to the end of the currently active playback
     queue, without interrupting what's already playing - used to feed one
-    lookahead match at a time instead of front-loading a whole batch."""
-    result = _api_request('POST', '/me/player/queue', params={'uri': uri, 'device_id': device_id})
+    lookahead match at a time instead of front-loading a whole batch.
+
+    use_active_device=True omits device_id from the request, targeting
+    whichever device Spotify already considers active instead of this
+    specific id - same reasoning as pause/resume's own use_active_device.
+    GET /me/player/queue itself has always reported whatever's active
+    account-wide regardless of what device_id a caller asks about (see
+    clear_queue's own docstring) - this makes the add side consistent with
+    that instead of pinning to a tracked id that can drift out of sync with
+    reality."""
+    params = {'uri': uri} if use_active_device else {'uri': uri, 'device_id': device_id}
+    result = _api_request('POST', '/me/player/queue', params=params)
     success = result is not None
     if success:
         # Tracks exactly how many real account-queue entries are sitting

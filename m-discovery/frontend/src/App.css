@@ -3242,6 +3242,22 @@ main.with-player {
   color: var(--text-muted);
 }
 
+.radio-active-device {
+  font-size: 1rem;
+  color: var(--text-muted);
+  margin-top: 4px;
+}
+
+.radio-active-device-name {
+  color: #22c55e;
+  font-weight: 600;
+}
+
+.radio-active-device-mismatch {
+  color: #e0a952;
+  font-weight: 600;
+}
+
 .radio-stop-btn {
   flex-shrink: 0;
 }

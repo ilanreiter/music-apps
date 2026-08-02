@@ -11,6 +11,7 @@ from .database import (
     get_db_connection, get_radio_session, append_seen_track_keys, upsert_radio_discovered_track,
     set_radio_session_track_state, find_known_track_external_match,
     set_radio_session_playlist, assign_radio_playlist_item_ids,
+    has_active_spotify_radio_session, get_active_spotify_radio_session_summary,
 )
 
 PUBLIC_BASE_URL = os.environ.get('PUBLIC_BASE_URL', 'http://localhost:8001')
@@ -393,7 +394,13 @@ def _maybe_auto_resume(destination_id, result, is_radio_session=False):
         return
     _last_auto_resume_attempt[destination_id] = time.time()
     print(f"auto-resume {destination_id}: found paused (desired={desired!r}, radio={is_radio_session}) at {result.get('track_uri')!r}, resuming")
-    spotify_connect.resume(destination_id)
+    # use_active_device=True - the whole premise of this check is "the
+    # device we tracked might not be the one Spotify actually considers
+    # active anymore" (confirmed live: the account's real active device can
+    # drift to a different, sometimes merely mirrored, id outside this app's
+    # control). Forcing a transfer back onto the stale tracked id would
+    # fight that drift instead of just resuming wherever's genuinely active.
+    spotify_connect.resume(destination_id, use_active_device=True)
 
 
 def _advance_spotify_native(save_session, destination_id, match_pool):
@@ -504,7 +511,11 @@ def _reconcile_radio_queue(destination_id, radio_session_id, committed_queue):
         return
     print(f"radio reconcile {radio_session_id}: {missing} missing from Spotify's real queue (real: {real_uris}) - adding")
     for uri in missing:
-        ok = spotify_connect.add_to_queue(destination_id, uri)
+        # use_active_device=True - same reasoning as _maybe_auto_resume:
+        # follow wherever Spotify's real active device actually is rather
+        # than force these onto a tracked destination_id that may have
+        # drifted out of sync with it.
+        ok = spotify_connect.add_to_queue(destination_id, uri, use_active_device=True)
         if not ok:
             print(f"radio reconcile {radio_session_id}: add_to_queue failed for {uri}")
 
@@ -576,7 +587,13 @@ def _advance_spotify_radio_playlist(save_session, destination_id, queue, radio_s
                         found['radio_track_id'] = remembered_id
                 if not _radio_session_still_current(radio_session_id):
                     return match_pool
-                spotify_connect.add_to_queue(destination_id, match_result['uri'])
+                # use_active_device=True - same reasoning as
+                # _maybe_auto_resume/_reconcile_radio_queue: this is an
+                # already-running session's ongoing refill, not the initial
+                # explicit start, so it should follow wherever Spotify's
+                # real active device is rather than pin to a tracked
+                # destination_id that can drift out of sync with it.
+                spotify_connect.add_to_queue(destination_id, match_result['uri'], use_active_device=True)
                 set_radio_session_playlist(radio_session_id, playlist)
                 save_session(queue=queue + [found])
                 return match_pool
@@ -706,7 +723,20 @@ def _advance_spotify(save_session, destination_id, now_playing, queue, match_poo
             return match_pool
         next_track = queue[0]
         queue = queue[1:]
-        spotify_connect.play_uris(destination_id, [next_track['uri']])
+        # use_active_device=True - follow wherever Spotify's real active
+        # device already is (e.g. switched entirely outside this app, via
+        # Spotify's own device picker) rather than force playback back onto
+        # whichever device this app originally tracked - confirmed live
+        # that forcing it back is exactly what silently overrode a genuine
+        # external device switch the moment a transition fired, even though
+        # everything else (status polling, queue additions) had already
+        # correctly followed it. Falls back to a targeted retry if the
+        # account-wide attempt comes back completely unconfirmed, so a
+        # genuinely-idle account (nothing active at all) doesn't leave
+        # playback stalled - "Radio must never just stop" applies here too.
+        result = spotify_connect.play_uris(destination_id, [next_track['uri']], use_active_device=True)
+        if result is False:
+            spotify_connect.play_uris(destination_id, [next_track['uri']])
         now_playing = next_track
         save_session(now_playing=now_playing, queue=queue)
         transitioned = True
@@ -1059,6 +1089,102 @@ def _advance_spotify(save_session, destination_id, now_playing, queue, match_poo
     return match_pool
 
 
+# Cooldown for _maybe_reclaim_orphaned_spotify_radio's live Spotify status
+# check, keyed by wall-clock time (module-level, not per-session - there's
+# only ever one playback_session row). Only relevant while the tracked
+# destination_type isn't already 'spotify' (see run()'s call site), so this
+# never competes with the search/status budget of an actually-tracked
+# session - it's purely for noticing a session this app has lost track of.
+RECLAIM_CHECK_INTERVAL_SECONDS = 20
+_last_reclaim_check_ts = 0.0
+
+
+def _maybe_reclaim_orphaned_spotify_radio(session, save_session_fn):
+    """Self-healing for the recurring failure mode this session's whole final
+    stretch was about: the singleton playback_session's destination_type
+    drifts away from 'spotify' (a manual destination switch, a stale/crashed
+    tracking state after a restart, Amazon's own multi-room mirroring moving
+    the "active" device outside this app's control - see the WiiM/Chromecast
+    drift notes elsewhere in this file) while Spotify itself is still
+    genuinely, actively playing a still-'active' radio_session's content.
+    Previously this required manual intervention (the user noticing "Radio
+    tab disconnected, play log stopped" and asking for a status check) -
+    this makes that recovery automatic.
+
+    Deliberately does NOT try to verify the specific *track* Spotify is
+    playing actually came from this session's own playlist/pool - there is
+    no reliable link from a bare track_uri back to "was this one of ours"
+    (a plain Last.fm text candidate has no known_tracks/radio_discovered_tracks
+    row until first matched, and even a resolved one doesn't round-trip
+    identity in reverse). Trusts instead that this app is the only thing
+    that ever drives Spotify playback for a radio session on this account,
+    so "there's exactly one active Spotify radio_session row, and Spotify's
+    account-wide player is genuinely playing something right now" is already
+    a reliable enough signal - the alternative (never reclaiming without
+    perfect proof) is strictly worse for a single-user tool, per "Radio must
+    never just stop".
+
+    Constructs now_playing/spotify_match_pool explicitly rather than just
+    flipping destination_type back to 'spotify' and hoping _advance_spotify's
+    own passive reconciliation (the "track_uri changed, reconstruct
+    now_playing from scratch" branch further down in that function) sorts it
+    out - traced through that path and confirmed it derives radio_session_id
+    from the *previous* now_playing's own tag, which is None/stale here by
+    definition, so it would silently reconnect to live Spotify audio without
+    ever re-tagging it as a radio session at all (no Play Log entries, no
+    Radio tab "On Air", right back to this exact bug)."""
+    global _last_reclaim_check_ts
+    now = time.time()
+    if now - _last_reclaim_check_ts < RECLAIM_CHECK_INTERVAL_SECONDS:
+        return False
+    _last_reclaim_check_ts = now
+
+    # Plain DB read, no Spotify call - cheap enough to do every cooldown tick
+    # even when nothing's wrong, so the live get_status() call below only
+    # ever fires when there's actually something worth reclaiming.
+    if not has_active_spotify_radio_session():
+        return False
+    radio_session = get_active_spotify_radio_session_summary()
+    if radio_session is None:
+        return False
+
+    live = spotify_connect.get_status(None)
+    if not live or not live.get('reachable') or live.get('status') != 'play' or not live.get('track_uri'):
+        return False
+
+    radio_session_id = radio_session['id']
+    active_device_id = live.get('active_device_id') or session.get('destination_id')
+
+    if radio_session.get('engine') == 'spotify_native':
+        # _advance_spotify_native rebuilds now_playing/queue itself from
+        # GET /me/player/queue on its very next tick (dispatched this same
+        # tick, see run()'s call site below) - it never reads the now_playing
+        # this function would otherwise pass in, so there's nothing useful
+        # to construct here beyond the pool tag that routes it there at all.
+        now_playing = None
+        match_pool = {'engine': 'spotify_native', 'radio_session_id': radio_session_id}
+    else:
+        now_playing = {
+            'id': live['track_uri'], 'source': 'spotify', 'uri': live['track_uri'], 'context_uri': None,
+            'track_name': live.get('title'), 'artist_name': live.get('artist'), 'album_name': live.get('album'),
+            'duration_seconds': (live['duration_ms'] / 1000) if live.get('duration_ms') is not None else None,
+            'artwork_url': live.get('artwork_url'),
+            'radio_session_id': radio_session_id,
+            'selection_reason': 'Discovered - similar track',
+            'selection_engine': 'Last.fm',
+        }
+        match_pool = {'radio_session_id': radio_session_id}
+
+    print(f"playback_advancer: reclaiming orphaned Spotify radio session {radio_session_id} - "
+          f"tracked destination had drifted to {session.get('destination_type')!r} but Spotify is "
+          f"still genuinely playing it on {live.get('active_device_name')!r}")
+    save_session_fn(
+        destination_type='spotify', destination_id=active_device_id,
+        now_playing=now_playing, queue=[], spotify_match_pool=match_pool,
+    )
+    return True
+
+
 def run(get_session, save_session, progress):
     """Runs forever on a background thread, started unconditionally at app
     startup (src/main.py's startup_event) - unlike the other background jobs
@@ -1111,6 +1237,15 @@ def run(get_session, save_session, progress):
                 merged.update(fields)
                 save_session(**merged)
                 session.update(merged)
+
+            if destination_type != 'spotify' and _maybe_reclaim_orphaned_spotify_radio(session, _save):
+                # Reclaimed this same tick - session/destination_type were
+                # just updated in place by _save above (see its own comment
+                # on why it mutates `session` rather than only the DB), so
+                # falling straight through to the 'spotify' branch below lets
+                # _advance_spotify start driving it immediately instead of
+                # waiting a full extra poll interval.
+                destination_type = 'spotify'
 
             if destination_type == 'wiim':
                 now_playing = session.get('now_playing') or {}

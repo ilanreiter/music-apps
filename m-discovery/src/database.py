@@ -1835,6 +1835,30 @@ def has_active_spotify_radio_session():
             conn.close()
 
 
+def get_active_spotify_radio_session_summary():
+    """Like has_active_spotify_radio_session above but returns enough of the
+    row (id, engine) to actually act on - playback_advancer's autonomous
+    reclaim (see _maybe_reclaim_orphaned_spotify_radio) needs to know *which*
+    session to re-tag now_playing with and *which* engine's match_pool shape
+    to rebuild, not just that some session exists."""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT id, engine FROM radio_session WHERE status = 'active' AND destination_type = 'spotify' LIMIT 1")
+        row = cur.fetchone()
+        cur.close()
+        if not row:
+            return None
+        return {'id': row[0], 'engine': row[1]}
+    except Error as e:
+        print(f"Error reading the active Spotify radio session summary: {e}")
+        return None
+    finally:
+        if conn:
+            conn.close()
+
+
 def record_spotify_search():
     """Logs one real (non-short-circuited) Spotify /search call - see
     spotify_connect.py's _search_and_score. No time-based pruning here
