@@ -3192,6 +3192,21 @@ main.with-player {
   animation: none;
 }
 
+.radio-live-badge-unreachable {
+  color: #e0a952;
+}
+
+.radio-live-badge-unreachable .radio-live-dot {
+  background: #e0a952;
+  animation: none;
+}
+
+.radio-live-unreachable-note {
+  font-size: 0.78rem;
+  color: #e0a952;
+  margin-top: 4px;
+}
+
 .radio-now-playing-art {
   width: 76px;
   height: 76px;

@@ -33,6 +33,23 @@ NEAR_END_MS = 4000
 # all. Widened past the poll interval so at least one tick reliably lands
 # inside it before the track actually finishes.
 SPOTIFY_NEAR_END_MS = 7000
+# How long to wait after a transition's play_uris call before reading the
+# real queue to look for stale entries to discard - GET /me/player/queue can
+# lag a just-issued write by a moment (same risk clear_queue's own docstring
+# already documents for the same endpoint).
+SPOTIFY_QUEUE_DISCARD_SETTLE_SECONDS = 1.0
+# Pace between individual discard (next()) calls, same reasoning as
+# spotify_connect.CLEAR_QUEUE_STEP_DELAY_SECONDS - avoids hammering the API
+# when several stale entries need clearing in one pass.
+SPOTIFY_QUEUE_DISCARD_STEP_SECONDS = 0.3
+# Bounds one pass's worth of discarding - confirmed live over a real
+# session that unaddressed residue can reach 18+ entries, so this needs to
+# be generous enough to actually catch up, not just symbolic. Each
+# iteration re-verifies the real queue's front before acting and stops the
+# moment it hits the currently-playing track or a genuinely-still-needed
+# uri, so a higher bound only costs more (cheap, non-search) API calls in
+# the worst case, never more risk.
+SPOTIFY_QUEUE_DISCARD_MAX_ATTEMPTS = 20
 
 # Same extension->MIME mapping as main.py's EXTENSION_MIME_TYPES, keyed by the
 # file_format string already present on every synced track object instead of
@@ -740,6 +757,46 @@ def _advance_spotify(save_session, destination_id, now_playing, queue, match_poo
         now_playing = next_track
         save_session(now_playing=now_playing, queue=queue)
         transitioned = True
+        # Discards genuinely stale queued entries left behind by this and
+        # prior transitions. Every transition here add_to_queue's its
+        # next_track ahead of time as a fallback buffer, then explicitly
+        # play_uris's that same uri once near-end fires - confirmed live
+        # (spotify_connect.play_uris' docstring, and this session's own
+        # direct test) that the queued copy is never consumed by that, so
+        # with nothing discarding it, one entry accumulates per transition.
+        # Confirmed live over a real session: unbounded, reaching 18+ stale
+        # entries and eventually crowding the real queue's preview window
+        # enough to hide the app's own genuinely-queued lookahead tracks.
+        #
+        # A first version of this discarded whenever the front of the real
+        # queue matched next_track['uri'] and was reverted - confirmed live
+        # (a deliberate test) that Spotify's queue preview also echoes the
+        # *currently playing* track as filler once nothing else is
+        # genuinely queued, indistinguishable from genuine residue by uri
+        # alone; discarding that blindly restarted the current track from
+        # position 0 instead of cleaning anything up.
+        #
+        # This version uses a different, confirmed-reliable signal: this
+        # app's own tracked `queue` (the uris it genuinely add_to_queue'd
+        # and still expects to use) is authoritative ground truth for
+        # what's legitimately upcoming. Anything sitting ahead of those
+        # known uris in the real queue - and that also isn't the uri now
+        # playing - is unambiguous residue regardless of which uri it
+        # happens to be. Stops the instant either boundary is reached,
+        # never touching the currently-playing track or anything still
+        # genuinely needed.
+        genuine_uris = {t['uri'] for t in queue}
+        time.sleep(SPOTIFY_QUEUE_DISCARD_SETTLE_SECONDS)
+        for _ in range(SPOTIFY_QUEUE_DISCARD_MAX_ATTEMPTS):
+            confirm = spotify_connect.get_queue()
+            upcoming = (confirm or {}).get('queue') or []
+            if not upcoming:
+                break
+            front_uri = upcoming[0].get('uri')
+            if front_uri == next_track['uri'] or front_uri in genuine_uris:
+                break
+            spotify_connect.next_track(destination_id, use_active_device=True)
+            time.sleep(SPOTIFY_QUEUE_DISCARD_STEP_SECONDS)
     else:
         track_uri = result.get('track_uri')
         current_uri = (now_playing or {}).get('uri')

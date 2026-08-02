@@ -2974,7 +2974,20 @@ class RadioLiveStatus(BaseModel):
     tracking - confirmed live this was a real, recurring gap: switching
     the generic destination to a Chromecast (playing nothing) made the
     Radio tab show "paused, no device" even while this exact radio session
-    was still genuinely playing on Spotify."""
+    was still genuinely playing on Spotify.
+
+    reachable=False (rather than omitting live_status altogether) marks a
+    genuine fetch attempt that failed - a Spotify API rate limit, a network
+    blip, anything transient - distinct from the field being absent because
+    it never applied at all (destination isn't spotify, or the session
+    isn't 'active'). Confirmed live this distinction matters: the frontend's
+    own fallback logic (App.js), built for "no live_status *yet*, still
+    starting," was silently also catching "live_status fetch just failed"
+    the same way - showing old cached now_playing/destStatus as if it were
+    current with zero indication anything was stale. A rate-limited hour
+    displayed as a perfectly normal "On Air, Playing on Living Room" the
+    whole time."""
+    reachable: bool = True
     is_playing: bool
     track_name: Optional[str] = None
     artist_name: Optional[str] = None
@@ -3260,10 +3273,35 @@ def play_radio_session(session_id: int, params: RadioPlayRequest):
     if not fully_cleared:
         print(f"radio play {session_id}: queue still not empty on {params.device_id} after {spotify_connect.CLEAR_QUEUE_VERIFY_MAX_ATTEMPTS} clear attempts - starting anyway")
 
-    first_item = playlist[0]
-    match_result = playback_advancer.resolve_playlist_item(first_item)
-    if not match_result.get('matched'):
-        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Could not find the first track on Spotify")
+    # Same bounded-miss tolerance _advance_spotify_radio_playlist's own
+    # refill loop already uses (SPOTIFY_MATCH_CONSECUTIVE_CAP) - confirmed
+    # live that trying only playlist[0] and giving up entirely left every
+    # retry doomed forever: a similarity search can easily surface a track
+    # that doesn't actually exist on Spotify under that title/artist (here,
+    # playlist[0] was a clean no_match, not a rate limit), and since nothing
+    # ever popped that dead entry off the front, "Please try again" just hit
+    # the exact same track and failed the exact same way every time.
+    first_item = None
+    match_result = None
+    skipped = 0
+    while playlist and skipped < playback_advancer.SPOTIFY_MATCH_CONSECUTIVE_CAP:
+        candidate = playlist[0]
+        result = playback_advancer.resolve_playlist_item(candidate)
+        playlist = playlist[1:]
+        if result.get('reason') == 'unavailable':
+            # Rate-limited - stop entirely rather than burning through the
+            # rest of the list on further doomed searches (same rule the
+            # refill loop follows), and don't consume this one since it was
+            # never actually attempted against a real search.
+            playlist = [candidate] + playlist
+            break
+        if result.get('matched'):
+            first_item = candidate
+            match_result = result
+            break
+        skipped += 1
+    if match_result is None:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Could not find a playable track to start the playlist with")
 
     play_result = spotify_connect.play_uris(params.device_id, [match_result['uri']])
     if play_result == 'superseded':
@@ -3287,11 +3325,13 @@ def play_radio_session(session_id: int, params: RadioPlayRequest):
     if first_item.get('radio_track_id') is not None:
         now_playing['radio_track_id'] = first_item['radio_track_id']
 
-    # Pops the first item off the persisted playlist - _advance_spotify's
-    # retargeted refill loop (playback_advancer.py) picks up from here on
-    # its very next tick, walking the remainder to (re)fill the lookahead
-    # queue back up to depth 2.
-    set_radio_session_playlist(session_id, playlist[1:])
+    # Persists whatever's left of the playlist - `playlist` was already
+    # advanced past both the matched item and any unmatched ones skipped
+    # ahead of it in the loop above, so this is not just "pop position 0"
+    # anymore. _advance_spotify's retargeted refill loop (playback_advancer.py)
+    # picks up from here on its very next tick, walking the remainder to
+    # (re)fill the lookahead queue back up to depth 2.
+    set_radio_session_playlist(session_id, playlist)
     save_playback_session(
         destination_type='spotify', destination_id=params.device_id,
         now_playing=now_playing, queue=[], spotify_match_pool={'radio_session_id': session_id},
@@ -3384,6 +3424,7 @@ def get_radio_session_route(session_id: int):
         live = spotify_connect.get_status(None)
         if live and live.get('reachable'):
             session['live_status'] = {
+                'reachable': True,
                 'is_playing': live.get('status') == 'play',
                 'track_name': live.get('title'),
                 'artist_name': live.get('artist'),
@@ -3392,6 +3433,14 @@ def get_radio_session_route(session_id: int):
                 'position_ms': live.get('position_ms'),
                 'duration_ms': live.get('duration_ms'),
             }
+        else:
+            # Distinct from "live_status not present at all" (this branch's
+            # own guard not matching - non-spotify or non-active session,
+            # where it genuinely doesn't apply) - this is a real attempt
+            # that failed (rate limit, network blip). See RadioLiveStatus's
+            # own docstring for why the frontend needs this told apart from
+            # silence.
+            session['live_status'] = {'reachable': False, 'is_playing': False}
     return session
 
 class RadioQueueItemRequest(BaseModel):
@@ -3499,4 +3548,30 @@ def stop_radio(session_id: int):
             # have drifted to a different (or merely mirrored) active device
             # outside this app's control.
             spotify_connect.pause(playback['destination_id'], use_active_device=True)
+            # Confirmed live: pausing alone leaves whatever this session had
+            # already add_to_queue'd (this app's own committed lookahead,
+            # plus any older undrained residue) sitting in Spotify's real
+            # queue - harmless while genuinely paused, but it resurfaces the
+            # moment the device is later resumed or skipped, either manually
+            # or by a future session's own passive reconciliation mistaking
+            # it for its own.
+            #
+            # Deliberately targets playback['destination_id'] - the device
+            # this radio session was actually using - NOT a fresh live
+            # active-device lookup the way pause() above does. Confirmed
+            # live this distinction matters: clear_queue_for_device_verified
+            # transfers control to its target device and then repeatedly
+            # calls next() on it, which is a far more invasive operation than
+            # pause() (silence whatever's making noise). Reading "whichever
+            # device Spotify currently considers active" at clear-time
+            # grabbed an unrelated, dormant device that merely happened to
+            # be the account's active pointer at that moment, forced a
+            # transfer onto it, and - combined with that device's own
+            # already-documented flakiness (see _maybe_auto_resume) - woke
+            # it into actually playing old unrelated residue out loud,
+            # instead of draining anything relevant to this session at all.
+            # Matches the existing precedent in /play and /switch-device
+            # below, both of which clear an explicit caller-tracked
+            # device_id, never a live-active lookup.
+            spotify_connect.clear_queue_for_device_verified(playback['destination_id'])
     return {"status": "stopped"}

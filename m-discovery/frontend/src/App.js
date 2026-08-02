@@ -6366,36 +6366,53 @@ function RadioTab({
               // hasn't reached playingPreview yet (spotify_native, browser,
               // ytmusic - none of which have live_status at all).
               const live = playingPreview?.live_status;
-              const nowOnAir = live ? live.is_playing : isPlaying;
+              // reachable===false is a confirmed *failed* fetch attempt
+              // (main.py's RadioLiveStatus - a rate limit, a network blip),
+              // not "no live data yet" - falling through to the generic
+              // isPlaying/nowPlaying/destStatus props here the same way an
+              // absent live_status does would keep confidently showing
+              // whatever was last genuinely known, with nothing telling the
+              // user it might be stale. Confirmed live: an hour-plus Spotify
+              // rate limit displayed as a perfectly normal "On Air, Playing
+              // on Living Room" the entire time it was blind.
+              const liveUnreachable = live?.reachable === false;
+              const liveOk = live && !liveUnreachable;
+              const nowOnAir = liveOk ? live.is_playing : isPlaying;
               return (
                 <>
                   <div className="radio-now-playing-art">
-                    {(live?.artwork_url || nowPlaying?.artwork_url) ? (
-                      <img src={live?.artwork_url || nowPlaying.artwork_url} alt="" onError={(e) => { e.target.style.display = 'none'; }} />
+                    {((liveOk && live.artwork_url) || nowPlaying?.artwork_url) ? (
+                      <img src={(liveOk && live.artwork_url) || nowPlaying.artwork_url} alt="" onError={(e) => { e.target.style.display = 'none'; }} />
                     ) : (
                       <span className="radio-now-playing-fallback">📻</span>
                     )}
                   </div>
                   <div className="radio-now-playing-info">
-                    <span className="radio-live-badge">
+                    <span className={`radio-live-badge${liveUnreachable ? ' radio-live-badge-unreachable' : ''}`}>
                       <span className="radio-live-dot" />
-                      {nowOnAir ? 'On Air' : 'Paused'}
+                      {liveUnreachable ? 'Unverified' : (nowOnAir ? 'On Air' : 'Paused')}
                     </span>
-                    <h3 className="radio-now-playing-title">{live?.track_name || nowPlaying?.track_name || 'Starting…'}</h3>
-                    <p className="radio-now-playing-artist">{live?.artist_name || nowPlaying?.artist_name}</p>
+                    <h3 className="radio-now-playing-title">{(liveOk && live.track_name) || nowPlaying?.track_name || 'Starting…'}</h3>
+                    <p className="radio-now-playing-artist">{(liveOk && live.artist_name) || nowPlaying?.artist_name}</p>
                     <p className="radio-now-playing-seed">
                       {radioSeed?.description || 'Radio'}
                       <span className="radio-destination-tag"> → {destinationLabel}</span>
                     </p>
-                    {live?.active_device_name ? (
+                    {liveUnreachable && (
+                      <p className="radio-live-unreachable-note">Can't verify right now (Spotify unreachable) - info above may be stale</p>
+                    )}
+                    {liveOk && live.active_device_name ? (
                       <p className="radio-active-device">
                         Playing on: <span className="radio-active-device-name">{live.active_device_name}</span>
                       </p>
-                    ) : outputDevice?.type === 'spotify' && destStatus?.active_device_name && (
+                    ) : !liveUnreachable && outputDevice?.type === 'spotify' && destStatus?.active_device_name && (
                       // Fallback for a session with no live_status yet (still
                       // starting) - same mismatch framing as before, since
                       // without an independent read there's nothing better
                       // to compare destStatus against than the generic pick.
+                      // Not shown at all when liveUnreachable - destStatus is
+                      // exactly as unverifiable as live_status right now, and
+                      // the note above already covers that.
                       <p className="radio-active-device">
                         Playing on:{' '}
                         <span className={destStatus.active_device_name !== outputDevice.name ? 'radio-active-device-mismatch' : 'radio-active-device-name'}>

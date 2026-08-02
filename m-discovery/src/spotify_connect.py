@@ -612,8 +612,14 @@ def set_volume(device_id, level):
     return result is not None
 
 
-def next_track(device_id):
-    result = _api_request('POST', '/me/player/next', params={'device_id': device_id})
+def next_track(device_id, use_active_device=False):
+    """use_active_device=True - same reasoning as pause()/resume()/
+    add_to_queue()/play_uris() above: omits device_id from the actual API
+    call so it targets whichever device Spotify itself currently considers
+    active, for a caller following up right after a use_active_device=True
+    play_uris() call that may not have landed on device_id literally."""
+    params = {} if use_active_device else {'device_id': device_id}
+    result = _api_request('POST', '/me/player/next', params=params)
     return result is not None
 
 
