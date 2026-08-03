@@ -1,5 +1,6 @@
 import os
 import random
+import re
 
 import requests
 
@@ -197,6 +198,55 @@ def track_artwork(artist_name, track_name):
             if img.get('size') == size and img.get('#text'):
                 return img['#text']
     return None
+
+
+_DECADE_TAG_RE = re.compile(r'^(\d0)s$')
+
+
+def _genre_decade_from_tags(tags, artist_name):
+    """Shared extraction for artist_genre_decade below - genre is the first
+    tag that isn't decade-shaped or just the artist's own name, title-cased;
+    decade is any exact "\\d0s" tag, parsed as e.g. "70s" -> 1970, "10s" ->
+    2010 (values 0-29 read as 2000s, 30-99 as 1900s - covers the range
+    Last.fm's own tagging convention actually uses). Last.fm's tags are
+    crowd-sourced folksonomy, not a clean genre taxonomy - a real query
+    mixes genre words with decade tags and noise (confirmed live: ABBA's
+    own artist tags include 'Disco', 'pop', '70s', 'swedish', 'dance')."""
+    artist_lower = artist_name.strip().lower()
+    genre, decade = None, None
+    for t in tags:
+        name = (t.get('name') or '').strip()
+        if not name:
+            continue
+        m = _DECADE_TAG_RE.match(name.lower())
+        if m:
+            if decade is None:
+                n = int(m.group(1))
+                decade = (2000 if n <= 20 else 1900) + n
+            continue
+        if genre is None and name.lower() != artist_lower:
+            genre = name.title()
+    return genre, decade
+
+
+def artist_genre_decade(artist_name):
+    """(genre, decade) from artist.getTopTags, best-effort - (None, None) if
+    Last.fm has no tag data at all. Deliberately artist-level, not
+    track.getInfo's own per-track toptags - confirmed live that track-level
+    tagging is far sparser (e.g. Status Quo's "Down Down", a genuine UK #1
+    single, has zero track tags of its own) while the artist itself is
+    densely tagged (classic rock/rock/hard rock/70s/80s/...). decade here is
+    the artist's own most-tagged era, not necessarily this specific track's
+    actual release year - a reasonable approximation for a whole discovery
+    list's decade breakdown, not a fact about the one song. Only ever
+    called as a fallback for a candidate with no known_tracks match at all
+    (see radio_engine.py) - a real library tag, when one exists, is always
+    preferred over this crowd-sourced guess."""
+    data = _request('artist.getTopTags', artist=artist_name, autocorrect=1)
+    if not data:
+        return None, None
+    tags = ((data.get('toptags') or {}).get('tag')) or []
+    return _genre_decade_from_tags(tags, artist_name)
 
 
 def _pick_top_track(top_tracks):

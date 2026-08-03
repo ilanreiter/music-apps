@@ -160,6 +160,42 @@ def _index_cached_tracks_by_key(artist_names, db):
     return index
 
 
+def _index_track_metadata_by_key(artist_names, db):
+    """{(track_name.lower(), artist_name.lower()): {'genre','year','duration_seconds'}}
+    for every known_tracks row by these artists, regardless of
+    spotify_checked - unlike _index_cached_tracks_by_key's own known_tracks
+    query (deliberately gated on spotify_checked, since that one exists to
+    avoid a live Spotify search at match time), genre/year/duration come
+    from the local file's own tags and have nothing to do with Spotify
+    verification status at all. Confirmed live this mattered: 8333 of this
+    library's 12745 genre-tagged known_tracks rows aren't Spotify-verified
+    yet, so the Spotify-gated index alone was missing most of the
+    available genre/year/duration data the summary panel (App.js) can
+    actually show."""
+    if not artist_names:
+        return {}
+    lowered = list({a.lower() for a in artist_names})
+    try:
+        cur = db.cursor()
+        cur.execute("""
+            SELECT track_name, artist_name, genre, year, duration_seconds
+            FROM known_tracks
+            WHERE LOWER(artist_name) = ANY(%s)
+        """, (lowered,))
+        rows = cur.fetchall()
+        cur.close()
+    except Exception as e:
+        print(f"Error indexing track metadata for radio: {e}")
+        return {}
+    index = {}
+    for track_name, artist_name, genre, year, duration_seconds in rows:
+        if genre or year or duration_seconds:
+            index[(track_name.lower(), artist_name.lower())] = {
+                'genre': genre, 'year': year, 'duration_seconds': duration_seconds,
+            }
+    return index
+
+
 def _interleave_by_artist(tracks):
     """Round-robin regroup by artist so a same-artist run doesn't surface as
     several plays in a row. Real Last.fm data makes this common: an
@@ -378,6 +414,44 @@ def generate_radio_batch_track_first(session, seen_keys, count, db):
             {**cached, 'selection_reason': c['selection_reason'], 'selection_engine': c.get('selection_engine'), 'match': c.get('match'), 'drift': c.get('drift')}
             if cached else c
         )
+
+    # Backfill genre/year/duration for anything that didn't already get it
+    # from a Spotify-verified known_tracks match above (a radio_discovered_tracks
+    # hit, or no cache hit at all) - _index_track_metadata_by_key checks
+    # every known_tracks row by these artists, not just the Spotify-verified
+    # ones, since this metadata has nothing to do with Spotify at all.
+    metadata_by_key = _index_track_metadata_by_key(list({c['artist_name'] for c in collected}), db)
+    for c in final:
+        if c.get('genre') or c.get('year') or c.get('duration_seconds'):
+            continue
+        meta = metadata_by_key.get((c['track_name'].lower(), c['artist_name'].lower()))
+        if meta:
+            c.update(meta)
+
+    # Eager Last.fm tag-based fallback for anything still missing both genre
+    # and year after the known_tracks backfill above - i.e. no local
+    # library match at all. Artist-level (artist.getTopTags), not
+    # track.getInfo's own per-track toptags - confirmed live track-level
+    # tagging is far sparser (a genuine UK #1 single came back with zero
+    # tags of its own) while the artist itself is usually densely tagged.
+    # Cached per-artist within this one call - several tracks by the same
+    # artist in one batch cost a single Last.fm call, not one each, which
+    # also meaningfully cuts total call volume on top of switching to a
+    # denser source. Crowd-sourced, not authoritative - see
+    # lastfm.artist_genre_decade's own docstring - a real library tag
+    # always wins when one exists.
+    artist_tag_cache = {}
+    for c in final:
+        if c.get('genre') or c.get('year'):
+            continue
+        artist_key = c['artist_name'].strip().lower()
+        if artist_key not in artist_tag_cache:
+            artist_tag_cache[artist_key] = lastfm.artist_genre_decade(c['artist_name'])
+        genre, decade = artist_tag_cache[artist_key]
+        if genre:
+            c['genre'] = genre
+        if decade:
+            c['year'] = decade
 
     if exclude_library:
         # A real known_tracks membership check, not just _index_cached_tracks_by_key's

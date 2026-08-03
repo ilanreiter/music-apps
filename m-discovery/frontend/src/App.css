@@ -506,9 +506,26 @@ main.with-player {
 
 .radio-summary-legend {
   display: flex;
+  align-items: center;
   gap: 16px;
   font-size: 0.78rem;
   color: var(--text-muted);
+}
+
+.radio-summary-clear-all {
+  margin-left: auto;
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 3px 10px;
+  color: var(--text-main);
+  cursor: pointer;
+  font-size: 0.78rem;
+}
+
+.radio-summary-clear-all:hover {
+  background: var(--accent-soft);
+  color: var(--accent);
 }
 
 .radio-summary-legend span {
@@ -559,10 +576,61 @@ main.with-player {
   padding: 6px 10px;
   font-size: 0.8rem;
   border-bottom: 1px solid var(--border);
+  cursor: pointer;
 }
 
 .radio-summary-row:last-child {
   border-bottom: none;
+}
+
+.radio-summary-row:hover {
+  background: var(--bg-card-hover);
+}
+
+.radio-summary-row.active {
+  background: rgba(236, 72, 153, 0.15);
+}
+
+.radio-summary-row.active .name {
+  color: var(--radio-accent);
+  font-weight: 600;
+}
+
+.radio-summary-row.unknown .name {
+  font-style: italic;
+}
+
+.radio-summary-row.unknown:not(.active) .name {
+  color: var(--text-muted);
+}
+
+.radio-filter-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 6px 12px;
+  margin-bottom: 10px;
+  font-size: 0.8rem;
+  color: var(--text-muted);
+}
+
+.radio-filter-bar button {
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 3px 10px;
+  color: var(--text-main);
+  cursor: pointer;
+  font-size: 0.78rem;
+}
+
+.radio-filter-bar button:hover {
+  background: var(--accent-soft);
+  color: var(--accent);
 }
 
 .radio-summary-artist-photo {

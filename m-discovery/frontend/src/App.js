@@ -6106,8 +6106,13 @@ function RadioTab({
           the page and asks nothing about destination - nothing about
           picking a seed, or the Last.fm recommendation step that follows it,
           needs to know where the result will eventually go. Destination
-          only becomes relevant at step 4 (push), not before. */}
-      {!generatingSession && (
+          only becomes relevant at step 4 (push), not before. Always
+          visible, even with a generated session already on screen (restored
+          after a refresh, or just not discarded yet) - picking a new seed
+          already resets generatingSession itself (see startGeneratedRadio),
+          so hiding this behind "no active session" only meant a refresh
+          could strand you staring at an old list with no way back to search
+          short of discarding it first. */}
       <div className="radio-seed-picker">
         <div className="radio-seed-tabs-row">
           <div className="radio-seed-tabs">
@@ -6224,7 +6229,6 @@ function RadioTab({
           </div>
         )}
       </div>
-      )}
 
       {/* Steps 2-4 (recommendations/generation, review+edit, destination+push)
           below - not yet reordered/reworked to match the same step outline,
@@ -6543,59 +6547,102 @@ function RadioPlaylistPreview({ session, onPlaylistChange, onReorder, onRemove, 
   const [previewPlaying, setPreviewPlaying] = useState(false);
   const previewAudioRef = useRef(null);
 
-  // genre/year/duration_seconds only ever come from a genuine known_tracks
-  // (library) match - a radio_discovered_tracks cache hit or a plain-text
-  // (never-searched) candidate has none of this metadata, so most lists
-  // will have partial coverage at best. Counted here rather than assumed,
-  // so the panel below can disclose real coverage instead of silently
-  // under-reporting against the full track count.
+  // The summary panel doubles as a facet filter on the track list above it -
+  // clicking a row adds that artist/genre/decade to the filter, clicking an
+  // already-selected row removes just that one value. Within one axis,
+  // selected values OR together (clicking both ABBA and Bee Gees shows
+  // either); the 3 axes AND together (artist-set AND genre-set AND
+  // decade-set), same as a normal faceted filter.
+  const [activeFilters, setActiveFilters] = useState({ artist: [], genre: [], decade: [] });
+  const toggleFilter = (type, value) => {
+    setActiveFilters((prev) => {
+      const current = prev[type];
+      const next = current.includes(value) ? current.filter((v) => v !== value) : [...current, value];
+      return { ...prev, [type]: next };
+    });
+  };
+  const filtersActive = activeFilters.artist.length > 0 || activeFilters.genre.length > 0 || activeFilters.decade.length > 0;
+
+  // True on every axis except excludeAxis - each table's own bars are
+  // computed with its own axis excluded (see summary below), so picking an
+  // artist narrows the genre/decade tables to what that artist actually
+  // has, while the artist table itself still shows every artist available
+  // under the other active filters - the standard faceted-search
+  // convention (a facet never hides its own other options, only what the
+  // *other* facets would exclude).
+  const matchesFiltersExcept = (item, excludeAxis) => {
+    if (excludeAxis !== 'artist' && activeFilters.artist.length && !activeFilters.artist.includes(item.artist_name)) return false;
+    if (excludeAxis !== 'genre' && activeFilters.genre.length && !activeFilters.genre.includes(item.genre || 'Unknown')) return false;
+    if (excludeAxis !== 'decade' && activeFilters.decade.length) {
+      const decadeKey = item.year ? Math.floor(item.year / 10) * 10 : 'Unknown';
+      if (!activeFilters.decade.includes(decadeKey)) return false;
+    }
+    return true;
+  };
+
   const summary = useMemo(() => {
     const playlist = session.playlist;
-    const byArtist = new Map();
-    const byGenre = new Map();
-    const byDecade = new Map();
-    let durationSum = 0, durationCount = 0, genreCount = 0, yearCount = 0;
 
-    const bump = (map, key, match) => {
-      if (!map.has(key)) map.set(key, { count: 0, matchSum: 0, matchCount: 0 });
-      const entry = map.get(key);
-      entry.count += 1;
-      if (match != null) { entry.matchSum += match; entry.matchCount += 1; }
+    const buildFacet = (excludeAxis, keyFn) => {
+      const map = new Map();
+      for (const item of playlist) {
+        if (!matchesFiltersExcept(item, excludeAxis)) continue;
+        const key = keyFn(item);
+        if (!map.has(key)) map.set(key, { count: 0, matchSum: 0, matchCount: 0 });
+        const entry = map.get(key);
+        entry.count += 1;
+        if (item.match != null) { entry.matchSum += item.match; entry.matchCount += 1; }
+      }
+      return Array.from(map.entries())
+        .map(([key, e]) => ({ key, count: e.count, avgMatch: e.matchCount ? e.matchSum / e.matchCount : null }));
     };
 
-    for (const item of playlist) {
-      bump(byArtist, item.artist_name, item.match);
-      if (item.genre) { genreCount += 1; bump(byGenre, item.genre, item.match); }
-      if (item.year) { yearCount += 1; bump(byDecade, Math.floor(item.year / 10) * 10, item.match); }
-      if (item.duration_seconds) {
-        durationSum += item.duration_seconds;
-        durationCount += 1;
-      }
-    }
-
-    const toList = (map) => Array.from(map.entries())
-      .map(([key, e]) => ({ key, count: e.count, avgMatch: e.matchCount ? e.matchSum / e.matchCount : null }));
-
-    const artists = toList(byArtist).sort((a, b) => b.count - a.count);
-    const genres = toList(byGenre).sort((a, b) => b.count - a.count);
-    const decades = toList(byDecade).sort((a, b) => a.key - b.key);
-
-    // Most tracks are Last.fm-only candidates with no local match at all,
-    // so a plain sum over known durations badly under-reports a full list's
-    // real playtime (see the 31/500-known case this was built from).
-    // Estimating every unknown track at the known subset's own average
-    // keeps the total representative of the whole list's actual size
-    // instead of just whichever fraction happened to already be resolved.
-    const estimatedDurationSum = durationCount > 0 ? (durationSum / durationCount) * playlist.length : 0;
+    const artists = buildFacet('artist', (item) => item.artist_name).sort((a, b) => b.count - a.count);
+    const genres = buildFacet('genre', (item) => item.genre || 'Unknown').sort((a, b) => b.count - a.count);
+    // Unknown has no chronological position, so it can't just sort
+    // alongside real decade numbers (NaN from 'Unknown' - number) - pinned
+    // last instead, after every real decade in ascending order.
+    const decadesList = buildFacet('decade', (item) => (item.year ? Math.floor(item.year / 10) * 10 : 'Unknown'));
+    const decades = [
+      ...decadesList.filter((d) => d.key !== 'Unknown').sort((a, b) => a.key - b.key),
+      ...decadesList.filter((d) => d.key === 'Unknown'),
+    ];
 
     return {
-      total: playlist.length, distinctArtists: byArtist.size, artists, genres, decades,
+      // total/distinctArtists are the true, always-unfiltered full-list
+      // totals (used for the stat tiles' "(of N)" context, not the facet
+      // tables) - distinct from artists.length above, which is the artist
+      // table's own facet count (genre/decade-filtered, artist-filter
+      // excluded) and can be smaller once other filters are active.
+      total: playlist.length, distinctArtists: new Set(playlist.map((item) => item.artist_name)).size,
+      artists, genres, decades,
       maxArtistCount: artists.length ? Math.max(...artists.map((a) => a.count)) : 0,
       maxGenreCount: genres.length ? Math.max(...genres.map((g) => g.count)) : 0,
       maxDecadeCount: decades.length ? Math.max(...decades.map((d) => d.count)) : 0,
-      durationSum, durationCount, estimatedDurationSum, genreCount, yearCount,
     };
-  }, [session.playlist]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [session.playlist, activeFilters]);
+
+  const filteredPlaylist = useMemo(() => {
+    if (!filtersActive) return session.playlist;
+    return session.playlist.filter((item) => matchesFiltersExcept(item, null));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [session.playlist, activeFilters, filtersActive]);
+
+  // The 3 headline stat tiles track whatever's currently filtered into
+  // view (unlike the per-axis breakdown tables below, which deliberately
+  // stay computed against the full list - see filteredPlaylist's own
+  // comment - so every facet stays browsable/combinable while filtered).
+  const filteredSummary = useMemo(() => {
+    const artistSet = new Set();
+    let durationSum = 0, durationCount = 0;
+    for (const item of filteredPlaylist) {
+      artistSet.add(item.artist_name);
+      if (item.duration_seconds) { durationSum += item.duration_seconds; durationCount += 1; }
+    }
+    const estimatedDurationSum = durationCount > 0 ? (durationSum / durationCount) * filteredPlaylist.length : 0;
+    return { total: filteredPlaylist.length, distinctArtists: artistSet.size, durationCount, estimatedDurationSum };
+  }, [filteredPlaylist]);
 
   const handlePreviewClick = async (item) => {
     if (preview.itemId === item.item_id) {
@@ -6728,11 +6775,20 @@ function RadioPlaylistPreview({ session, onPlaylistChange, onReorder, onRemove, 
   // artists/genres/decades are different units, never compared against
   // each other); avgMatch is scaled against the full honest 0-100% range,
   // same convention as the per-track match meter above.
-  const renderSummaryBar = (label, count, avgMatch, maxCount, photoUrl) => {
+  const renderSummaryBar = (label, count, avgMatch, maxCount, filterType, filterValue, photoUrl) => {
     const countPct = maxCount ? Math.round((count / maxCount) * 100) : 0;
     const matchPct = avgMatch != null ? Math.round(avgMatch * 100) : null;
+    const isActive = activeFilters[filterType].includes(filterValue);
     return (
-      <div key={label} className="radio-summary-row">
+      <div
+        key={label}
+        className={`radio-summary-row${isActive ? ' active' : ''}${filterValue === 'Unknown' ? ' unknown' : ''}`}
+        role="button"
+        tabIndex={0}
+        title={`Filter the list to ${label}`}
+        onClick={() => toggleFilter(filterType, filterValue)}
+        onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleFilter(filterType, filterValue); } }}
+      >
         {photoUrl && (
           <img className="radio-summary-artist-photo" src={photoUrl} alt="" onError={(e) => { e.target.style.display = 'none'; }} />
         )}
@@ -6760,28 +6816,44 @@ function RadioPlaylistPreview({ session, onPlaylistChange, onReorder, onRemove, 
         {headerAction}
       </div>
       <p className="hint">⬆ moves a track to play next, ✕ removes it.</p>
+      {filtersActive && (
+        <div className="radio-filter-bar">
+          <span>
+            Filtered by {[
+              activeFilters.artist.length ? activeFilters.artist.join(', ') : null,
+              activeFilters.genre.length ? activeFilters.genre.join(', ') : null,
+              activeFilters.decade.length ? activeFilters.decade.map((d) => `${d}s`).join(', ') : null,
+            ].filter(Boolean).join(' · ')}
+            {' '}({filteredPlaylist.length} of {session.playlist.length})
+          </span>
+          <button type="button" onClick={() => setActiveFilters({ artist: [], genre: [], decade: [] })}>Clear all</button>
+        </div>
+      )}
       <div className="track-list">
-        {session.playlist.map((item, index) => renderRow(item, index))}
+        {filteredPlaylist.map((item, index) => renderRow(item, index))}
       </div>
       {session.playlist.length === 0 && (
         <p className="empty-state">Nothing generated yet.</p>
+      )}
+      {session.playlist.length > 0 && filteredPlaylist.length === 0 && (
+        <p className="empty-state">No tracks match the current filter.</p>
       )}
       {session.playlist.length > 0 && (
         <div className="radio-summary">
           <div className="radio-summary-stats">
             <div className="radio-summary-stat">
-              <span className="value">{summary.total}</span>
-              <span className="label">Tracks</span>
+              <span className="value">{filteredSummary.total}</span>
+              <span className="label">Tracks{filtersActive && ` (of ${summary.total})`}</span>
             </div>
             <div className="radio-summary-stat">
-              <span className="value">{summary.distinctArtists}</span>
-              <span className="label">Artists</span>
+              <span className="value">{filteredSummary.distinctArtists}</span>
+              <span className="label">Artists{filtersActive && ` (of ${summary.distinctArtists})`}</span>
             </div>
             <div className="radio-summary-stat">
-              <span className="value">{summary.durationCount > 0 ? formatTotalDuration(summary.estimatedDurationSum) : '–'}</span>
+              <span className="value">{filteredSummary.durationCount > 0 ? formatTotalDuration(filteredSummary.estimatedDurationSum) : '–'}</span>
               <span className="label">
                 Total estimated playtime
-                {summary.durationCount > 0 && summary.durationCount < summary.total && ` (${summary.durationCount}/${summary.total} with known duration)`}
+                {filteredSummary.durationCount > 0 && filteredSummary.durationCount < filteredSummary.total && ` (${filteredSummary.durationCount}/${filteredSummary.total} with known duration)`}
               </span>
             </div>
           </div>
@@ -6789,44 +6861,35 @@ function RadioPlaylistPreview({ session, onPlaylistChange, onReorder, onRemove, 
           <div className="radio-summary-legend">
             <span><i className="swatch count-fill" /> Track count</span>
             <span><i className="swatch match-fill" /> Avg similarity</span>
+            {filtersActive && (
+              <button type="button" className="radio-summary-clear-all" onClick={() => setActiveFilters({ artist: [], genre: [], decade: [] })}>
+                Clear all filters
+              </button>
+            )}
           </div>
           <div className="radio-summary-panels">
             <div className="radio-summary-section">
               <h5>Tracks by artist</h5>
               <div className="radio-summary-table">
                 {summary.artists.map((a) => renderSummaryBar(
-                  a.key, a.count, a.avgMatch, summary.maxArtistCount,
+                  a.key, a.count, a.avgMatch, summary.maxArtistCount, 'artist', a.key,
                   `${apiBase}/artist-info/photo?name=${encodeURIComponent(a.key)}`,
                 ))}
               </div>
             </div>
 
             <div className="radio-summary-section">
-              <h5>
-                By genre
-                {summary.genreCount < summary.total && <span className="radio-summary-hint"> ({summary.genreCount}/{summary.total} known)</span>}
-              </h5>
-              {summary.genres.length === 0 ? (
-                <p className="empty-state">No genre data available yet.</p>
-              ) : (
-                <div className="radio-summary-table">
-                  {summary.genres.map((g) => renderSummaryBar(g.key, g.count, g.avgMatch, summary.maxGenreCount))}
-                </div>
-              )}
+              <h5>By genre</h5>
+              <div className="radio-summary-table">
+                {summary.genres.map((g) => renderSummaryBar(g.key, g.count, g.avgMatch, summary.maxGenreCount, 'genre', g.key))}
+              </div>
             </div>
 
             <div className="radio-summary-section">
-              <h5>
-                By decade
-                {summary.yearCount < summary.total && <span className="radio-summary-hint"> ({summary.yearCount}/{summary.total} known)</span>}
-              </h5>
-              {summary.decades.length === 0 ? (
-                <p className="empty-state">No release-year data available yet.</p>
-              ) : (
-                <div className="radio-summary-table">
-                  {summary.decades.map((d) => renderSummaryBar(`${d.key}s`, d.count, d.avgMatch, summary.maxDecadeCount))}
-                </div>
-              )}
+              <h5>By decade</h5>
+              <div className="radio-summary-table">
+                {summary.decades.map((d) => renderSummaryBar(d.key === 'Unknown' ? 'Unknown' : `${d.key}s`, d.count, d.avgMatch, summary.maxDecadeCount, 'decade', d.key))}
+              </div>
             </div>
           </div>
         </div>
