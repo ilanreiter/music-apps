@@ -625,15 +625,15 @@ def _advance_spotify_radio_playlist(save_session, destination_id, queue, radio_s
         if conn is None:
             break
         try:
-            # Same tiered generator /api/radio/generate's own background job
-            # uses, called here so a long unattended run keeps extending past
-            # whatever length was originally generated - "Radio must never
-            # just stop" applies here exactly as it did for the old
+            # Same drift-BFS generator /api/radio/generate's own background
+            # job uses, called here so a long unattended run keeps extending
+            # past whatever length was originally generated - "Radio must
+            # never just stop" applies here exactly as it did for the old
             # candidates/cursor model.
-            new_tracks, track_frontier, fallback_expanded_artists, _degraded = radio_engine.generate_radio_batch_track_first(
+            new_tracks, track_frontier, discovery_state, _degraded = radio_engine.generate_radio_batch_track_first(
                 session, session.get('seen_track_keys') or [], RADIO_ADVANCER_REFILL_BATCH, conn,
             )
-            set_radio_session_track_state(radio_session_id, track_frontier, fallback_expanded_artists)
+            set_radio_session_track_state(radio_session_id, track_frontier, discovery_state)
         finally:
             conn.close()
         extended_once = True
@@ -1097,17 +1097,17 @@ def _advance_spotify(save_session, destination_id, now_playing, queue, match_poo
         if conn is None:
             break
         try:
-            # Track-first, tiered by which mechanism it costs - Last.fm
-            # track.getSimilar recursion primary, the artist-level bundle a
-            # reserve once that's genuinely empty, an untargeted cached
-            # library track only as an absolute last resort. This is what
-            # keeps a backgrounded Radio session matching indefinitely
-            # through a long unattended run instead of just running dry -
-            # see radio_engine.generate_radio_batch_track_first.
-            new_tracks, track_frontier, fallback_expanded_artists, _degraded = radio_engine.generate_radio_batch_track_first(
+            # Drift-aware Graph-BFS, purely track-to-track (lastfm.track_similar_tracks)
+            # - no artist-level tier, no hop-depth cap, just a measured drift
+            # budget that expands outward once the current radius is
+            # genuinely exhausted. This is what keeps a backgrounded Radio
+            # session matching indefinitely through a long unattended run
+            # instead of just running dry - see
+            # radio_engine.generate_radio_batch_track_first.
+            new_tracks, track_frontier, discovery_state, _degraded = radio_engine.generate_radio_batch_track_first(
                 session, session.get('seen_track_keys') or [], RADIO_ADVANCER_REFILL_BATCH, conn,
             )
-            set_radio_session_track_state(radio_session_id, track_frontier, fallback_expanded_artists)
+            set_radio_session_track_state(radio_session_id, track_frontier, discovery_state)
         finally:
             conn.close()
         refilled_from_radio = True

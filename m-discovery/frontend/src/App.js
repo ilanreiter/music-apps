@@ -980,6 +980,13 @@ function App() {
   // changing afterward to set up the *next* session) - 'browser' | 'spotify'
   // | 'ytmusic'. What the refill effects below dispatch against.
   const [radioDestinationType, setRadioDestinationType] = useState(null);
+  // Which engine the currently-committed radio session was started with -
+  // 'spotify_native' still drives Spotify Connect playback live (device-
+  // switch/stop-clear behavior must keep following it), 'discovery' no
+  // longer does (it just generates a reviewable playlist). Set from
+  // commitRadioSession below, not derived from anything ref-based that
+  // wouldn't survive a page refresh.
+  const [radioActiveEngine, setRadioActiveEngine] = useState('discovery');
   const [radioStatus, setRadioStatus] = useState(null); // transient hint/error text
   const RADIO_REFILL_THRESHOLD = 3;
   const RADIO_BATCH_SIZE = 10;
@@ -2784,34 +2791,6 @@ function App() {
     return null;
   };
 
-  // Builds the spotify_match_pool payload handed to the server (via
-  // startQueue's spotifyMatchPool option) so playback_advancer keeps
-  // matching/queueing this radio session on its own. A candidate's `id` is
-  // its known_track_id when the backend already resolved it to a cached,
-  // Spotify-matched library track (see radio_engine.find_cached_artist_tracks) -
-  // that's what lets the advancer's existing cache-hit path
-  // (_match_local_track_cached) resolve it with zero new Spotify searches,
-  // instead of every candidate needing a fresh text search
-  // (_match_text_candidate). spotify_uri/radio_track_id are the same idea
-  // for a radio_discovered_tracks match instead (a track not in the
-  // library, so no known_tracks id to carry) - playback_advancer's matching
-  // loop checks for these directly. selection_reason/selection_engine ride
-  // along so whichever candidate actually plays can stamp the Play Log
-  // with the real reason/engine instead of a generic default. null when
-  // there's nothing left to hand off (an empty starting batch) - that's
-  // still meaningful, since passing it clears any pool from a previous
-  // session/flow rather than silently preserving one.
-  const buildRadioSpotifyPool = (sessionId, remaining) => (
-    remaining.length > 0 ? {
-      candidates: remaining.map((t) => ({
-        id: t.known_track_id ?? null, track_name: t.track_name, artist_name: t.artist_name, album_name: t.album_name,
-        spotify_uri: t.spotify_uri ?? null, radio_track_id: t.radio_track_id ?? null, selection_reason: t.selection_reason ?? null,
-        selection_engine: t.selection_engine ?? null,
-      })),
-      cursor: 0,
-      radio_session_id: sessionId,
-    } : null
-  );
 
   // Sets the three radio-session state vars together, right at the moment
   // a queue mutation carrying this same session's id actually happens (see
@@ -2827,6 +2806,7 @@ function App() {
     setRadioSessionId(sessionId);
     setRadioSeed({ type: seed.type, description: seed.description });
     setRadioDestinationType(destinationType);
+    setRadioActiveEngine(seed.engine || 'discovery');
   };
 
   // Restores Radio's own UI state (hero card, Up Next, Stop button) after a
@@ -2872,7 +2852,7 @@ function App() {
         if (response.data.queue) setQueue(response.data.queue);
         commitRadioSession(
           sessionId,
-          { type: session.seed_type, description: session.seed_description },
+          { type: session.seed_type, description: session.seed_description, engine: session.engine },
           session.destination_type,
         );
         if (session.destination_type === 'ytmusic') setRadioDestination('ytmusic');
@@ -2898,75 +2878,6 @@ function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Tries each candidate in order until one actually resolves to a Spotify
-  // URI, hands the rest off to the server pool the moment it does (same
-  // low-latency-first-track philosophy as Discover/library-cast). A
-  // candidate with a known_track_id is a library track the backend already
-  // confirmed is cached on Spotify (radio_engine.find_cached_artist_tracks)
-  // - matched via the real cache-first endpoint (instant, no live search),
-  // never the plain text search. Only genuine tier-2/3 (fresh, uncached)
-  // candidates can ever come back 'unavailable' here - and per requirement
-  // #1 (Radio must never just stop over a rate limit), hitting that mid-list
-  // asks the backend for one fresh cached-only batch (it already knows to
-  // degrade once the budget's spent) and retries with that, rather than
-  // giving up outright. Returns true if something started playing.
-  const tryResolveAndStartFirstSpotifyMatch = async (sessionId, seed, destinationType, candidates) => {
-    for (let i = 0; i < candidates.length; i++) {
-      const candidate = candidates[i];
-      let matchResult;
-      if (candidate.spotify_uri) {
-        // Already resolved by radio_engine.generate_radio_batch_track_first's
-        // own cache check (a radio_discovered_tracks match - see
-        // mapRadioTracks) - no live search needed at all.
-        matchResult = { matched: true, uri: candidate.spotify_uri, radio_track_id: candidate.radio_track_id, artwork_url: candidate.artwork_url };
-      } else {
-        try {
-          if (candidate.known_track_id != null) {
-            const matchResponse = await axios.post(`${API_BASE_URL}/spotify/tracks/${candidate.known_track_id}/match`);
-            matchResult = matchResponse.data;
-          } else {
-            const matchResponse = await axios.post(`${API_BASE_URL}/spotify/discover-match`, {
-              track_name: candidate.track_name, artist_name: candidate.artist_name,
-            });
-            matchResult = matchResponse.data;
-          }
-        } catch (err) {
-          console.error('Error matching radio track to Spotify:', err);
-          break;
-        }
-      }
-      if (matchResult.reason === 'unavailable') {
-        try {
-          const moreResponse = await axios.post(`${API_BASE_URL}/radio/${sessionId}/more`, { count: 10 });
-          if (moreResponse.data.degraded) {
-            setRadioStatus("Spotify's search is rate-limited right now - Radio is playing from your library only.");
-          }
-          const fallbackMapped = mapRadioTracks(sessionId, moreResponse.data.tracks);
-          if (fallbackMapped.length > 0) {
-            return tryResolveAndStartFirstSpotifyMatch(sessionId, seed, destinationType, fallbackMapped);
-          }
-        } catch (err) {
-          console.error('Error fetching a cached-only radio fallback batch:', err);
-        }
-        setRadioStatus("Spotify's search is temporarily rate-limited - try again later.");
-        return false;
-      }
-      if (!matchResult.matched) continue;
-      const firstEntry = {
-        id: matchResult.uri, source: 'spotify', uri: matchResult.uri, context_uri: null,
-        radio_id: candidate.id, radio_session_id: sessionId,
-        track_name: candidate.track_name, artist_name: candidate.artist_name,
-        album_name: candidate.album_name, artwork_url: matchResult.artwork_url,
-        radio_track_id: matchResult.radio_track_id ?? candidate.radio_track_id ?? null,
-        selection_reason: candidate.selection_reason ?? null,
-        selection_engine: candidate.selection_engine ?? null,
-      };
-      commitRadioSession(sessionId, seed, destinationType);
-      startQueue([firstEntry], { spotifyMatchPool: buildRadioSpotifyPool(sessionId, candidates.slice(i + 1)) });
-      return true;
-    }
-    return false;
-  };
 
   // Same per-candidate matching tryResolveAndStartFirstSpotifyMatch uses
   // (cache-first via known_track_id, text search otherwise), but just
@@ -3122,8 +3033,21 @@ function App() {
       }
       setRadioStatus(null);
     }
-    if (seed.engine === 'spotify_native' && destinationType === 'spotify') {
-      return startNativeSpotifyRadio(seed, destinationType);
+    // Discover's own seed picker never reaches this function for a Spotify
+    // destination anymore - it always routes into the generated-playlist
+    // flow instead (RadioTab's own startFromTrack/startFromArtist/
+    // startFromPlaylist). So the only remaining Spotify-destination callers
+    // are outside Discover entirely (Library's per-track 📻 button, its
+    // per-playlist-group icon) - for those, "start radio" can only ever
+    // mean spotify_native (seed one track, let Spotify's own Autoplay
+    // continue), the one radio mode that's a genuine instant one-shot
+    // action with no generation/review step to open a tab for. Forces
+    // engine: 'spotify_native' onto the seed regardless of what the caller
+    // set (or didn't) - commitRadioSession reads this to set
+    // radioActiveEngine, which the live device-switch/stop-clear gates key
+    // off, so this must be right regardless of caller.
+    if (destinationType === 'spotify') {
+      return startNativeSpotifyRadio({ ...seed, engine: 'spotify_native' }, destinationType);
     }
     try {
       const response = await axios.post(`${API_BASE_URL}/radio/start`, {
@@ -3148,63 +3072,10 @@ function App() {
       const mapped = mapRadioTracks(session_id, tracks);
       const seedEntry = await resolveSeedTrackForPlayback(seed.seedTrack, destinationType, session_id);
 
-      if (destinationType === 'spotify') {
-        if (response.data.degraded) {
-          setRadioStatus("Spotify's search is rate-limited right now - Radio is playing from your library only.");
-        }
-        if (seedEntry) {
-          // The seed already resolved to something directly playable -
-          // hand off every suggested track as the server-side pool, no
-          // client-side matching needed at all for this session. Commit
-          // right here, synchronously with startQueue - no await between
-          // them for the "stop when superseded" effect to catch a stale
-          // in-between state on.
-          commitRadioSession(session_id, seed, destinationType);
-          startQueue([seedEntry], { spotifyMatchPool: buildRadioSpotifyPool(session_id, mapped) });
-          return;
-        }
-        // No seed track resolved - synchronously try suggestions one at a
-        // time until the first one matches (same low-latency-first start
-        // Discover/library-cast already use), then hand the rest off to
-        // the server pool instead of continuing to resolve them all here.
-        const started = await tryResolveAndStartFirstSpotifyMatch(session_id, seed, destinationType, mapped);
-        if (!started) {
-          // Confirmed live: with mapped=[] (nothing cached for this seed's
-          // artist/genre and Spotify search rate-limited) this session never
-          // calls commitRadioSession/startQueue at all - if left as-is,
-          // radioSessionId and nowPlaying/queue just stay whatever a
-          // previous session left them at, so the Radio tab kept showing
-          // old, unrelated "now playing" content under this new session's
-          // name/id instead of any indication it had failed to start. The
-          // backend already has this session_id marked 'active' too
-          // (create_radio_session retires the old one first) - tell it to
-          // stop rather than leaving an orphaned active row nothing is
-          // actually feeding.
-          axios.post(`${API_BASE_URL}/radio/${session_id}/stop`).catch((err) => console.error('Error stopping an unstarted radio session:', err));
-          setRadioSessionId(null);
-          setRadioSeed(null);
-          setRadioDestinationType(null);
-          // Names the actual seed track when there was one, rather than a
-          // generic "nothing cached" - confirmed live this can be
-          // legitimately a single specific track that just hasn't been
-          // through the background Spotify pre-warm yet (thousands still
-          // are), not "your whole library has nothing for this artist."
-          // "This Browser" plays local files directly with no Spotify match
-          // needed at all, so it's a real, immediate workaround here, not
-          // just "wait" - worth surfacing rather than leaving the user to
-          // guess it.
-          setRadioStatus(
-            response.data.degraded
-              ? seed.seedTrack
-                ? `Couldn't start radio - "${seed.seedTrack.track_name}" hasn't been matched to Spotify yet and search is rate-limited right now, so it can't be sent to your Spotify Connect device. Switch Radio's destination to This Browser to play it directly, or try again once the rate limit clears.`
-                : "Couldn't start radio - Spotify's search is rate-limited right now and nothing in your library is already cached for this seed. Try again once the rate limit clears."
-              : 'No Spotify match found for this radio seed - try a different one.',
-          );
-        }
-        return;
-      }
-
-      // This Browser: unchanged client-driven preview sampling.
+      // This Browser: unchanged client-driven preview sampling. (Spotify
+      // reaches this point only for spotify_native, already returned above
+      // at line 3048-3050 - the discovery+spotify combination never gets
+      // this far at all, per the guard near the top of this function.)
       if (seedEntry) {
         commitRadioSession(session_id, seed, destinationType);
         startQueue([seedEntry]);
@@ -3253,7 +3124,11 @@ function App() {
     // noticeable once the lookahead buffer deepened from 1 track to 2 -
     // "Stop" started visibly playing two more tracks afterward instead of
     // being barely perceptible.
-    if (outputDevice?.type === 'spotify') {
+    // radioActiveEngine gate: only spotify_native still keeps a live
+    // lookahead buffer worth clearing here - a discovery-engine session has
+    // nothing live sitting in queue anymore, so there's nothing for this
+    // block to protect against.
+    if (outputDevice?.type === 'spotify' && radioActiveEngine === 'spotify_native') {
       spotifyLookaheadRef.current = null;
       setQueue([]);
       axios.post(`${API_BASE_URL}/playback-session`, {
@@ -3268,37 +3143,8 @@ function App() {
     setRadioSessionId(null);
     setRadioSeed(null);
     setRadioDestinationType(null);
+    setRadioActiveEngine('discovery');
     setRadioStatus(null);
-  };
-
-  // The explicit "start playback" step for the new pre-generated-playlist
-  // Radio flow (RadioTab's own generate/preview UI calls /api/radio/{id}/generate
-  // and /reorder /remove directly - this is the one step that also needs to
-  // update this component's own nowPlaying/queue/radioSessionId, the same
-  // three things handleStartRadio's old flow set via commitRadioSession +
-  // startQueue). The backend's /play route already did the clear-then-verify
-  // and the first play_uris call - this just syncs this tab's own state to
-  // match what the server now has, the same way a page-refresh's session-
-  // restore effect already does.
-  const handlePlayGeneratedRadio = async (sessionId, seed) => {
-    if (!outputDevice || outputDevice.type !== 'spotify') return false;
-    try {
-      await axios.post(`${API_BASE_URL}/radio/${sessionId}/play`, { device_id: outputDevice.id });
-    } catch (err) {
-      console.error('Error starting the generated radio playlist:', err);
-      setRadioStatus('Failed to start playback. Please try again.');
-      return false;
-    }
-    try {
-      const response = await axios.get(`${API_BASE_URL}/playback-session`);
-      setNowPlaying(response.data.now_playing || null);
-      setQueue(response.data.queue || []);
-      setIsPlaying(true);
-    } catch (err) {
-      console.error('Error syncing playback state after starting radio:', err);
-    }
-    commitRadioSession(sessionId, seed, 'spotify');
-    return true;
   };
 
   // Wraps the raw outputDevice setter so switching between two Spotify
@@ -3315,7 +3161,13 @@ function App() {
   // signature they already call.
   const setOutputDevice = (device) => {
     const activeRadioSessionId = nowPlaying?.radio_session_id;
-    const isRadioDeviceSwitch = outputDevice?.type === 'spotify' && device?.type === 'spotify' && activeRadioSessionId != null;
+    // radioActiveEngine gate: only spotify_native still drives Spotify
+    // Connect playback live (Radio's own account-level Autoplay-continue
+    // seed) - a discovery-engine session has nothing live to redirect
+    // anymore, so this falls through to the plain setOutputDeviceRaw below
+    // for it, same as any non-radio device switch.
+    const isRadioDeviceSwitch = outputDevice?.type === 'spotify' && device?.type === 'spotify'
+      && activeRadioSessionId != null && radioActiveEngine === 'spotify_native';
     setOutputDeviceRaw(device);
     if (!isRadioDeviceSwitch) return;
     axios.post(`${API_BASE_URL}/radio/${activeRadioSessionId}/switch-device`, { device_id: device.id })
@@ -3338,35 +3190,53 @@ function App() {
   // reasoning: keeps the seed a sane size even for a huge playlist.
   const RADIO_PLAYLIST_ARTIST_LIMIT = 8;
 
+  // Pulled out of startRadioFromPlaylist below so RadioTab's own picker can
+  // build the seed object and hand it to startGeneratedRadio directly (the
+  // spotify+discovery reviewable-playlist flow) instead of always going
+  // through handleStartRadio's old live-start path - the same distinction
+  // startFromTrack/startFromArtist already make, just closing the gap for
+  // the playlist seed type too. Throws on failure - callers decide how to
+  // surface it (startRadioFromPlaylist below catches it; RadioTab's
+  // startFromPlaylist does its own try/catch around this too).
+  // generated: true when this seed is headed into the generate-then-review
+  // flow (Spotify) rather than a genuinely continuous radio session (This
+  // Browser/YouTube Music, or spotify_native) - changes only the built
+  // description text, "Radio from X" being actively wrong for a one-time
+  // reviewable playlist that never starts playing anything on its own.
+  const resolveRadioSeedFromPlaylist = async (platform, playlistId, playlistName, engine = 'discovery', generated = false) => {
+    const endpoint = platform === 'spotify'
+      ? `${API_BASE_URL}/spotify/playlists/${playlistId}/tracks`
+      : `${API_BASE_URL}/ytmusic/playlists/${playlistId}/tracks`;
+    const response = await axios.get(endpoint);
+    const tracks = response.data || [];
+    const seenArtists = new Set();
+    const artists = [];
+    for (const t of tracks) {
+      // Spotify tracks carry a comma-joined "artists" display string; YT
+      // Music tracks already have a clean artist_name - handle both.
+      const names = t.artist_name ? [t.artist_name] : (t.artists ? t.artists.split(',').map((n) => n.trim()) : []);
+      for (const name of names) {
+        if (name && !seenArtists.has(name)) {
+          seenArtists.add(name);
+          artists.push(name);
+        }
+      }
+      if (artists.length >= RADIO_PLAYLIST_ARTIST_LIMIT) break;
+    }
+    // First track in the playlist stands in for "a track from this
+    // playlist" - mapped into the app's normal playable-track shape
+    // (mapSpotifyTrack/mapYtMusicTrack), same as playGroup already uses
+    // for playing/queuing this same platform's playlist tracks elsewhere.
+    const seedTrack = tracks.length > 0
+      ? (platform === 'spotify' ? mapSpotifyTrack(tracks[0], playlistName) : mapYtMusicTrack(tracks[0], playlistName))
+      : null;
+    return { type: 'playlist', description: `${generated ? 'Discover from' : 'Radio from'} ${playlistName}`, seedArtists: artists, seedTrack, engine };
+  };
+
   const startRadioFromPlaylist = async (platform, playlistId, playlistName, engine = 'discovery') => {
     try {
-      const endpoint = platform === 'spotify'
-        ? `${API_BASE_URL}/spotify/playlists/${playlistId}/tracks`
-        : `${API_BASE_URL}/ytmusic/playlists/${playlistId}/tracks`;
-      const response = await axios.get(endpoint);
-      const tracks = response.data || [];
-      const seenArtists = new Set();
-      const artists = [];
-      for (const t of tracks) {
-        // Spotify tracks carry a comma-joined "artists" display string; YT
-        // Music tracks already have a clean artist_name - handle both.
-        const names = t.artist_name ? [t.artist_name] : (t.artists ? t.artists.split(',').map((n) => n.trim()) : []);
-        for (const name of names) {
-          if (name && !seenArtists.has(name)) {
-            seenArtists.add(name);
-            artists.push(name);
-          }
-        }
-        if (artists.length >= RADIO_PLAYLIST_ARTIST_LIMIT) break;
-      }
-      // First track in the playlist stands in for "a track from this
-      // playlist" - mapped into the app's normal playable-track shape
-      // (mapSpotifyTrack/mapYtMusicTrack), same as playGroup already uses
-      // for playing/queuing this same platform's playlist tracks elsewhere.
-      const seedTrack = tracks.length > 0
-        ? (platform === 'spotify' ? mapSpotifyTrack(tracks[0], playlistName) : mapYtMusicTrack(tracks[0], playlistName))
-        : null;
-      await handleStartRadio({ type: 'playlist', description: `Radio from ${playlistName}`, seedArtists: artists, seedTrack, engine });
+      const seed = await resolveRadioSeedFromPlaylist(platform, playlistId, playlistName, engine);
+      await handleStartRadio(seed);
     } catch (err) {
       console.error('Error reading playlist tracks for radio seed:', err);
       setRadioStatus('Could not read this playlist to start radio.');
@@ -3718,8 +3588,12 @@ function App() {
           const primaryArtist = track.artist_name.split(',')[0].trim();
           handleStartRadio({ type: 'track', description: `Radio from "${track.track_name}"`, seedArtists: [primaryArtist], seedTrack: track });
         }}
-        aria-label="Start Radio from this track"
-        title="Start Radio from this track"
+        // For a Spotify destination this now seeds Spotify's own Autoplay
+        // directly (handleStartRadio's spotify branch) rather than opening
+        // Discover's reviewable-playlist flow - a genuine one-shot action,
+        // so the tooltip says so rather than reusing the generic label.
+        aria-label={outputDevice?.type === 'spotify' ? 'Start Spotify Radio from this track' : 'Start Radio from this track'}
+        title={outputDevice?.type === 'spotify' ? "Start Spotify Radio - seeds Spotify's own Autoplay from this track" : 'Start Radio from this track'}
       >
         📻
       </button>
@@ -4298,7 +4172,7 @@ function App() {
             className={activeTab === 'radio' ? 'active' : ''}
             onClick={() => setActiveTab('radio')}
           >
-            Radio
+            Discover
           </button>
           <button
             className={activeTab === 'cleanup' ? 'active' : ''}
@@ -4908,6 +4782,7 @@ function App() {
             radioDestination={radioDestination}
             setRadioDestination={setRadioDestination}
             radioDestinationType={radioDestinationType}
+            radioActiveEngine={radioActiveEngine}
             radioSessionId={radioSessionId}
             radioSeed={radioSeed}
             radioStatus={radioStatus}
@@ -4918,8 +4793,8 @@ function App() {
             onDismissRadioStatus={() => setRadioStatus(null)}
             onStartRadio={handleStartRadio}
             onStartRadioFromPlaylist={startRadioFromPlaylist}
+            onResolveRadioSeedFromPlaylist={resolveRadioSeedFromPlaylist}
             onStopRadio={stopRadio}
-            onPlayGeneratedRadio={handlePlayGeneratedRadio}
           />
         ) : activeTab === 'playlog' ? (
           <PlayLogTab apiBase={API_BASE_URL} />
@@ -5911,20 +5786,11 @@ function BarChart({ title, entries }) {
 // CleanupTab being handed onTrackPlayClick rather than owning playback logic.
 function RadioTab({
   apiBase, outputDevice, setOutputDevice, outputDevices, ytMusicConnected,
-  radioDestination, setRadioDestination, radioDestinationType,
+  radioDestination, setRadioDestination, radioDestinationType, radioActiveEngine,
   radioSessionId, radioSeed, radioStatus, nowPlaying, queue, isPlaying, destStatus,
-  onDismissRadioStatus, onStartRadio, onStartRadioFromPlaylist, onStopRadio,
-  onPlayGeneratedRadio,
+  onDismissRadioStatus, onStartRadio, onStartRadioFromPlaylist, onResolveRadioSeedFromPlaylist, onStopRadio,
 }) {
   const [seedMode, setSeedMode] = useState('track');
-  // 'discovery' (default) - this app's own Last.fm-driven engine, matching/
-  // queueing every track itself. 'spotify_native' - only meaningful for a
-  // Spotify Connect destination: seeds Spotify's own account-level autoplay
-  // with a single track and leaves it alone from there (see
-  // playback_advancer._advance_spotify_native) - near-zero ongoing search
-  // cost, but depends on the account/device's own "Autoplay similar songs"
-  // setting (Spotify's app, not this one) actually being turned on.
-  const [radioEngine, setRadioEngine] = useState('discovery');
   // Same open/close toggle pattern as the control panel's own destination
   // picker (PlayerBar's destMenuOpen/.np-destination) - a single trigger
   // button showing the current pick, opening a dropdown of the other
@@ -5941,18 +5807,15 @@ function RadioTab({
   const [ytJobStatus, setYtJobStatus] = useState(null);
   const [searchBudget, setSearchBudget] = useState(null);
 
-  // New pre-generated-playlist flow (spotify+discovery only - see
-  // src/main.py's generate_radio_playlist). targetLength is the requested
-  // playlist size; generatingSession holds the session while it's being
-  // built/previewed/edited, before the user presses Play - once played,
-  // radioSessionId (the existing prop, already driving the rest of this
-  // component) takes over and this switches to polling the SAME session id
-  // read-only, to keep the preview grid in sync with what's actually
-  // playing (see the playingPreview effect below).
+  // Pre-generated-playlist flow (spotify+discovery only - see src/main.py's
+  // generate_radio_playlist). targetLength is the requested playlist size;
+  // generatingSession holds the session while it's being built/previewed/
+  // edited. There's no live "now playing" state to poll for this flow
+  // anymore - the reviewable grid is the whole experience for spotify+
+  // discovery until a future Phase pushes it to a real Spotify playlist.
   const [targetLength, setTargetLength] = useState(500);
+  const [includeLibraryTracks, setIncludeLibraryTracks] = useState(true);
   const [generatingSession, setGeneratingSession] = useState(null);
-  const [playingPreview, setPlayingPreview] = useState(null);
-  const [startingPlay, setStartingPlay] = useState(false);
 
   useEffect(() => {
     if (!generatingSession || generatingSession.generation_status !== 'generating') return;
@@ -5968,52 +5831,20 @@ function RadioTab({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [generatingSession?.id, generatingSession?.generation_status, apiBase]);
 
-  // Once played, keeps the (now read-only, from this component's side -
-  // playback_advancer owns actually consuming it) generated playlist in
-  // view so "now playing pinned to top, rest below" stays visible instead of
-  // the preview grid just disappearing the moment Play is pressed.
   useEffect(() => {
-    const previewId = playingPreview?.id;
-    if (previewId == null || radioSessionId !== previewId) { return; }
-    let cancelled = false;
-    const poll = () => {
-      axios.get(`${apiBase}/radio/${previewId}`).then((r) => {
-        if (cancelled || r.data.status !== 'active') return;
-        setPlayingPreview(r.data);
+    // Mount-only: a generated (Discover+Spotify) session is never tagged onto
+    // playback_session.now_playing (see App's own now_playing restore effect),
+    // so without this a page refresh mid-generation or after a finished
+    // generation would strand it - server-side complete, client-side invisible.
+    axios.get(`${apiBase}/radio/active-generated`).then((r) => {
+      const sessionId = r.data?.session_id;
+      if (!sessionId) return;
+      axios.get(`${apiBase}/radio/${sessionId}`).then((r2) => {
+        setGeneratingSession((prev) => (prev ? prev : r2.data));
       }).catch(() => {});
-    };
-    poll();
-    const intervalId = setInterval(poll, 5000);
-    return () => { cancelled = true; clearInterval(intervalId); };
-  }, [playingPreview, radioSessionId, apiBase]);
-
-  // radioSessionId changing away from the session this tab is showing means
-  // either Stop was pressed or a different session took over - either way
-  // the live preview no longer applies.
-  useEffect(() => {
-    if (playingPreview && radioSessionId !== playingPreview.id) setPlayingPreview(null);
-  }, [radioSessionId, playingPreview]);
-
-  // After a page refresh, this component's own state (generatingSession/
-  // playingPreview) always starts fresh at null - only App.js's own
-  // radioSessionId/radioSeed/radioDestinationType restore from the server
-  // (see its own session-restore effect). Without this, a refresh mid-
-  // session made the playlist preview grid vanish and the old Up Next panel
-  // reappear (its hiding condition is `!playingPreview`) even though the
-  // session was still genuinely active server-side the whole time - fetches
-  // it directly the first time radioSessionId shows up pointing at a
-  // discovery-engine Spotify session this component doesn't already have.
-  useEffect(() => {
-    if (!radioSessionId || radioDestinationType !== 'spotify') return;
-    if (playingPreview && playingPreview.id === radioSessionId) return;
-    let cancelled = false;
-    axios.get(`${apiBase}/radio/${radioSessionId}`).then((r) => {
-      if (cancelled) return;
-      if (r.data.engine === 'discovery' && r.data.status === 'active') setPlayingPreview(r.data);
     }).catch(() => {});
-    return () => { cancelled = true; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [radioSessionId, radioDestinationType, apiBase]);
+  }, []);
 
   const startGeneratedRadio = async (seed) => {
     onDismissRadioStatus();
@@ -6022,7 +5853,7 @@ function RadioTab({
       const response = await axios.post(`${apiBase}/radio/generate`, {
         seed_type: seed.type, seed_description: seed.description, seed_artists: seed.seedArtists,
         seed_track_name: seed.seedTrack?.track_name || null, seed_artist_name: seed.seedTrack?.artist_name || null,
-        target_length: targetLength,
+        target_length: targetLength, include_library_tracks: includeLibraryTracks,
       });
       setGeneratingSession({ ...response.data, seed });
     } catch (err) {
@@ -6044,17 +5875,6 @@ function RadioTab({
       axios.post(`${apiBase}/radio/${generatingSession.id}/stop`).catch(() => {});
     }
     setGeneratingSession(null);
-  };
-
-  const playGeneratedRadio = async () => {
-    if (!generatingSession?.id || startingPlay) return;
-    setStartingPlay(true);
-    const started = await onPlayGeneratedRadio(generatingSession.id, generatingSession.seed);
-    setStartingPlay(false);
-    if (started) {
-      setPlayingPreview(generatingSession);
-      setGeneratingSession(null);
-    }
   };
 
   useEffect(() => {
@@ -6135,17 +5955,22 @@ function RadioTab({
     return () => { cancelled = true; clearInterval(intervalId); };
   }, [apiBase]);
 
-  // spotify+discovery uses the new generate-then-preview flow exclusively
-  // (see startGeneratedRadio) - spotify_native and the browser/ytmusic
-  // destinations keep the old immediate-start behavior unchanged, since
-  // neither has a real device queue to pre-stage a reorderable/deletable
-  // playlist against.
-  const usesGeneratedFlow = outputDevice?.type === 'spotify' && radioEngine === 'discovery';
+  // Discover always uses the generate-then-preview flow for a Spotify
+  // destination (see startGeneratedRadio) - spotify_native moved out of this
+  // tab entirely (it's a one-shot action now, started from a track's own
+  // "📻" button in Library instead), so Discover itself is Last.fm-only.
+  // Browser/ytmusic destinations keep the old immediate-start behavior
+  // unchanged, since neither has a real device queue to pre-stage a
+  // reorderable/deletable playlist against.
+  const usesGeneratedFlow = outputDevice?.type === 'spotify';
 
   const startFromTrack = (track) => {
     // track already came from /tracks/known - the exact plain library-track
     // shape onStartRadio/resolveSeedTrackForPlayback expects to play first.
-    const seed = { type: 'track', description: `Radio from "${track.track_name}"`, seedArtists: [track.artist_name], seedTrack: track, engine: radioEngine };
+    // "Radio from" is wrong for usesGeneratedFlow - nothing starts playing,
+    // a reviewable playlist gets built instead (this description becomes
+    // its own title - see RadioPlaylistPreview).
+    const seed = { type: 'track', description: `${usesGeneratedFlow ? 'Discover from' : 'Radio from'} "${track.track_name}"`, seedArtists: [track.artist_name], seedTrack: track };
     if (usesGeneratedFlow) { startGeneratedRadio(seed); return; }
     onStartRadio(seed);
   };
@@ -6166,7 +5991,7 @@ function RadioTab({
     } catch (err) {
       console.error('Error finding a track for this artist:', err);
     }
-    const seed = { type: 'artist', description: `Radio from ${artistName}`, seedArtists: [artistName], seedTrack, engine: radioEngine };
+    const seed = { type: 'artist', description: `${usesGeneratedFlow ? 'Discover from' : 'Radio from'} ${artistName}`, seedArtists: [artistName], seedTrack };
     try {
       if (usesGeneratedFlow) { await startGeneratedRadio(seed); return; }
       await onStartRadio(seed);
@@ -6179,7 +6004,12 @@ function RadioTab({
     const key = `${playlist.platform}-${playlist.id}`;
     setStartingSeedKey(key);
     try {
-      await onStartRadioFromPlaylist(playlist.platform, playlist.id, playlist.name, radioEngine);
+      if (usesGeneratedFlow) {
+        const seed = await onResolveRadioSeedFromPlaylist(playlist.platform, playlist.id, playlist.name, undefined, true);
+        await startGeneratedRadio(seed);
+        return;
+      }
+      await onStartRadioFromPlaylist(playlist.platform, playlist.id, playlist.name);
     } finally {
       setStartingSeedKey(null);
     }
@@ -6251,9 +6081,144 @@ function RadioTab({
       <InfoPopup message={radioStatus} onClose={onDismissRadioStatus} />
 
       <div className="radio-header">
-        <h2>Radio</h2>
-        <p className="radio-subtitle">Pick a track, artist, or playlist below and Radio keeps playing similar music continuously.</p>
+        <h2>
+          Discover{' '}
+          <svg width="16" height="16" viewBox="0 0 24 24" className="lastfm-badge" aria-hidden="true">
+            <circle cx="12" cy="12" r="12" fill="#d51007" />
+            <text x="12" y="16" textAnchor="middle" fontSize="9" fontWeight="700" fill="#fff" fontFamily="Helvetica, Arial, sans-serif">fm</text>
+          </svg>
+        </h2>
+        <p className="radio-subtitle">Pick a track, artist, or playlist below to find similar music - Spotify builds a reviewable playlist, other destinations keep playing continuously.</p>
       </div>
+
+      {/* Step 1 of the discovery workflow (seed -> recommendations ->
+          review/edit -> generate + push): pick a seed. Deliberately first on
+          the page and asks nothing about destination - nothing about
+          picking a seed, or the Last.fm recommendation step that follows it,
+          needs to know where the result will eventually go. Destination
+          only becomes relevant at step 4 (push), not before. */}
+      {!generatingSession && (
+      <div className="radio-seed-picker">
+        <div className="radio-seed-tabs-row">
+          <div className="radio-seed-tabs">
+            <button className={seedMode === 'track' ? 'active' : ''} onClick={() => setSeedMode('track')}>🎵 Track</button>
+            <button className={seedMode === 'artist' ? 'active' : ''} onClick={() => setSeedMode('artist')}>🎤 Artist</button>
+            <button className={seedMode === 'playlist' ? 'active' : ''} onClick={() => setSeedMode('playlist')}>📃 Playlist</button>
+          </div>
+          {usesGeneratedFlow && (
+            <div className="radio-generate-options">
+              <label className="radio-include-library" title="When unchecked, the generated list excludes tracks already matched in your library.">
+                <input
+                  type="checkbox"
+                  checked={includeLibraryTracks}
+                  onChange={(e) => setIncludeLibraryTracks(e.target.checked)}
+                />
+                Include library tracks
+              </label>
+              <div className="radio-target-length">
+                <label htmlFor="radio-target-length-input">Playlist length</label>
+                <input
+                  id="radio-target-length-input"
+                  type="number"
+                  className="radio-target-length-input"
+                  min={1}
+                  max={1000}
+                  value={targetLength}
+                  onChange={(e) => setTargetLength(Math.max(1, Math.min(1000, Number(e.target.value) || 1)))}
+                  title="Builds the full playlist up front so you can review, reorder, or remove tracks before anything plays."
+                />
+              </div>
+            </div>
+          )}
+        </div>
+
+        {seedMode === 'track' && (
+          <div className="radio-seed-panel">
+            <input
+              type="text"
+              className="search-input"
+              placeholder="Search your library for a track…"
+              value={trackQuery}
+              onChange={(e) => setTrackQuery(e.target.value)}
+            />
+            <div className="radio-seed-results">
+              {trackResults.map((t) => (
+                <div className="radio-seed-row" key={t.id}>
+                  <div className="radio-seed-row-info">
+                    <span className="radio-seed-row-title">{t.track_name}</span>
+                    <span className="radio-seed-row-subtitle">{t.artist_name}</span>
+                  </div>
+                  <button className="scan-btn radio-seed-btn" onClick={() => startFromTrack(t)}>
+                    {usesGeneratedFlow ? '🧭 Discover' : '📻 Start Radio'}
+                  </button>
+                </div>
+              ))}
+              {trackQuery.trim().length >= 2 && trackResults.length === 0 && (
+                <p className="empty-state">No matching tracks.</p>
+              )}
+            </div>
+          </div>
+        )}
+
+        {seedMode === 'artist' && (
+          <div className="radio-seed-panel">
+            <input
+              type="text"
+              className="search-input"
+              placeholder="Search for an artist…"
+              value={artistQuery}
+              onChange={(e) => setArtistQuery(e.target.value)}
+            />
+            <div className="radio-seed-results">
+              {artistResults.map((a) => (
+                <div className="radio-seed-row" key={a.key}>
+                  <div className="radio-seed-row-info">
+                    <span className="radio-seed-row-title">{a.key}</span>
+                  </div>
+                  <button className="scan-btn radio-seed-btn" disabled={startingSeedKey === `artist-${a.key}`} onClick={() => startFromArtist(a.key)}>
+                    {startingSeedKey === `artist-${a.key}` ? (usesGeneratedFlow ? 'Building…' : 'Starting…') : (usesGeneratedFlow ? '🧭 Discover' : '📻 Start Radio')}
+                  </button>
+                </div>
+              ))}
+              {artistQuery.trim().length >= 2 && artistResults.length === 0 && (
+                <p className="empty-state">No matching artists.</p>
+              )}
+            </div>
+          </div>
+        )}
+
+        {seedMode === 'playlist' && (
+          <div className="radio-seed-panel">
+            {playlistsLoading ? (
+              <p className="empty-state">Loading playlists…</p>
+            ) : playlists.length === 0 ? (
+              <p className="empty-state">No Spotify or YouTube Music playlists found.</p>
+            ) : (
+              <div className="radio-seed-results">
+                {playlists.map((p) => {
+                  const key = `${p.platform}-${p.id}`;
+                  return (
+                    <div className="radio-seed-row" key={key}>
+                      <div className="radio-seed-row-info">
+                        <span className="radio-seed-row-title">{p.name}</span>
+                        <span className="radio-seed-row-subtitle">{p.platform === 'spotify' ? 'Spotify' : 'YouTube Music'}</span>
+                      </div>
+                      <button className="scan-btn radio-seed-btn" disabled={startingSeedKey === key} onClick={() => startFromPlaylist(p)}>
+                        {startingSeedKey === key ? (usesGeneratedFlow ? 'Building…' : 'Starting…') : (usesGeneratedFlow ? '🧭 Discover' : '📻 Start Radio')}
+                      </button>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+      )}
+
+      {/* Steps 2-4 (recommendations/generation, review+edit, destination+push)
+          below - not yet reordered/reworked to match the same step outline,
+          deliberately deferred. */}
 
       {/* Rendered inline further down, inside the always-on radio-now-playing
           panel, so the session status and the search budget read as one
@@ -6304,115 +6269,50 @@ function RadioTab({
             {outputDevice.name} can't play Radio directly - pick This Browser, a Spotify Connect device, or YouTube Music above.
           </span>
         )}
-        {outputDevice?.type === 'spotify' && (
-          <>
-            <span className="radio-destination-label radio-engine-label">Engine:</span>
-            <button className={radioEngine === 'discovery' ? 'active' : ''} onClick={() => setRadioEngine('discovery')}>
-              <svg width="14" height="14" viewBox="0 0 24 24" className="lastfm-badge" aria-hidden="true">
-                <circle cx="12" cy="12" r="12" fill="#d51007" />
-                <text x="12" y="16" textAnchor="middle" fontSize="9" fontWeight="700" fill="#fff" fontFamily="Helvetica, Arial, sans-serif">fm</text>
-              </svg>
-              {' '}Last.fm Discover
-            </button>
-            <button className={radioEngine === 'spotify_native' ? 'active' : ''} onClick={() => setRadioEngine('spotify_native')}>
-              🟢 Spotify Radio
-            </button>
-            {radioEngine === 'spotify_native' && (
-              <span className="radio-destination-hint">
-                Plays your pick, then leans on Spotify's own "Autoplay similar songs" (a setting in Spotify's own app) to keep going - uses almost no search budget, but needs that setting turned on.
-              </span>
-            )}
-          </>
-        )}
       </div>
 
-      {usesGeneratedFlow && (
-        <div className="radio-destination-row">
-          <span className="radio-destination-label">Playlist length:</span>
-          <input
-            type="number"
-            className="radio-target-length-input"
-            min={1}
-            max={1000}
-            value={targetLength}
-            onChange={(e) => setTargetLength(Math.max(1, Math.min(1000, Number(e.target.value) || 1)))}
-          />
-          <span className="radio-destination-hint">
-            Builds the full playlist up front so you can review, reorder, or remove tracks before anything plays.
-          </span>
-        </div>
-      )}
-
-      {radioDestinationType !== 'ytmusic' && (
-        // Always rendered, live or not - previously this only existed while
-        // radioSessionId was set, so it looked identical (just gone) whether
-        // radio was genuinely idle or had silently lost its session tag to a
-        // bug. An explicit idle state means "the visual disappeared" can only
-        // ever mean a real bug again, not the normal no-session case.
+      {radioDestinationType !== 'ytmusic' && !(radioSessionId ? (radioDestinationType === 'spotify' && radioActiveEngine === 'discovery') : usesGeneratedFlow) && (() => {
+        // This whole panel - live status AND its idle fallback - only ever
+        // applies to spotify_native/browser, which are the only remaining
+        // flows with genuine in-app live playback state to show. Discovery+
+        // spotify's own reviewable playlist grid (and the seed picker before
+        // that) already fully covers "nothing started yet, pick something" /
+        // "here's what's built" for that combination - this panel would just
+        // be redundant, or (for a session that was live-driving before this
+        // deploy and is now a stale leftover tag) actively misleading.
+        // usesGeneratedFlow reflects the picker's current choice when no
+        // session is active yet; radioActiveEngine reflects the already-
+        // committed session's actual engine once one exists - both need
+        // checking since a still-active leftover session's radioSessionId
+        // can outlive the picker having since been changed.
+        return (
         <div className={`radio-now-playing${radioSessionId ? '' : ' radio-now-playing-idle'}`}>
           <div className="radio-now-playing-main">
             {radioSessionId ? (() => {
-              // playingPreview.live_status is a direct, independent read of
-              // Spotify's real account-wide state (see main.py's
-              // RadioLiveStatus) - not derived from the generic outputDevice/
-              // destStatus/nowPlaying this component shares with every other
-              // playback mode. Preferred whenever available so this panel
-              // stays correct even if the app's generic destination gets
-              // switched to something else entirely (a Chromecast, WiiM) for
-              // an unrelated reason - confirmed live that was a real,
-              // recurring gap: the panel showed "paused, no device" while
-              // this exact radio session was still genuinely playing on
-              // Spotify. Falls back to the generic props for a session that
-              // hasn't reached playingPreview yet (spotify_native, browser,
-              // ytmusic - none of which have live_status at all).
-              const live = playingPreview?.live_status;
-              // reachable===false is a confirmed *failed* fetch attempt
-              // (main.py's RadioLiveStatus - a rate limit, a network blip),
-              // not "no live data yet" - falling through to the generic
-              // isPlaying/nowPlaying/destStatus props here the same way an
-              // absent live_status does would keep confidently showing
-              // whatever was last genuinely known, with nothing telling the
-              // user it might be stale. Confirmed live: an hour-plus Spotify
-              // rate limit displayed as a perfectly normal "On Air, Playing
-              // on Living Room" the entire time it was blind.
-              const liveUnreachable = live?.reachable === false;
-              const liveOk = live && !liveUnreachable;
-              const nowOnAir = liveOk ? live.is_playing : isPlaying;
+              // Generic outputDevice/destStatus/nowPlaying props, same as
+              // the app's other playback modes use.
+              const nowOnAir = isPlaying;
               return (
                 <>
                   <div className="radio-now-playing-art">
-                    {((liveOk && live.artwork_url) || nowPlaying?.artwork_url) ? (
-                      <img src={(liveOk && live.artwork_url) || nowPlaying.artwork_url} alt="" onError={(e) => { e.target.style.display = 'none'; }} />
+                    {nowPlaying?.artwork_url ? (
+                      <img src={nowPlaying.artwork_url} alt="" onError={(e) => { e.target.style.display = 'none'; }} />
                     ) : (
                       <span className="radio-now-playing-fallback">📻</span>
                     )}
                   </div>
                   <div className="radio-now-playing-info">
-                    <span className={`radio-live-badge${liveUnreachable ? ' radio-live-badge-unreachable' : ''}`}>
+                    <span className="radio-live-badge">
                       <span className="radio-live-dot" />
-                      {liveUnreachable ? 'Unverified' : (nowOnAir ? 'On Air' : 'Paused')}
+                      {nowOnAir ? 'On Air' : 'Paused'}
                     </span>
-                    <h3 className="radio-now-playing-title">{(liveOk && live.track_name) || nowPlaying?.track_name || 'Starting…'}</h3>
-                    <p className="radio-now-playing-artist">{(liveOk && live.artist_name) || nowPlaying?.artist_name}</p>
+                    <h3 className="radio-now-playing-title">{nowPlaying?.track_name || 'Starting…'}</h3>
+                    <p className="radio-now-playing-artist">{nowPlaying?.artist_name}</p>
                     <p className="radio-now-playing-seed">
                       {radioSeed?.description || 'Radio'}
                       <span className="radio-destination-tag"> → {destinationLabel}</span>
                     </p>
-                    {liveUnreachable && (
-                      <p className="radio-live-unreachable-note">Can't verify right now (Spotify unreachable) - info above may be stale</p>
-                    )}
-                    {liveOk && live.active_device_name ? (
-                      <p className="radio-active-device">
-                        Playing on: <span className="radio-active-device-name">{live.active_device_name}</span>
-                      </p>
-                    ) : !liveUnreachable && outputDevice?.type === 'spotify' && destStatus?.active_device_name && (
-                      // Fallback for a session with no live_status yet (still
-                      // starting) - same mismatch framing as before, since
-                      // without an independent read there's nothing better
-                      // to compare destStatus against than the generic pick.
-                      // Not shown at all when liveUnreachable - destStatus is
-                      // exactly as unverifiable as live_status right now, and
-                      // the note above already covers that.
+                    {outputDevice?.type === 'spotify' && destStatus?.active_device_name && (
                       <p className="radio-active-device">
                         Playing on:{' '}
                         <span className={destStatus.active_device_name !== outputDevice.name ? 'radio-active-device-mismatch' : 'radio-active-device-name'}>
@@ -6438,14 +6338,12 @@ function RadioTab({
               </div>
             )}
           </div>
-          {radioSessionId && queue.length > 0 && !playingPreview && (
+          {radioSessionId && queue.length > 0 && (
             // Nested in the same panel, directly under the On Air row and
             // above the search budget bar (per user request) - one unified
-            // visual instead of several separate blocks. Hidden once the
-            // new playlist preview grid (RadioPlaylistPreview) is showing
-            // the same up-next tracks itself, per user request - only
-            // still needed for spotify_native/browser radio, which have no
-            // pre-generated playlist of their own to show instead.
+            // visual instead of several separate blocks. Only ever populated
+            // for spotify_native/browser radio now - discovery+spotify has
+            // no live queue of its own to show here at all.
             <div className="radio-upnext">
               <h3>Up Next</h3>
               <div className="radio-upnext-list">
@@ -6487,7 +6385,8 @@ function RadioTab({
           )}
           {renderSearchBudget()}
         </div>
-      )}
+        );
+      })()}
 
       {radioDestinationType === 'ytmusic' && radioSessionId && (
         <div className="radio-ytmusic-status">
@@ -6525,11 +6424,9 @@ function RadioTab({
         </div>
       )}
 
-      {generatingSession && generatingSession.generation_status === 'generating' && (
+      {generatingSession && generatingSession.generation_status === 'generating' && generatingSession.playlist.length === 0 && (
         <div className="radio-playlist-preview radio-playlist-preview-generating">
-          <p className="empty-state">
-            Building your playlist… ({generatingSession.playlist.length}/{generatingSession.target_length || targetLength} so far)
-          </p>
+          <p className="empty-state">Building your discovery list…</p>
           <button className="scan-btn radio-stop-btn" onClick={cancelGeneratedRadio}>Cancel</button>
         </div>
       )}
@@ -6539,119 +6436,25 @@ function RadioTab({
           <button className="scan-btn radio-stop-btn" onClick={() => setGeneratingSession(null)}>Dismiss</button>
         </div>
       )}
-      {generatingSession && generatingSession.generation_status === 'ready' && (
+      {generatingSession && generatingSession.playlist.length > 0 && (
         <RadioPlaylistPreview
           session={generatingSession}
+          apiBase={apiBase}
           onPlaylistChange={updateGeneratingPlaylist}
           onReorder={(itemId) => axios.post(`${apiBase}/radio/${generatingSession.id}/reorder`, { item_id: itemId }).catch((err) => console.error('Error reordering radio playlist:', err))}
           onRemove={(itemId) => axios.post(`${apiBase}/radio/${generatingSession.id}/remove`, { item_id: itemId }).catch((err) => console.error('Error removing radio playlist item:', err))}
           headerAction={(
             <div className="radio-playlist-preview-actions">
-              <button className="scan-btn" disabled={startingPlay} onClick={playGeneratedRadio}>{startingPlay ? 'Starting…' : '▶ Play'}</button>
-              <button className="scan-btn radio-stop-btn" onClick={cancelGeneratedRadio}>Discard</button>
+              {/* Phase 2: replace with a "Push to Spotify" button calling the
+                  new spotify_push_job.py trigger. Until then, Generate
+                  produces a reviewable/reorderable playlist with no play
+                  action. */}
+              <button className="scan-btn radio-stop-btn" onClick={cancelGeneratedRadio}>
+                {generatingSession.generation_status === 'generating' ? 'Cancel' : 'Discard'}
+              </button>
             </div>
           )}
         />
-      )}
-      {playingPreview && (
-        <RadioPlaylistPreview
-          session={playingPreview}
-          onPlaylistChange={() => {}}
-          onReorder={(itemId) => axios.post(`${apiBase}/radio/${playingPreview.id}/reorder`, { item_id: itemId }).catch((err) => console.error('Error reordering radio playlist:', err))}
-          onRemove={(itemId) => axios.post(`${apiBase}/radio/${playingPreview.id}/remove`, { item_id: itemId }).catch((err) => console.error('Error removing radio playlist item:', err))}
-          nowPlaying={radioSessionId === playingPreview.id ? nowPlaying : null}
-          committedQueue={radioSessionId === playingPreview.id ? queue : []}
-        />
-      )}
-
-      {!generatingSession && !playingPreview && (
-      <div className="radio-seed-picker">
-        <div className="radio-seed-tabs">
-          <button className={seedMode === 'track' ? 'active' : ''} onClick={() => setSeedMode('track')}>🎵 Track</button>
-          <button className={seedMode === 'artist' ? 'active' : ''} onClick={() => setSeedMode('artist')}>🎤 Artist</button>
-          <button className={seedMode === 'playlist' ? 'active' : ''} onClick={() => setSeedMode('playlist')}>📃 Playlist</button>
-        </div>
-
-        {seedMode === 'track' && (
-          <div className="radio-seed-panel">
-            <input
-              type="text"
-              className="search-input"
-              placeholder="Search your library for a track…"
-              value={trackQuery}
-              onChange={(e) => setTrackQuery(e.target.value)}
-            />
-            <div className="radio-seed-results">
-              {trackResults.map((t) => (
-                <div className="radio-seed-row" key={t.id}>
-                  <div className="radio-seed-row-info">
-                    <span className="radio-seed-row-title">{t.track_name}</span>
-                    <span className="radio-seed-row-subtitle">{t.artist_name}</span>
-                  </div>
-                  <button className="scan-btn radio-seed-btn" onClick={() => startFromTrack(t)}>📻 Start Radio</button>
-                </div>
-              ))}
-              {trackQuery.trim().length >= 2 && trackResults.length === 0 && (
-                <p className="empty-state">No matching tracks.</p>
-              )}
-            </div>
-          </div>
-        )}
-
-        {seedMode === 'artist' && (
-          <div className="radio-seed-panel">
-            <input
-              type="text"
-              className="search-input"
-              placeholder="Search for an artist…"
-              value={artistQuery}
-              onChange={(e) => setArtistQuery(e.target.value)}
-            />
-            <div className="radio-seed-results">
-              {artistResults.map((a) => (
-                <div className="radio-seed-row" key={a.key}>
-                  <div className="radio-seed-row-info">
-                    <span className="radio-seed-row-title">{a.key}</span>
-                  </div>
-                  <button className="scan-btn radio-seed-btn" disabled={startingSeedKey === `artist-${a.key}`} onClick={() => startFromArtist(a.key)}>
-                    {startingSeedKey === `artist-${a.key}` ? 'Starting…' : '📻 Start Radio'}
-                  </button>
-                </div>
-              ))}
-              {artistQuery.trim().length >= 2 && artistResults.length === 0 && (
-                <p className="empty-state">No matching artists.</p>
-              )}
-            </div>
-          </div>
-        )}
-
-        {seedMode === 'playlist' && (
-          <div className="radio-seed-panel">
-            {playlistsLoading ? (
-              <p className="empty-state">Loading playlists…</p>
-            ) : playlists.length === 0 ? (
-              <p className="empty-state">No Spotify or YouTube Music playlists found.</p>
-            ) : (
-              <div className="radio-seed-results">
-                {playlists.map((p) => {
-                  const key = `${p.platform}-${p.id}`;
-                  return (
-                    <div className="radio-seed-row" key={key}>
-                      <div className="radio-seed-row-info">
-                        <span className="radio-seed-row-title">{p.name}</span>
-                        <span className="radio-seed-row-subtitle">{p.platform === 'spotify' ? 'Spotify' : 'YouTube Music'}</span>
-                      </div>
-                      <button className="scan-btn radio-seed-btn" disabled={startingSeedKey === key} onClick={() => startFromPlaylist(p)}>
-                        {startingSeedKey === key ? 'Starting…' : '📻 Start Radio'}
-                      </button>
-                    </div>
-                  );
-                })}
-              </div>
-            )}
-          </div>
-        )}
-      </div>
       )}
     </section>
   );
@@ -6667,15 +6470,41 @@ function RadioTab({
 const RADIO_PREVIEW_SOURCE_LABELS = { in_library: 'In library', unresolved: 'Not yet resolved' };
 
 // Renders a radio_session.playlist as a table matching PlayLogTab's own
-// column shape (artwork/artist/track/engine/source/reason) - reused for both
-// the pre-play preview (session.playlist is the whole generated list,
-// reorder/remove freely available) and the live "now playing" view once
-// started (nowPlaying pinned to the top, followed by the already-committed
-// lookahead tracks, then the remaining pending playlist - see RadioTab's own
-// playingPreview poll for how session.playlist stays in sync while playing).
-function RadioPlaylistPreview({ session, onPlaylistChange, onReorder, onRemove, headerAction, nowPlaying, committedQueue }) {
+// column shape (artwork/artist/track/engine/source/reason) - the reviewable,
+// reorderable/removable pre-generated playlist. (Previously also doubled as
+// a "live now playing" view once a session started playing - that mode is
+// gone along with discovery+spotify's own live playback drive.)
+function RadioPlaylistPreview({ session, onPlaylistChange, onReorder, onRemove, headerAction, apiBase }) {
   const [busyItemId, setBusyItemId] = useState(null);
-  const isLive = nowPlaying !== undefined;
+  // Lazy, on-demand 30s sample per row - fetched only when actually clicked
+  // (not upfront for the whole list, which could be hundreds of iTunes/
+  // Deezer lookups) via the same /discover/preview route the original
+  // Discover recommendation cards use - see main.py's
+  // get_discover_track_preview. url stays null both before the first click
+  // (loading true distinguishes that) and after a confirmed "no preview
+  // found" (loading false) - previewDisabled below tells those apart.
+  const [preview, setPreview] = useState({ itemId: null, url: null, loading: false });
+  const [previewPlaying, setPreviewPlaying] = useState(false);
+  const previewAudioRef = useRef(null);
+
+  const handlePreviewClick = async (item) => {
+    if (preview.itemId === item.item_id) {
+      if (preview.url && previewAudioRef.current) {
+        previewAudioRef.current.paused ? previewAudioRef.current.play() : previewAudioRef.current.pause();
+      }
+      return;
+    }
+    setPreview({ itemId: item.item_id, url: null, loading: true });
+    try {
+      const response = await axios.post(`${apiBase}/discover/preview`, {
+        track_name: item.track_name, artist_name: item.artist_name,
+      });
+      setPreview({ itemId: item.item_id, url: response.data.preview_url || null, loading: false });
+    } catch (err) {
+      console.error('Error fetching track preview:', err);
+      setPreview({ itemId: item.item_id, url: null, loading: false });
+    }
+  };
 
   const handlePromoteClick = async (itemId) => {
     if (busyItemId != null) return;
@@ -6698,112 +6527,105 @@ function RadioPlaylistPreview({ session, onPlaylistChange, onReorder, onRemove, 
   const handleRemoveClick = (itemId) => {
     onPlaylistChange((prev) => prev.filter((p) => p.item_id !== itemId));
     onRemove(itemId);
+    if (preview.itemId === itemId) setPreview({ itemId: null, url: null, loading: false });
   };
 
-  // A pending playlist item and an already-committed one (queued or now
-  // playing) are two different shapes. Pending items carry the backend's
-  // own 'in_library'/'unresolved' (see main.py's generate_radio_playlist -
-  // 'unresolved' means no Spotify search attempted yet, deliberately not a
-  // claim of "not in library"). A committed item has already been resolved
-  // (playback_advancer's `found` dict) and carries a *different*, generic
-  // 'source' field ('spotify' - "this plays via Spotify," unrelated to
-  // library membership) plus local_id when it's a genuine library match -
-  // falling back to RADIO_PREVIEW_SOURCE_LABELS[item.source] for a
-  // committed item showed that generic 'spotify' value as literal text.
-  const sourceInfo = (item) => {
-    if (item.source === 'in_library' || item.source === 'unresolved') {
-      return { key: item.source, label: RADIO_PREVIEW_SOURCE_LABELS[item.source] };
-    }
-    return item.local_id != null
-      ? { key: 'library', label: 'In library' }
-      : { key: 'radio_discovered', label: 'Not in library' };
+  // Only ever fed the pending playlist now (session.playlist, from
+  // GET /api/radio/{id} - see main.py's generate_radio_playlist) - the
+  // "already-committed, different shape" case this used to also handle
+  // went away with the live-drive panel it was rendered from.
+  const sourceInfo = (item) => ({ key: item.source, label: RADIO_PREVIEW_SOURCE_LABELS[item.source] || item.source });
+
+  // Last.fm's similarity scores cluster low in practice on real seeds
+  // (roughly 0.1-0.6 observed live) but the meter scales against the full
+  // honest 0-1 range rather than being fit to that observed cluster - a
+  // different seed or a future scoring change shouldn't silently throw the
+  // calibration off.
+  const matchMeter = (match) => {
+    if (match == null) return null;
+    const fill = Math.max(0, Math.min(1, match));
+    return (
+      <div className="track-match" title="Last.fm's own similarity score, relative to the track it was found from - not comparable across different seeds">
+        <span className="match-meter">
+          {[0.2, 0.45, 0.7, 0.9].map((threshold) => (
+            <i key={threshold} style={{ opacity: fill >= threshold ? 1 : fill >= threshold - 0.2 ? 0.4 : 0.15 }} />
+          ))}
+        </span>
+        <span className="match-pct">{Math.round(fill * 100)}%</span>
+      </div>
+    );
   };
 
-  const renderRow = (item, { clickable, playingNow } = {}) => (
-    <tr
-      key={item.item_id ?? item.id}
-      className={`radio-playlist-preview-row${playingNow ? ' radio-playlist-preview-nowplaying' : ''}${clickable ? '' : ' radio-playlist-preview-row-static'}`}
-    >
-      <td className="radio-playlist-preview-actions-col">
-        {clickable && item.item_id != null && (
-          <>
-            <button
-              type="button"
-              className="radio-playlist-action-btn"
-              title="Play next"
-              disabled={busyItemId === item.item_id}
-              onClick={() => handlePromoteClick(item.item_id)}
-            >
-              ⬆
-            </button>
-            <button
-              type="button"
-              className="radio-playlist-action-btn radio-playlist-remove-btn"
-              title="Remove"
-              onClick={() => handleRemoveClick(item.item_id)}
-            >
-              ✕
-            </button>
-          </>
-        )}
-      </td>
-      <td className="play-log-artwork-col">
-        {item.artwork_url ? (
-          <img className="play-log-artwork" src={item.artwork_url} alt="" onError={(e) => { e.target.style.visibility = 'hidden'; }} />
-        ) : (
-          <div className="play-log-artwork play-log-artwork-fallback" aria-hidden="true">♪</div>
-        )}
-      </td>
-      <td>{item.artist_name}</td>
-      <td>{item.track_name}</td>
-      <td className="play-log-engine">{item.selection_engine || PLAY_LOG_NO_ENGINE_LABEL}</td>
-      <td>
-        {playingNow ? (
-          <span className="play-log-source play-log-source-library">Now Playing</span>
-        ) : (() => {
-          const { key, label } = sourceInfo(item);
-          return <span className={`play-log-source play-log-source-${key}`}>{label}</span>;
+  const renderRow = (item, index) => {
+    const { key: sourceKey, label: sourceLabel } = sourceInfo(item);
+    return (
+      <div key={item.item_id ?? item.id} className="track-row">
+        <span className="track-num">{index + 1}</span>
+        <div className="track-art">
+          {item.artwork_url ? (
+            <img src={item.artwork_url} alt="" onError={(e) => { e.target.style.display = 'none'; }} />
+          ) : '♪'}
+        </div>
+        <div className="track-main">
+          <div className="track-title">{item.track_name}</div>
+          <div className="track-sub">
+            <span className="artist">{item.artist_name}</span>
+            <span className={`pill pill-${sourceKey === 'in_library' ? 'library' : 'unresolved'}`}>{sourceLabel}</span>
+          </div>
+          {item.selection_reason && <div className="track-why">{item.selection_reason}</div>}
+        </div>
+        {matchMeter(item.match)}
+        {item.item_id != null && (() => {
+          const isPreviewing = preview.itemId === item.item_id;
+          const previewDisabled = isPreviewing && !preview.loading && preview.url === null;
+          const previewIcon = isPreviewing && preview.loading ? '…' : previewDisabled ? '–' : isPreviewing && previewPlaying ? '⏸' : '▶';
+          return (
+            <div className={`track-actions${isPreviewing ? ' previewing' : ''}`}>
+              <button
+                type="button"
+                className={isPreviewing && previewPlaying ? 'is-playing' : ''}
+                title={previewDisabled ? 'No preview available' : 'Play a short sample'}
+                disabled={(isPreviewing && preview.loading) || previewDisabled}
+                onClick={() => handlePreviewClick(item)}
+              >
+                {previewIcon}
+              </button>
+              <button type="button" title="Play next" disabled={busyItemId === item.item_id} onClick={() => handlePromoteClick(item.item_id)}>⬆</button>
+              <button type="button" className="danger" title="Remove" onClick={() => handleRemoveClick(item.item_id)}>✕</button>
+              {isPreviewing && preview.url && (
+                <audio
+                  key={item.item_id}
+                  ref={previewAudioRef}
+                  src={preview.url}
+                  autoPlay
+                  onPlay={() => setPreviewPlaying(true)}
+                  onPause={() => setPreviewPlaying(false)}
+                  onEnded={() => setPreviewPlaying(false)}
+                  style={{ display: 'none' }}
+                />
+              )}
+            </div>
+          );
         })()}
-      </td>
-      <td className="play-log-reason" title={item.selection_reason || ''}>{item.selection_reason || '—'}</td>
-      <td className="radio-playlist-match-col" title={item.match != null ? "Last.fm's own similarity score, relative to the track it was found from - not comparable across different seeds" : ''}>
-        {item.match != null ? `${Math.round(item.match * 100)}%` : '—'}
-      </td>
-    </tr>
-  );
+      </div>
+    );
+  };
 
   return (
     <div className="radio-playlist-preview">
       <div className="radio-playlist-preview-header">
         <h3>
-          {isLive ? 'Radio playlist' : 'Generated playlist'}
-          {' '}({session.playlist.length}{!isLive && session.target_length ? `/${session.target_length}` : ''} tracks)
+          {session.seed_description || 'Generated playlist'}
+          <span className="count"> · {session.playlist.length}{session.target_length ? `/${session.target_length}` : ''} tracks</span>
+          {session.generation_status === 'generating' && <span className="count building"> · building…</span>}
         </h3>
         {headerAction}
       </div>
-      <p className="hint">⬆ moves a track to play next, ✕ removes it. {isLive ? 'Already-queued tracks may briefly skip when reordered or removed.' : ''}</p>
-      <div className="play-log-table-wrap radio-playlist-preview-table-wrap">
-        <table className="play-log-table">
-          <thead>
-            <tr>
-              <th className="radio-playlist-preview-actions-col" />
-              <th className="play-log-artwork-col" />
-              <th>Artist</th>
-              <th>Track</th>
-              <th>Engine</th>
-              <th>Source</th>
-              <th>Reason</th>
-              <th title="Last.fm's own similarity score, relative to the track it was found from">Match</th>
-            </tr>
-          </thead>
-          <tbody>
-            {isLive && nowPlaying && renderRow(nowPlaying, { clickable: false, playingNow: true })}
-            {isLive && (committedQueue || []).map((item) => renderRow(item, { clickable: item.item_id != null }))}
-            {session.playlist.map((item) => renderRow(item, { clickable: true }))}
-          </tbody>
-        </table>
+      <p className="hint">⬆ moves a track to play next, ✕ removes it.</p>
+      <div className="track-list">
+        {session.playlist.map((item, index) => renderRow(item, index))}
       </div>
-      {session.playlist.length === 0 && !(isLive && ((committedQueue || []).length > 0 || nowPlaying)) && (
+      {session.playlist.length === 0 && (
         <p className="empty-state">Nothing generated yet.</p>
       )}
     </div>

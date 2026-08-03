@@ -302,15 +302,28 @@ def create_tables():
             # across /more calls and playback_advancer refill ticks the same
             # way seen_track_keys already does, or every call would restart
             # the walk from the seed instead of continuing it.
-            # fallback_expanded_artists tracks which artists the artist-level
-            # reserve tier (points 1+2+3 - wider similar-artists, deeper
-            # top-tracks, neighborhood expansion) has already pulled from, so
-            # a later fallback trigger doesn't redundantly re-expand the same
-            # artist.
+            # discovery_state is the drift-BFS's own reserve state -
+            # {'deferred': [...], 'max_drift': float} (see
+            # radio_engine.generate_radio_batch_track_first) - candidates
+            # found but not yet admitted because they drifted further from
+            # the seed than the search radius has grown to need yet. Column
+            # predates the drift-BFS rewrite (used to hold a tiered
+            # artist-fallback generator's fallback_expanded_artists list) -
+            # dropped and re-added rather than migrated in place, since that
+            # generator's own state had no meaningful mapping to this one.
+            # include_library_tracks - when False, generate_radio_batch_track_first
+            # drops any candidate that matches a known_tracks row (a genuine
+            # local-library match, not a radio_discovered_tracks cache hit)
+            # from what it returns - lets Discover be pointed at "only stuff
+            # I don't already have" without touching how the walk itself
+            # explores (a library track's own neighbors are still explored
+            # exactly as before, it just isn't surfaced as a result itself).
+            cur.execute("ALTER TABLE radio_session ADD COLUMN IF NOT EXISTS include_library_tracks BOOLEAN NOT NULL DEFAULT TRUE;")
             cur.execute("ALTER TABLE radio_session ADD COLUMN IF NOT EXISTS seed_track_name TEXT;")
             cur.execute("ALTER TABLE radio_session ADD COLUMN IF NOT EXISTS seed_artist_name TEXT;")
             cur.execute("ALTER TABLE radio_session ADD COLUMN IF NOT EXISTS track_frontier JSONB DEFAULT '[]'::jsonb;")
-            cur.execute("ALTER TABLE radio_session ADD COLUMN IF NOT EXISTS fallback_expanded_artists JSONB DEFAULT '[]'::jsonb;")
+            cur.execute("ALTER TABLE radio_session DROP COLUMN IF EXISTS fallback_expanded_artists;")
+            cur.execute("ALTER TABLE radio_session ADD COLUMN IF NOT EXISTS discovery_state JSONB DEFAULT '{}'::jsonb;")
             # Pre-generated, editable playlist support (the whole point being
             # to generate a full ordered list *before* anything plays, so it
             # can be reviewed/reordered/deleted, rather than discovering it a
@@ -1525,7 +1538,7 @@ RADIO_SEEN_TRACK_KEYS_CAP = 500
 
 def create_radio_session(seed_type, seed_description, seed_artists, destination_type, seen_track_keys, engine='discovery',
                           seed_track_name=None, seed_artist_name=None, track_frontier=None,
-                          target_length=None, generation_status='ready'):
+                          target_length=None, generation_status='ready', include_library_tracks=True):
     """Starts a new radio_session row. seen_track_keys is the caller's
     already-lowercased list of "track|||artist" keys for the first batch of
     tracks it just generated, so a subsequent /more call's dedup starts from
@@ -1554,12 +1567,12 @@ def create_radio_session(seed_type, seed_description, seed_artists, destination_
         cur.execute("UPDATE radio_session SET status = 'stopped', updated_at = NOW() WHERE status = 'active'")
         cur.execute("""
             INSERT INTO radio_session (seed_type, seed_description, seed_artists, seen_track_keys, destination_type, engine, status,
-                                        seed_track_name, seed_artist_name, track_frontier, target_length, generation_status)
-            VALUES (%s, %s, %s, %s, %s, %s, 'active', %s, %s, %s, %s, %s)
+                                        seed_track_name, seed_artist_name, track_frontier, target_length, generation_status, include_library_tracks)
+            VALUES (%s, %s, %s, %s, %s, %s, 'active', %s, %s, %s, %s, %s, %s)
             RETURNING id
         """, (
             seed_type, seed_description, Json(seed_artists), Json(seen_track_keys[-RADIO_SEEN_TRACK_KEYS_CAP:]), destination_type, engine,
-            seed_track_name, seed_artist_name, Json(track_frontier or []), target_length, generation_status,
+            seed_track_name, seed_artist_name, Json(track_frontier or []), target_length, generation_status, include_library_tracks,
         ))
         session_id = cur.fetchone()[0]
         conn.commit()
@@ -1581,8 +1594,8 @@ def get_radio_session(session_id):
         cur.execute("""
             SELECT id, seed_type, seed_description, seed_artists, seen_track_keys, destination_type,
                    ytmusic_playlist_id, ytmusic_push_job_id, status, engine,
-                   seed_track_name, seed_artist_name, track_frontier, fallback_expanded_artists,
-                   target_length, playlist, generation_status, next_item_id
+                   seed_track_name, seed_artist_name, track_frontier, discovery_state,
+                   target_length, playlist, generation_status, next_item_id, include_library_tracks
             FROM radio_session WHERE id = %s
         """, (session_id,))
         row = cur.fetchone()
@@ -1594,12 +1607,44 @@ def get_radio_session(session_id):
             'seen_track_keys': row[4], 'destination_type': row[5], 'ytmusic_playlist_id': row[6],
             'ytmusic_push_job_id': row[7], 'status': row[8], 'engine': row[9],
             'seed_track_name': row[10], 'seed_artist_name': row[11],
-            'track_frontier': row[12] or [], 'fallback_expanded_artists': row[13] or [],
+            'track_frontier': row[12] or [], 'discovery_state': row[13] or {},
             'target_length': row[14], 'playlist': row[15] or [], 'generation_status': row[16],
-            'next_item_id': row[17] or 0,
+            'next_item_id': row[17] or 0, 'include_library_tracks': row[18],
         }
     except Error as e:
         print(f"Error reading radio session {session_id}: {e}")
+        return None
+    finally:
+        if conn:
+            conn.close()
+
+
+def get_active_generated_radio_session_id():
+    """The one radio_session (if any) a page refresh should restore into
+    Discover's own generatingSession state - a spotify+discovery session
+    still 'active' (create_radio_session retires every other session the
+    instant a new one starts, so at most one row ever qualifies) whose
+    generation is underway or already finished, waiting to be reviewed.
+    Unlike a *live* session (spotify_native/browser/ytmusic), a generated
+    one is never tagged onto playback_session.now_playing at all - nothing
+    plays until a future push step - so it has no other restore path.
+    Confirmed live this mattered: a completed generation looked identical
+    to "lost forever" after a refresh with nothing pointing back to it."""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT id FROM radio_session
+            WHERE status = 'active' AND destination_type = 'spotify' AND engine = 'discovery'
+                AND generation_status IN ('generating', 'ready')
+            LIMIT 1
+        """)
+        row = cur.fetchone()
+        cur.close()
+        return row[0] if row else None
+    except Error as e:
+        print(f"Error finding the active generated radio session: {e}")
         return None
     finally:
         if conn:
@@ -1636,19 +1681,21 @@ def append_seen_track_keys(session_id, new_keys):
             conn.close()
 
 
-def set_radio_session_track_state(session_id, track_frontier, fallback_expanded_artists):
+def set_radio_session_track_state(session_id, track_frontier, discovery_state):
     """Overwrite (not merge) - unlike seen_track_keys, both of these are
     whole-state snapshots the generator recomputes in full on every call
     (radio_engine.generate_radio_batch_track_first pops from/pushes onto its
     own in-memory copy of track_frontier during a single call, and this just
-    persists wherever it ended up), not accumulating sets."""
+    persists wherever it ended up), not accumulating sets. discovery_state
+    is {'deferred': [...], 'max_drift': float} - see
+    generate_radio_batch_track_first's own docstring."""
     conn = None
     try:
         conn = get_db_connection()
         cur = conn.cursor()
         cur.execute(
-            "UPDATE radio_session SET track_frontier = %s, fallback_expanded_artists = %s, updated_at = NOW() WHERE id = %s",
-            (Json(track_frontier), Json(fallback_expanded_artists), session_id),
+            "UPDATE radio_session SET track_frontier = %s, discovery_state = %s, updated_at = NOW() WHERE id = %s",
+            (Json(track_frontier), Json(discovery_state), session_id),
         )
         conn.commit()
         cur.close()

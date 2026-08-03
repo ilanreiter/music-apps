@@ -17,28 +17,24 @@ from . import lastfm
 # especially once a seed's real pool of strong matches starts thinning out.
 RADIO_MORE_MAX_ROUNDS = 3
 
-# How many hops out from wherever a track was discovered
-# generate_radio_batch_track_first keeps following track.getSimilar before
-# treating a result as a dead end (still returned as a candidate, just not
-# pushed back onto track_frontier for further exploration) - bounds how far
-# a long session can wander from its own recent picks. Confirmed via live
-# simulation this is not just a safety net: even at depth 1, a single seed
-# track supplied 120+ genuinely varied, on-theme candidates before the
-# track-level frontier ever ran dry, and it kept the walk closer to a
-# hub-and-spoke pattern (many short hops off whatever's currently playing)
-# rather than one long chain that can drift a long way from the original
-# seed over enough hops (also confirmed live: 2 hops from ABBA's "Dancing
-# Queen" reached Bruno Mars).
-TRACK_HOP_MAX_DEPTH = 1
-
-# The artist-level reserve tier's own tuning (see
-# generate_radio_batch_track_first's docstring, tier 2) - deliberately wider
-# than the artist-similarity module's own SIMILAR_ARTISTS_PER_SEED/
-# TOP_TRACKS_PER_ARTIST defaults, since this only ever runs once track-level
-# has genuinely gone dry and needs to inject a real amount of fresh material
-# at once, not trickle-feed it the way a per-seed Discover pull does.
-ARTIST_FALLBACK_SIMILAR_LIMIT = 20
-ARTIST_FALLBACK_TOP_TRACKS_LIMIT = 20
+# Drift-aware discovery tuning - see generate_radio_batch_track_first's own
+# docstring for the full model. "drift" for a candidate is 1 minus the
+# compounded product of every hop's own Last.fm track.getSimilar match score
+# along the BFS path back to the seed - 0 at the seed itself, approaching 1
+# the longer/weaker the chain of hops that reached it has been. There's no
+# hop-depth cap and no artist-level tier at all anymore: every candidate is
+# reached purely by track-to-track similarity, which Last.fm computes from
+# listening/tag co-occurrence, not genre or artist metadata - a single hop
+# can and does land on a completely different artist (see
+# lastfm.track_similar_tracks' own docstring: ABBA's "Dancing Queen" ->
+# Michael Jackson, Earth Wind & Fire, in one hop). INITIAL_MAX_DRIFT is the
+# starting radius candidates must clear to be accepted immediately; anything
+# weaker isn't discarded, just deferred until the search genuinely runs out
+# of anything closer (see the deferred-pool promotion in the main loop) -
+# this is what keeps the walk starting tight around the seed and only
+# drifting into adjacent styles once it actually needs to, without ever
+# hard-capping how far a long session can eventually wander.
+INITIAL_MAX_DRIFT = 0.6
 
 
 def radio_track_key(track_name, artist_name):
@@ -112,67 +108,6 @@ def _discovered_track_row(track_id, track_name, artist_name, album_name, spotify
         'album_name': album_name, 'spotify_uri': f'spotify:track:{spotify_track_id}', 'artwork_url': artwork_url,
     }
 
-def find_any_cached_tracks(seen_keys, limit, db):
-    """Absolute last resort: any already-Spotify-confirmed track at all
-    (library or previously-discovered, no artist filter) - confirmed live
-    this tier was actually needed: a seed with a small library/genre
-    footprint (an obscure artist plus a handful of Last.fm-similar ones)
-    can genuinely exhaust every cached track by all of them after just a
-    few played tracks, especially while rate-limited (no live search to
-    discover anything beyond that fixed set). generate_radio_batch_track_first
-    only reaches for this as its absolute last resort (tier 3), once both
-    Last.fm-driven tiers ahead of it come up short - keeping *something*
-    playing wins over staying on-theme, per the same "Radio must never just
-    stop" requirement the rest of this tiering already follows."""
-    seen = set(seen_keys)
-    cooldown_cutoff = database.now_ny_naive() - timedelta(days=database.get_radio_cooldown_days())
-    try:
-        cur = db.cursor()
-        cur.execute("""
-            SELECT id, track_name, artist_name, album_name, spotify_album_art_url
-            FROM known_tracks
-            WHERE spotify_checked IS TRUE AND spotify_track_id IS NOT NULL
-                AND (last_played_at IS NULL OR last_played_at < %s)
-            ORDER BY random()
-            LIMIT %s
-        """, (cooldown_cutoff, max(limit * 3, limit)))  # over-fetch - seen_keys will drop some
-        known_rows = cur.fetchall()
-        cur.execute("""
-            SELECT id, track_name, artist_name, album_name, spotify_track_id, spotify_album_art_url
-            FROM radio_discovered_tracks
-            WHERE (last_played_at IS NULL OR last_played_at < %s)
-            ORDER BY random()
-            LIMIT %s
-        """, (cooldown_cutoff, max(limit * 3, limit)))
-        discovered_rows = cur.fetchall()
-        cur.close()
-    except Exception as e:
-        print(f"Error finding any cached track for radio: {e}")
-        return []
-    results = []
-    for track_id, track_name, artist_name, album_name, artwork_url in known_rows:
-        key = radio_track_key(track_name, artist_name)
-        if key in seen:
-            continue
-        seen.add(key)
-        results.append({
-            'id': track_id, 'track_name': track_name, 'artist_name': artist_name,
-            'album_name': album_name, 'artwork_url': artwork_url,
-        })
-        if len(results) >= limit:
-            break
-    for row in discovered_rows:
-        if len(results) >= limit:
-            break
-        track_id, track_name, artist_name, album_name, spotify_track_id, artwork_url = row
-        key = radio_track_key(track_name, artist_name)
-        if key in seen:
-            continue
-        seen.add(key)
-        results.append(_discovered_track_row(track_id, track_name, artist_name, album_name, spotify_track_id, artwork_url))
-    return results
-
-
 def _index_cached_tracks_by_key(artist_names, db):
     """{(track_name.lower(), artist_name.lower()): {...}} for every
     already-Spotify-confirmed track (library or previously-discovered) by
@@ -219,13 +154,43 @@ def _index_cached_tracks_by_key(artist_names, db):
     return index
 
 
+def _interleave_by_artist(tracks):
+    """Round-robin regroup by artist so a same-artist run doesn't surface as
+    several plays in a row. Real Last.fm data makes this common: an
+    artist's own other songs are frequently its single strongest
+    track-level match (self-compression - see MIN_TRACK_MATCH_SCORE's own
+    comment in lastfm.py), so a BFS pass often clears out most of one
+    artist's catalog - each of their songs, in turn, pointing right back at
+    their other songs - before ever branching to a different artist.
+    Confirmed live: an ABBA-seeded batch surfaced 4 straight Earth, Wind &
+    Fire tracks, then 3 straight Donna Summer tracks. Preserves each
+    artist's own internal discovery order (closest match first) and which
+    artist was discovered first - only interleaves *between* artists, never
+    reorders a single artist's own tracks relative to each other."""
+    groups = {}
+    for t in tracks:
+        groups.setdefault(t['artist_name'].lower(), []).append(t)
+    queues = list(groups.values())
+    result = []
+    while queues:
+        next_round = []
+        for q in queues:
+            result.append(q.pop(0))
+            if q:
+                next_round.append(q)
+        queues = next_round
+    return result
+
+
 def _bootstrap_track_frontier(session):
     """Builds a fresh one-item track_frontier when none is persisted yet (a
-    brand new session, or the rare case where even the artist-fallback
-    hasn't produced anything) - from the session's literal seed track when
-    it has one, otherwise a single representative top-track for the seed
-    artist, so track-level discovery has somewhere to start even for an
-    artist-seeded (no specific track picked) session."""
+    brand new session, or the rare case where even the deferred pool comes
+    up empty) - from the session's literal seed track when it has one,
+    otherwise a single representative top-track for the seed artist, so
+    track-level discovery has somewhere to start even for an artist-seeded
+    (no specific track picked) session. path_similarity starts at 1.0 (zero
+    drift) - the seed itself is the origin every other track's drift is
+    measured against."""
     seed_artist = session.get('seed_artist_name')
     seed_track = session.get('seed_track_name')
     if not seed_artist:
@@ -238,198 +203,163 @@ def _bootstrap_track_frontier(session):
         seed_track = top[0] if top else None
     if not seed_track:
         return []
-    return [{'artist_name': seed_artist, 'track_name': seed_track, 'depth': 0}]
+    return [{'artist_name': seed_artist, 'track_name': seed_track, 'path_similarity': 1.0, 'depth': 0}]
 
 
-def _artist_fallback_candidates(session, artists_encountered, fallback_expanded):
-    """The reserve tier - see generate_radio_batch_track_first's own
-    docstring (tier 2). Tries the original seed artist first (if not
-    already expanded this session), then whichever artist has actually
-    turned up among genuinely-added candidates so far but hasn't been
-    expanded yet - pulling ARTIST_FALLBACK_TOP_TRACKS_LIMIT top tracks for
-    it plus one bootstrap track per newly-surfaced similar artist (up to
-    ARTIST_FALLBACK_SIMILAR_LIMIT of them). Stops at the first artist that
-    yields anything rather than draining the whole candidate list in one
-    call - deliberately mirrors the tiny footprint the live simulation
-    validated (one artist's worth of expansion was enough to fuel another
-    140+ tracks of pure track-level discovery afterward).
-
-    Returns (candidates, updated fallback_expanded list) - candidates are
-    plain {'artist_name', 'track_name', 'selection_reason', 'selection_engine'}
-    dicts, not yet checked against seen/cooldown (the caller's try_add does
-    that, same as every other tier funnels through one single check)."""
-    seed_artists = session.get('seed_artists') or []
-    seed_artist = session.get('seed_artist_name') or (seed_artists[0] if seed_artists else None)
-    ordered_candidates = []
-    for a in ([seed_artist] if seed_artist else []) + list(seed_artists) + artists_encountered:
-        if a and a not in ordered_candidates:
-            ordered_candidates.append(a)
-
-    expanded_lower = set(fallback_expanded)
-    for artist in ordered_candidates:
-        key_a = artist.strip().lower()
-        if key_a in expanded_lower:
-            continue
-        expanded_lower.add(key_a)
-
-        candidates = []
-        for track_name in lastfm._get_top_tracks(artist, limit=ARTIST_FALLBACK_TOP_TRACKS_LIMIT):
-            # Both sub-cases below come from this same reserve tier (an
-            # already-established artist's own catalog, or a brand new
-            # similar artist bootstrapped off it) - kept under one shared
-            # "Discovered - similar artist" label (matching "Discovered -
-            # similar track" for tier 1) rather than each carrying its own
-            # one-off detail string, so the Play Log's reason column stays a
-            # small, genuinely filterable set of categories instead of a
-            # different value practically every row. Still Last.fm-driven
-            # (getTopTracks/getSimilar), same engine as tier 1.
-            candidates.append({
-                'artist_name': artist, 'track_name': track_name,
-                'selection_reason': 'Discovered - similar artist', 'selection_engine': 'Last.fm',
-            })
-        for name, match in lastfm._get_similar_artists(artist, limit=ARTIST_FALLBACK_SIMILAR_LIMIT):
-            if match < lastfm.min_artist_match_score() or name.strip().lower() in expanded_lower:
-                continue
-            bootstrap = lastfm._get_top_tracks(name, limit=1)
-            if not bootstrap:
-                continue
-            candidates.append({
-                'artist_name': name, 'track_name': bootstrap[0],
-                'selection_reason': 'Discovered - similar artist', 'selection_engine': 'Last.fm',
-            })
-
-        if candidates:
-            return candidates, sorted(expanded_lower)
-    return [], sorted(expanded_lower)
+def _normalize_discovery_state(raw):
+    """The persisted discovery_state column is a plain {'deferred': [...],
+    'max_drift': float} dict - defensively normalized here since a session
+    created before this drift-BFS rewrite (or one with no state yet) may
+    hand back {}, [], or None instead."""
+    if not isinstance(raw, dict):
+        return {'deferred': [], 'max_drift': INITIAL_MAX_DRIFT}
+    return {
+        'deferred': raw.get('deferred') or [],
+        'max_drift': raw.get('max_drift') or INITIAL_MAX_DRIFT,
+    }
 
 
 def generate_radio_batch_track_first(session, seen_keys, count, db):
-    """Track-first Radio candidate generation for a Spotify-destination
-    session - replaces the old artist-only generate_radio_batch_for_spotify.
-    Validated via live simulation (not just design) before being built:
-    track-level recursion alone reached 100+ genuinely varied, on-theme
-    tracks from a single seed using a dozen-odd Last.fm calls, without the
-    old approach's failure mode - a narrow seed's similar-artist
-    neighborhood exhausting within an hour of a long unattended session,
-    then falling back to whichever library artist happened to have the
-    deepest cached catalog (confirmed live: a 9-hour ABBA session spent most
-    of its second half replaying Bee Gees, purely because Bee Gees had 67
-    cached tracks against 0-3 for most of ABBA's other genuine similar
-    artists).
+    """Drift-aware Graph-BFS Radio candidate generation for a Spotify-
+    destination session - replaced the old track/artist tiered generator
+    entirely per explicit user request: that version could only keep
+    discovering past a track-level dead end by pivoting through
+    artist-level similarity (a coarser, genre/scene-level signal), which
+    both under-served genuine "hidden jewel" discovery (an unrelated
+    artist's one great matching song never got a look-in - only a similar
+    artist's own generic top tracks did) and could still genuinely run dry
+    for a narrow seed. This version has no artist-level concept at all -
+    every candidate is reached purely by lastfm.track_similar_tracks
+    (track-to-track, listening/tag-co-occurrence based - a hop can and
+    does land on a completely different artist), and "how far it's allowed
+    to wander" is governed by a measured drift budget rather than a hop
+    count, so it keeps expanding as long as *some* real Last.fm connection
+    still exists, at any strength.
 
-    Tier 1 (primary): lastfm.track_similar_tracks, called recursively -
-    every genuinely new track this finds becomes a fresh seed for its own
-    track.getSimilar call, up to TRACK_HOP_MAX_DEPTH hops from wherever it
-    was discovered, via track_frontier - a BFS queue persisted on the
-    radio_session row (database.set_radio_session_track_state) so it
-    survives across /more calls and playback_advancer refill ticks instead
-    of restarting from the seed on every call.
+    Core model: every candidate's drift = 1 - path_similarity, where
+    path_similarity is the product of every hop's own Last.fm match score
+    along the BFS path back to the original seed (1.0 at the seed itself).
+    A track discovered directly from the seed has path_similarity equal to
+    its own real match score; a track reached through 3 weaker hops has a
+    correspondingly smaller compounded path_similarity (bigger drift) even
+    if any single hop looked fine in isolation - this is what stands in for
+    the old hard TRACK_HOP_MAX_DEPTH cap (removed - a live sim under that
+    old model found 2 hops from ABBA's "Dancing Queen" reached Bruno Mars,
+    but that was really a statement about that *specific* weak 2-hop chain,
+    not about hop count in general; a decaying drift budget rejects a weak
+    chain at any depth while still allowing a strong one to run long).
 
-    Tier 2 (fallback, only once the track frontier is genuinely empty):
-    _artist_fallback_candidates - the artist-level bundle, re-anchored on
-    the original seed artist (or the next not-yet-expanded artist
-    encountered via track-hops), feeding straight back into track_frontier
-    so track-level resumes as the primary driver immediately after -
-    fallback_expanded_artists (also persisted) stops this from redundantly
-    re-expanding the same artist on a later call.
+    Expansion: candidates within the current max_drift are accepted
+    immediately (added to track_frontier for their own future
+    track.getSimilar call, breadth-first). Candidates beyond it are not
+    discarded - they're deferred (kept, sorted by drift). Only once the
+    live frontier is completely drained (every currently-admitted track has
+    had its neighborhood searched) does the search "expand outward in a
+    concentric ring": the single closest deferred candidate is promoted,
+    max_drift rises to exactly cover it (never further than needed), and
+    BFS resumes from there. This means the search always exhausts the
+    tightest, most-confident radius before ever settling for something
+    weaker, without needing to guess a fixed step size or re-query Last.fm
+    for data already in hand. track_frontier and the deferred pool
+    (discovery_state, {'deferred': [...], 'max_drift': float} - persisted
+    via database.set_radio_session_track_state, same column that used to
+    hold the old tiered generator's fallback_expanded_artists) both survive
+    across /more calls and playback_advancer refill ticks, so a long
+    session keeps expanding its ring from wherever it last left off instead
+    of restarting at the seed.
 
-    Tier 3 (absolute last resort, only if tiers 1 and 2 are both exhausted
-    within this same call): find_any_cached_tracks - any already-matched
-    library track at all, no artist filter. "Radio must never just stop"
-    still applies, but per explicit user request this is now a genuine last
-    resort, not an early or frequent fallback.
+    Only genuine, total exhaustion - track_frontier AND the deferred pool
+    both empty, meaning literally no Last.fm connection at any drift level
+    remains unexplored - stops the batch short of `count`. There is no
+    further tier below this (the old library-fallback last resort stays
+    removed - a library track is, by definition, already discovered, so
+    reusing it isn't discovery).
 
-    Every candidate from tiers 1 and 2 is checked against a single
-    seen/cooldown gate (try_add below) before being kept - cooldown
+    Every candidate is checked against a single seen/cooldown gate
+    (try_add below) before being kept or deferred - cooldown
     (database.get_recently_played_keys) excludes a track this app already
-    recorded a recent play for, regardless of which tier proposed it. Every
-    kept candidate is then checked against the cache index
-    (_index_cached_tracks_by_key, built from whatever artists actually
-    showed up in this batch) - a cache hit comes back pre-resolved
-    (spotify_uri/id set, so playback_advancer's matching loop needs zero
-    live search for it), a miss is left as a plain text candidate for a
-    live search at actual match time. Every candidate carries
-    selection_reason/selection_engine - persisted onto last_played_reason/
+    recorded a recent play for. Every accepted candidate is then checked
+    against the cache index (_index_cached_tracks_by_key, built from
+    whatever artists actually showed up in this batch) - a cache hit comes
+    back pre-resolved (spotify_uri/id set, so playback_advancer's matching
+    loop needs zero live search for it), a miss is left as a plain text
+    candidate for a live search at actual match time. Every candidate
+    carries selection_reason/selection_engine (always "Discovered -
+    similar track"/"Last.fm" now - the old artist tier's own label is
+    gone) plus match (this hop's own Last.fm score) and drift (the
+    compounded distance from the seed) - persisted onto last_played_reason/
     last_played_engine once actually played (database._record_track_played)
-    and surfaced in the Play Log as two separate columns.
+    and surfaced in the Play Log/reviewable playlist.
 
-    Returns (tracks, new_track_frontier, new_fallback_expanded_artists, degraded).
-    degraded=True only when tier 3 had to be used."""
+    Returns (tracks, new_track_frontier, new_discovery_state, degraded).
+    degraded is always False - kept in the return signature only for
+    compatibility with every existing caller's unpacking (main.py,
+    playback_advancer.py both destructure a 4-tuple)."""
     seen = set(seen_keys)
     frontier = [dict(f) for f in (session.get('track_frontier') or [])]
-    fallback_expanded = list(session.get('fallback_expanded_artists') or [])
+    state = _normalize_discovery_state(session.get('discovery_state'))
+    deferred = [dict(d) for d in state['deferred']]
+    max_drift = state['max_drift']
     cooldown_keys = database.get_recently_played_keys(
         database.now_ny_naive() - timedelta(days=database.get_radio_cooldown_days())
     )
     for f in frontier:
         seen.add(radio_track_key(f['track_name'], f['artist_name']))
-    if not frontier:
+    for d in deferred:
+        seen.add(radio_track_key(d['track_name'], d['artist_name']))
+    if not frontier and not deferred:
         frontier = _bootstrap_track_frontier(session)
         for f in frontier:
             seen.add(radio_track_key(f['track_name'], f['artist_name']))
 
     collected = []
-    artists_encountered = []
 
-    def try_add(artist_name, track_name, reason, engine, match=None):
+    def try_add(artist_name, track_name, path_similarity, depth, step_match):
         key = radio_track_key(track_name, artist_name)
         if key in seen or key in cooldown_keys:
             return None
         seen.add(key)
-        # match is Last.fm's own track.getSimilar score (0-1, relative to
-        # this seed's own best match - see lastfm.track_similar_tracks'
-        # docstring) - only tier 1 has one at all; tier 2's top-tracks/
-        # similar-artist bootstrap and tier 3's library fallback have no
-        # per-track similarity concept, so this stays None for those,
-        # surfaced honestly as "-" rather than a fabricated number.
-        entry = {'artist_name': artist_name, 'track_name': track_name, 'selection_reason': reason, 'selection_engine': engine, 'match': match}
-        collected.append(entry)
-        artists_encountered.append(artist_name)
-        return entry
+        drift = round(1 - path_similarity, 4)
+        node = {
+            'artist_name': artist_name, 'track_name': track_name,
+            'path_similarity': path_similarity, 'depth': depth, 'drift': drift, 'match': step_match,
+        }
+        if drift <= max_drift:
+            collected.append({**node, 'selection_reason': 'Discovered - similar track', 'selection_engine': 'Last.fm'})
+            return node
+        deferred.append(node)
+        return None
 
-    fallback_attempted = False
     while len(collected) < count:
         if not frontier:
-            if fallback_attempted:
+            if not deferred:
                 break
-            fallback_attempted = True
-            fallback_candidates, fallback_expanded = _artist_fallback_candidates(
-                session, artists_encountered, fallback_expanded,
-            )
-            added_any = False
-            for c in fallback_candidates:
-                if try_add(c['artist_name'], c['track_name'], c['selection_reason'], c['selection_engine']) is not None:
-                    frontier.append({'artist_name': c['artist_name'], 'track_name': c['track_name'], 'depth': 0})
-                    added_any = True
-            if not added_any:
-                break
+            deferred.sort(key=lambda d: d['drift'])
+            promoted = deferred.pop(0)
+            max_drift = max(max_drift, promoted['drift'])
+            collected.append({**promoted, 'selection_reason': 'Discovered - similar track', 'selection_engine': 'Last.fm'})
+            frontier.append(promoted)
             continue
 
         parent = frontier.pop(0)
         for s in lastfm.track_similar_tracks(parent['artist_name'], parent['track_name']):
-            entry = try_add(s['artist_name'], s['track_name'], 'Discovered - similar track', 'Last.fm', match=s.get('match'))
-            if entry is not None and parent['depth'] + 1 <= TRACK_HOP_MAX_DEPTH:
-                frontier.append({'artist_name': s['artist_name'], 'track_name': s['track_name'], 'depth': parent['depth'] + 1})
+            path_similarity = parent['path_similarity'] * s['match']
+            node = try_add(s['artist_name'], s['track_name'], path_similarity, parent['depth'] + 1, s['match'])
+            if node is not None:
+                frontier.append(node)
             if len(collected) >= count:
                 break
 
     degraded = False
-    if len(collected) < count:
-        # Tier 3 - see docstring. Only reached if both Last.fm-driven tiers
-        # above genuinely ran dry within this same call. Pure local DB
-        # query, no external recommendation engine involved at all - "App
-        # logic" reflects that honestly rather than crediting Last.fm for a
-        # pick it had nothing to do with.
-        degraded = True
-        for c in find_any_cached_tracks(list(seen), count - len(collected), db):
-            c['selection_reason'] = 'library fallback'
-            c['selection_engine'] = 'App logic'
-            collected.append(c)
-            seen.add(radio_track_key(c['track_name'], c['artist_name']))
+    # include_library_tracks (session-level, default True - see database.py's
+    # schema comment) doesn't affect exploration at all, only what's
+    # surfaced below - a library track's own track.getSimilar neighbors were
+    # already queued onto frontier the moment it was accepted, same as any
+    # other track.
+    exclude_library = not session.get('include_library_tracks', True)
 
-    # Cache-check every plain-text candidate (tier 3's own rows are already
-    # pre-resolved, nothing more to do for those) - reduces how many
-    # candidates actually need a live Spotify search at match time.
+    # Cache-check every plain-text candidate - reduces how many candidates
+    # actually need a live Spotify search at match time.
     text_candidates = [c for c in collected if 'id' not in c and 'spotify_uri' not in c]
     cached_by_key = _index_cached_tracks_by_key(list({c['artist_name'] for c in text_candidates}), db)
     final = []
@@ -439,8 +369,18 @@ def generate_radio_batch_track_first(session, seen_keys, count, db):
             continue
         cached = cached_by_key.get((c['track_name'].lower(), c['artist_name'].lower()))
         final.append(
-            {**cached, 'selection_reason': c['selection_reason'], 'selection_engine': c.get('selection_engine'), 'match': c.get('match')}
+            {**cached, 'selection_reason': c['selection_reason'], 'selection_engine': c.get('selection_engine'), 'match': c.get('match'), 'drift': c.get('drift')}
             if cached else c
         )
 
-    return final[:count], frontier, fallback_expanded, degraded
+    if exclude_library:
+        # A real known_tracks membership check, not just _index_cached_tracks_by_key's
+        # cache index above - that index only covers rows already
+        # Spotify-verified (spotify_checked=TRUE), so a library track that
+        # hasn't been pre-warmed yet would otherwise slip through untouched.
+        # filter_known_tracks_dicts (also used by generate_fresh_radio_tracks)
+        # checks the whole known_tracks table regardless of that flag.
+        final = filter_known_tracks_dicts(final, db)
+
+    new_discovery_state = {'deferred': deferred, 'max_drift': max_drift}
+    return _interleave_by_artist(final)[:count], frontier, new_discovery_state, degraded

@@ -19,6 +19,7 @@ from .database import (
     has_active_spotify_radio_session, count_searches_since_last_reset, get_spotify_quota_state,
     set_prewarm_paused, is_prewarm_paused, upsert_radio_discovered_track,
     get_radio_cooldown_days, set_radio_cooldown_days, get_radio_tuning, set_radio_tuning,
+    get_active_generated_radio_session_id,
 )
 from .library_scanner import run_scan
 from .artwork import get_or_create_thumbnail, check_artwork_presence, cache_key_for, normalize_album_name, normalized_album_sql, save_thumbnail
@@ -334,6 +335,7 @@ class RadioGenerateRequest(BaseModel):
     seed_track_name: Optional[str] = None
     seed_artist_name: Optional[str] = None
     target_length: Optional[int] = 500
+    include_library_tracks: Optional[bool] = True
 
 class LibraryScanRequest(BaseModel):
     root_path: str
@@ -2956,12 +2958,16 @@ class RadioPlaylistItem(BaseModel):
     spotify_uri: Optional[str] = None
     radio_track_id: Optional[int] = None
     artwork_url: Optional[str] = None
-    # Last.fm's own track.getSimilar score (0-1, relative to the seed track
-    # it was found from - see lastfm.track_similar_tracks) - only present
-    # for a tier-1 (track-level) pick; None for a tier-2 artist-fallback or
-    # tier-3 library-fallback pick, which have no per-track similarity
-    # concept at all.
+    # Last.fm's own track.getSimilar score (0-1) relative to whichever
+    # already-collected track this one was actually found from (its BFS
+    # parent, not necessarily the original seed) - see
+    # lastfm.track_similar_tracks and radio_engine.generate_radio_batch_track_first.
     match: Optional[float] = None
+    # 1 minus the compounded product of every hop's own match score along
+    # the BFS path back to the original seed - 0 at the seed itself,
+    # approaching 1 the longer/weaker the chain of hops that reached this
+    # track has been. See generate_radio_batch_track_first's own docstring.
+    drift: Optional[float] = None
 
 class RadioLiveStatus(BaseModel):
     """A direct, account-wide read of Spotify's real playback state - not
@@ -3023,7 +3029,7 @@ RADIO_GENERATE_BATCH_SIZE = 40
 # job.
 RADIO_GENERATE_MAX_LENGTH = 1000
 
-def _run_radio_generation(session_id, seed_artists, seed_track_name, seed_artist_name, target_length):
+def _run_radio_generation(session_id, seed_artists, seed_track_name, seed_artist_name, target_length, include_library_tracks=True):
     """Background job (see generate_radio_playlist) - builds the session's
     full playlist upfront by repeatedly calling
     radio_engine.generate_radio_batch_track_first, the same incremental
@@ -3031,7 +3037,7 @@ def _run_radio_generation(session_id, seed_artists, seed_track_name, seed_artist
     use, just looped here until target_length is reached instead of once per
     request/tick. Every batch's tracks are tagged with a stable item_id
     (append_radio_playlist_items) and appended to radio_session.playlist, and
-    the generator's own persisted state (track_frontier/fallback_expanded_artists/
+    the generator's own persisted state (track_frontier/discovery_state/
     seen_track_keys) is saved after every batch so a later low-playlist
     refill (playback_advancer._advance_spotify) picks up exactly where this
     left off rather than restarting the walk.
@@ -3046,22 +3052,24 @@ def _run_radio_generation(session_id, seed_artists, seed_track_name, seed_artist
     try:
         session = {
             'seed_artists': seed_artists, 'seed_track_name': seed_track_name,
-            'seed_artist_name': seed_artist_name, 'track_frontier': [], 'fallback_expanded_artists': [],
+            'seed_artist_name': seed_artist_name, 'track_frontier': [], 'discovery_state': {},
+            'include_library_tracks': include_library_tracks,
         }
         seed_key = radio_engine.radio_track_key(seed_track_name, seed_artist_name) if seed_track_name and seed_artist_name else None
         seen_keys = [seed_key] if seed_key else []
         total = 0
         while total < target_length:
             batch_count = min(RADIO_GENERATE_BATCH_SIZE, target_length - total)
-            track_dicts, track_frontier, fallback_expanded_artists, _degraded = radio_engine.generate_radio_batch_track_first(
+            track_dicts, track_frontier, discovery_state, _degraded = radio_engine.generate_radio_batch_track_first(
                 session, seen_keys, batch_count, conn,
             )
             if not track_dicts:
-                # Genuine exhaustion within one call - all 3 tiers dry, same
-                # signal /more's own `exhausted` flag uses. Nothing more to
-                # generate right now; the session still works with fewer
-                # than target_length tracks, and playback_advancer's own
-                # refill will try again once actual playback catches up.
+                # Genuine exhaustion within one call - track_frontier and the
+                # deferred pool are both dry, same signal /more's own
+                # `exhausted` flag uses. Nothing more to generate right now;
+                # the session still works with fewer than target_length
+                # tracks, and playback_advancer's own refill will try again
+                # once actual playback catches up.
                 break
             for t in track_dicts:
                 t['source'] = 'in_library' if ('id' in t or 'spotify_uri' in t) else 'unresolved'
@@ -3069,9 +3077,9 @@ def _run_radio_generation(session_id, seed_artists, seed_track_name, seed_artist
             new_keys = [radio_engine.radio_track_key(t['track_name'], t['artist_name']) for t in track_dicts]
             seen_keys.extend(new_keys)
             append_seen_track_keys(session_id, new_keys)
-            set_radio_session_track_state(session_id, track_frontier, fallback_expanded_artists)
+            set_radio_session_track_state(session_id, track_frontier, discovery_state)
             session['track_frontier'] = track_frontier
-            session['fallback_expanded_artists'] = fallback_expanded_artists
+            session['discovery_state'] = discovery_state
             total += len(track_dicts)
         set_radio_session_generation_status(session_id, 'ready')
     except Exception as e:
@@ -3101,18 +3109,19 @@ def generate_radio_playlist(params: RadioGenerateRequest):
         if params.seed_track_name and params.seed_artist_name else None
     )
 
+    include_library_tracks = params.include_library_tracks if params.include_library_tracks is not None else True
     session_id = create_radio_session(
         seed_type=params.seed_type, seed_description=seed_description, seed_artists=params.seed_artists,
         destination_type='spotify', seen_track_keys=[seed_key] if seed_key else [], engine='discovery',
         seed_track_name=params.seed_track_name, seed_artist_name=params.seed_artist_name,
-        target_length=target_length, generation_status='generating',
+        target_length=target_length, generation_status='generating', include_library_tracks=include_library_tracks,
     )
     if session_id is None:
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Could not start a radio session")
 
     threading.Thread(
         target=_run_radio_generation,
-        args=(session_id, params.seed_artists, params.seed_track_name, params.seed_artist_name, target_length),
+        args=(session_id, params.seed_artists, params.seed_track_name, params.seed_artist_name, target_length, include_library_tracks),
         daemon=True,
     ).start()
 
@@ -3158,18 +3167,18 @@ def start_radio(params: RadioStartRequest, db: psycopg2.extensions.connection = 
     initial_seen = [seed_key] if seed_key else []
     degraded = False
     track_frontier = []
-    fallback_expanded_artists = []
+    discovery_state = {}
     if params.destination_type == 'spotify':
         # No session row exists yet to read persisted track_frontier/
-        # fallback_expanded_artists from - a bare in-memory stand-in with
-        # just the seed info is enough for generate_radio_batch_track_first
-        # to bootstrap its own frontier from scratch (see
+        # discovery_state from - a bare in-memory stand-in with just the
+        # seed info is enough for generate_radio_batch_track_first to
+        # bootstrap its own frontier from scratch (see
         # radio_engine._bootstrap_track_frontier).
         pending_session = {
             'seed_artists': params.seed_artists, 'seed_track_name': params.seed_track_name,
-            'seed_artist_name': params.seed_artist_name, 'track_frontier': [], 'fallback_expanded_artists': [],
+            'seed_artist_name': params.seed_artist_name, 'track_frontier': [], 'discovery_state': {},
         }
-        track_dicts, track_frontier, fallback_expanded_artists, degraded = radio_engine.generate_radio_batch_track_first(
+        track_dicts, track_frontier, discovery_state, degraded = radio_engine.generate_radio_batch_track_first(
             pending_session, initial_seen, 15, db,
         )
     else:
@@ -3190,8 +3199,8 @@ def start_radio(params: RadioStartRequest, db: psycopg2.extensions.connection = 
     )
     if session_id is None:
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Could not start a radio session")
-    if fallback_expanded_artists:
-        set_radio_session_track_state(session_id, track_frontier, fallback_expanded_artists)
+    if discovery_state:
+        set_radio_session_track_state(session_id, track_frontier, discovery_state)
 
     if params.destination_type == 'ytmusic':
         if not ytmusic_connect.is_connected():
@@ -3224,10 +3233,10 @@ def get_more_radio_tracks(session_id: int, params: RadioMoreRequest, db: psycopg
     count = max(1, min(params.count or 10, 30))
     degraded = False
     if session['destination_type'] == 'spotify':
-        track_dicts, track_frontier, fallback_expanded_artists, degraded = radio_engine.generate_radio_batch_track_first(
+        track_dicts, track_frontier, discovery_state, degraded = radio_engine.generate_radio_batch_track_first(
             session, session['seen_track_keys'] or [], count, db,
         )
-        set_radio_session_track_state(session_id, track_frontier, fallback_expanded_artists)
+        set_radio_session_track_state(session_id, track_frontier, discovery_state)
     else:
         track_dicts = radio_engine.generate_fresh_radio_tracks(
             session['seed_artists'], session['destination_type'], session['seen_track_keys'] or [], count, db,
@@ -3400,6 +3409,17 @@ def switch_radio_device(session_id: int, params: RadioSwitchDeviceRequest):
         chromecast_pushed_count=playback.get('chromecast_pushed_count'), last_status=playback.get('last_status'),
     )
     return get_radio_session(session_id)
+
+@app.get("/api/radio/active-generated")
+def get_active_generated_radio_session():
+    """Lets the frontend restore Discover's own generatingSession state
+    after a page refresh (or a fresh tab) - see database.get_active_generated_radio_session_id's
+    own docstring for why a generated session needs a separate restore path
+    from the live-session one below (it's never tagged onto
+    playback_session.now_playing at all). {"session_id": None} rather than
+    404 when there isn't one - this is a routine "is there anything to
+    restore" check, not an error case."""
+    return {"session_id": get_active_generated_radio_session_id()}
 
 @app.get("/api/radio/{session_id}", response_model=RadioSessionInfo)
 def get_radio_session_route(session_id: int):
