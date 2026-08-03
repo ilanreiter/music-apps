@@ -123,7 +123,7 @@ def _index_cached_tracks_by_key(artist_names, db):
     try:
         cur = db.cursor()
         cur.execute("""
-            SELECT id, track_name, artist_name, album_name, spotify_album_art_url
+            SELECT id, track_name, artist_name, album_name, spotify_album_art_url, genre, year, duration_seconds
             FROM known_tracks
             WHERE LOWER(artist_name) = ANY(%s) AND spotify_checked IS TRUE AND spotify_track_id IS NOT NULL
                 AND (last_played_at IS NULL OR last_played_at < %s)
@@ -146,10 +146,16 @@ def _index_cached_tracks_by_key(artist_names, db):
         index[(track_name.lower(), artist_name.lower())] = _discovered_track_row(
             track_id, track_name, artist_name, album_name, spotify_track_id, artwork_url,
         )
-    for track_id, track_name, artist_name, album_name, artwork_url in known_rows:
+    for track_id, track_name, artist_name, album_name, artwork_url, genre, year, duration_seconds in known_rows:
+        # genre/year/duration_seconds come from the local file's own tags -
+        # radio_discovered_tracks (above) has no equivalent columns at all,
+        # and a plain-text (never-searched) candidate has no metadata
+        # source whatsoever, so these stay unset for both - the summary
+        # panel (App.js) discloses that coverage rather than assuming it.
         index[(track_name.lower(), artist_name.lower())] = {
             'id': track_id, 'track_name': track_name, 'artist_name': artist_name,
             'album_name': album_name, 'artwork_url': artwork_url,
+            'genre': genre, 'year': year, 'duration_seconds': duration_seconds,
         }
     return index
 

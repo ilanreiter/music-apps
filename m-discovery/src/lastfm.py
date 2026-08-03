@@ -178,6 +178,27 @@ def track_similar_tracks(artist_name, track_name, limit=None):
     return results
 
 
+def track_artwork(artist_name, track_name):
+    """Largest available cover-art URL from track.getInfo's own album.image
+    list, or None. Confirmed live before building this: unlike the
+    long-standing "Last.fm images are all dead placeholders" folklore,
+    real, distinct covers do come back for tracks Last.fm actually has data
+    for (ABBA/Earth Wind & Fire/Michael Jackson all checked by hand) - it
+    just returns nothing at all for a track it has no album data for,
+    rather than a fake stand-in. Used to backfill artwork for a Discover
+    candidate that has no known_tracks/radio_discovered_tracks cache hit -
+    see main.py's get_discover_track_artwork."""
+    data = _request('track.getInfo', artist=artist_name, track=track_name, autocorrect=1)
+    if not data:
+        return None
+    images = ((data.get('track') or {}).get('album') or {}).get('image') or []
+    for size in ('extralarge', 'large', 'medium'):
+        for img in images:
+            if img.get('size') == size and img.get('#text'):
+                return img['#text']
+    return None
+
+
 def _pick_top_track(top_tracks):
     # top_tracks is already ordered most-popular-first - weight so the #1
     # track is favored without being deterministic (some variety across

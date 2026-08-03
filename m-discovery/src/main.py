@@ -2090,6 +2090,18 @@ def get_discover_track_preview(params: DiscoverPreviewRequest):
         return {"preview_url": None, "artwork_url": None}
     return {"preview_url": result['preview_url'], "artwork_url": result.get('artwork_url')}
 
+@app.get("/api/discover/artwork")
+def get_discover_track_artwork(track_name: str, artist_name: str):
+    """Backfills artwork for a Discover candidate with no known_tracks/
+    radio_discovered_tracks cache hit at all (a plain-text, never-searched
+    Last.fm suggestion) - see radio_engine.generate_radio_batch_track_first,
+    whose candidates only carry artwork_url for an already-cached match.
+    Called lazily, one row at a time as it scrolls into view (see
+    RadioPlaylistPreview's LazyTrackArt), not upfront for a whole
+    500-1000-track list - same reasoning as /api/discover/preview's own lazy
+    fetch."""
+    return {"artwork_url": lastfm.track_artwork(artist_name, track_name)}
+
 def _start_spotify_prewarm_background():
     """Kicks off the background Spotify pre-warm job if one isn't already
     running. Returns False (no-op, no error) if one is already in flight -
@@ -2968,6 +2980,15 @@ class RadioPlaylistItem(BaseModel):
     # approaching 1 the longer/weaker the chain of hops that reached this
     # track has been. See generate_radio_batch_track_first's own docstring.
     drift: Optional[float] = None
+    # From the local file's own tags (known_tracks) - only ever set for a
+    # genuine library match (source='in_library' via a real known_tracks
+    # row, not a radio_discovered_tracks cache hit or a plain-text
+    # candidate, neither of which have this metadata at all). The frontend
+    # summary panel discloses how many tracks actually carry these rather
+    # than assuming full coverage.
+    genre: Optional[str] = None
+    year: Optional[int] = None
+    duration_seconds: Optional[int] = None
 
 class RadioLiveStatus(BaseModel):
     """A direct, account-wide read of Spotify's real playback state - not

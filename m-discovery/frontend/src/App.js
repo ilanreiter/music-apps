@@ -4866,6 +4866,16 @@ function formatDuration(seconds) {
   return `${m}:${s}`;
 }
 
+// For an aggregate total (e.g. a whole discovery list's play time) rather
+// than a single track - formatDuration's M:SS shape reads badly once the
+// minutes climb into the hundreds.
+function formatTotalDuration(totalSeconds) {
+  if (!totalSeconds) return '0m';
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.round((totalSeconds % 3600) / 60);
+  return hours > 0 ? `${hours}h ${minutes}m` : `${minutes}m`;
+}
+
 function formatFileSize(bytes) {
   if (!bytes) return null;
   const mb = bytes / (1024 * 1024);
@@ -6469,6 +6479,49 @@ function RadioTab({
 // itself never shows a not-yet-resolved row - only things that already played.
 const RADIO_PREVIEW_SOURCE_LABELS = { in_library: 'In library', unresolved: 'Not yet resolved' };
 
+// A candidate with no known_tracks/radio_discovered_tracks cache hit at
+// generation time (most of a fresh Discover list - see
+// radio_engine.generate_radio_batch_track_first) has no artwork_url at
+// all. Rather than fetching art for the whole 500-1000-track list upfront
+// (same reasoning as the sample-preview button's own lazy fetch),
+// IntersectionObserver defers the /api/discover/artwork call until each
+// row actually scrolls into view. Defined at module scope (not inside
+// RadioPlaylistPreview) so its component identity stays stable across the
+// parent's re-renders - an inline-defined component would remount (and
+// re-trigger the observer) on every unrelated state change otherwise.
+// cachedUrl is undefined (never resolved yet), null (resolved, nothing
+// found), or a URL string - the effect only re-runs when that "still
+// needs fetching" status actually flips, not on every parent render.
+function LazyTrackArt({ item, apiBase, cachedUrl, onResolved }) {
+  const ref = useRef(null);
+  const onResolvedRef = useRef(onResolved);
+  onResolvedRef.current = onResolved;
+
+  useEffect(() => {
+    if (item.artwork_url || cachedUrl !== undefined) return;
+    const el = ref.current;
+    if (!el) return;
+    const observer = new IntersectionObserver((entries) => {
+      if (entries[0].isIntersecting) {
+        observer.disconnect();
+        axios.get(`${apiBase}/discover/artwork`, { params: { track_name: item.track_name, artist_name: item.artist_name } })
+          .then((r) => onResolvedRef.current(r.data.artwork_url || null))
+          .catch(() => onResolvedRef.current(null));
+      }
+    }, { rootMargin: '300px' });
+    observer.observe(el);
+    return () => observer.disconnect();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [item.item_id, item.artwork_url, item.track_name, item.artist_name, apiBase, cachedUrl === undefined]);
+
+  const url = item.artwork_url || cachedUrl;
+  return (
+    <div className="track-art" ref={ref}>
+      {url ? <img src={url} alt="" onError={(e) => { e.target.style.display = 'none'; }} /> : '♪'}
+    </div>
+  );
+}
+
 // Renders a radio_session.playlist as a table matching PlayLogTab's own
 // column shape (artwork/artist/track/engine/source/reason) - the reviewable,
 // reorderable/removable pre-generated playlist. (Previously also doubled as
@@ -6476,6 +6529,9 @@ const RADIO_PREVIEW_SOURCE_LABELS = { in_library: 'In library', unresolved: 'Not
 // gone along with discovery+spotify's own live playback drive.)
 function RadioPlaylistPreview({ session, onPlaylistChange, onReorder, onRemove, headerAction, apiBase }) {
   const [busyItemId, setBusyItemId] = useState(null);
+  // {item_id: url|null} - see LazyTrackArt. Lives here (not per-row) so
+  // switching away and back within the same session doesn't re-fetch.
+  const [artworkCache, setArtworkCache] = useState({});
   // Lazy, on-demand 30s sample per row - fetched only when actually clicked
   // (not upfront for the whole list, which could be hundreds of iTunes/
   // Deezer lookups) via the same /discover/preview route the original
@@ -6486,6 +6542,60 @@ function RadioPlaylistPreview({ session, onPlaylistChange, onReorder, onRemove, 
   const [preview, setPreview] = useState({ itemId: null, url: null, loading: false });
   const [previewPlaying, setPreviewPlaying] = useState(false);
   const previewAudioRef = useRef(null);
+
+  // genre/year/duration_seconds only ever come from a genuine known_tracks
+  // (library) match - a radio_discovered_tracks cache hit or a plain-text
+  // (never-searched) candidate has none of this metadata, so most lists
+  // will have partial coverage at best. Counted here rather than assumed,
+  // so the panel below can disclose real coverage instead of silently
+  // under-reporting against the full track count.
+  const summary = useMemo(() => {
+    const playlist = session.playlist;
+    const byArtist = new Map();
+    const byGenre = new Map();
+    const byDecade = new Map();
+    let durationSum = 0, durationCount = 0, genreCount = 0, yearCount = 0;
+
+    const bump = (map, key, match) => {
+      if (!map.has(key)) map.set(key, { count: 0, matchSum: 0, matchCount: 0 });
+      const entry = map.get(key);
+      entry.count += 1;
+      if (match != null) { entry.matchSum += match; entry.matchCount += 1; }
+    };
+
+    for (const item of playlist) {
+      bump(byArtist, item.artist_name, item.match);
+      if (item.genre) { genreCount += 1; bump(byGenre, item.genre, item.match); }
+      if (item.year) { yearCount += 1; bump(byDecade, Math.floor(item.year / 10) * 10, item.match); }
+      if (item.duration_seconds) {
+        durationSum += item.duration_seconds;
+        durationCount += 1;
+      }
+    }
+
+    const toList = (map) => Array.from(map.entries())
+      .map(([key, e]) => ({ key, count: e.count, avgMatch: e.matchCount ? e.matchSum / e.matchCount : null }));
+
+    const artists = toList(byArtist).sort((a, b) => b.count - a.count);
+    const genres = toList(byGenre).sort((a, b) => b.count - a.count);
+    const decades = toList(byDecade).sort((a, b) => a.key - b.key);
+
+    // Most tracks are Last.fm-only candidates with no local match at all,
+    // so a plain sum over known durations badly under-reports a full list's
+    // real playtime (see the 31/500-known case this was built from).
+    // Estimating every unknown track at the known subset's own average
+    // keeps the total representative of the whole list's actual size
+    // instead of just whichever fraction happened to already be resolved.
+    const estimatedDurationSum = durationCount > 0 ? (durationSum / durationCount) * playlist.length : 0;
+
+    return {
+      total: playlist.length, distinctArtists: byArtist.size, artists, genres, decades,
+      maxArtistCount: artists.length ? Math.max(...artists.map((a) => a.count)) : 0,
+      maxGenreCount: genres.length ? Math.max(...genres.map((g) => g.count)) : 0,
+      maxDecadeCount: decades.length ? Math.max(...decades.map((d) => d.count)) : 0,
+      durationSum, durationCount, estimatedDurationSum, genreCount, yearCount,
+    };
+  }, [session.playlist]);
 
   const handlePreviewClick = async (item) => {
     if (preview.itemId === item.item_id) {
@@ -6561,11 +6671,12 @@ function RadioPlaylistPreview({ session, onPlaylistChange, onReorder, onRemove, 
     return (
       <div key={item.item_id ?? item.id} className="track-row">
         <span className="track-num">{index + 1}</span>
-        <div className="track-art">
-          {item.artwork_url ? (
-            <img src={item.artwork_url} alt="" onError={(e) => { e.target.style.display = 'none'; }} />
-          ) : '♪'}
-        </div>
+        <LazyTrackArt
+          item={item}
+          apiBase={apiBase}
+          cachedUrl={artworkCache[item.item_id]}
+          onResolved={(url) => setArtworkCache((prev) => ({ ...prev, [item.item_id]: url }))}
+        />
         <div className="track-main">
           <div className="track-title">{item.track_name}</div>
           <div className="track-sub">
@@ -6611,6 +6722,33 @@ function RadioPlaylistPreview({ session, onPlaylistChange, onReorder, onRemove, 
     );
   };
 
+  // One horizontal row, shared by all 3 summary panels: a count bar and an
+  // avg-similarity bar side by side, both filling left-to-right. count is
+  // scaled against maxCount (that same panel's own largest count -
+  // artists/genres/decades are different units, never compared against
+  // each other); avgMatch is scaled against the full honest 0-100% range,
+  // same convention as the per-track match meter above.
+  const renderSummaryBar = (label, count, avgMatch, maxCount, photoUrl) => {
+    const countPct = maxCount ? Math.round((count / maxCount) * 100) : 0;
+    const matchPct = avgMatch != null ? Math.round(avgMatch * 100) : null;
+    return (
+      <div key={label} className="radio-summary-row">
+        {photoUrl && (
+          <img className="radio-summary-artist-photo" src={photoUrl} alt="" onError={(e) => { e.target.style.display = 'none'; }} />
+        )}
+        <span className="name" title={label}>{label}</span>
+        <div className="radio-summary-bar-cell">
+          <div className="radio-summary-bar"><div className="fill count-fill" style={{ width: `${countPct}%` }} /></div>
+          <span className="bar-value">{count}</span>
+        </div>
+        <div className="radio-summary-bar-cell">
+          <div className="radio-summary-bar"><div className="fill match-fill" style={{ width: `${matchPct ?? 0}%` }} /></div>
+          <span className="bar-value">{matchPct != null ? `${matchPct}%` : '–'}</span>
+        </div>
+      </div>
+    );
+  };
+
   return (
     <div className="radio-playlist-preview">
       <div className="radio-playlist-preview-header">
@@ -6627,6 +6765,71 @@ function RadioPlaylistPreview({ session, onPlaylistChange, onReorder, onRemove, 
       </div>
       {session.playlist.length === 0 && (
         <p className="empty-state">Nothing generated yet.</p>
+      )}
+      {session.playlist.length > 0 && (
+        <div className="radio-summary">
+          <div className="radio-summary-stats">
+            <div className="radio-summary-stat">
+              <span className="value">{summary.total}</span>
+              <span className="label">Tracks</span>
+            </div>
+            <div className="radio-summary-stat">
+              <span className="value">{summary.distinctArtists}</span>
+              <span className="label">Artists</span>
+            </div>
+            <div className="radio-summary-stat">
+              <span className="value">{summary.durationCount > 0 ? formatTotalDuration(summary.estimatedDurationSum) : '–'}</span>
+              <span className="label">
+                Total estimated playtime
+                {summary.durationCount > 0 && summary.durationCount < summary.total && ` (${summary.durationCount}/${summary.total} with known duration)`}
+              </span>
+            </div>
+          </div>
+
+          <div className="radio-summary-legend">
+            <span><i className="swatch count-fill" /> Track count</span>
+            <span><i className="swatch match-fill" /> Avg similarity</span>
+          </div>
+          <div className="radio-summary-panels">
+            <div className="radio-summary-section">
+              <h5>Tracks by artist</h5>
+              <div className="radio-summary-table">
+                {summary.artists.map((a) => renderSummaryBar(
+                  a.key, a.count, a.avgMatch, summary.maxArtistCount,
+                  `${apiBase}/artist-info/photo?name=${encodeURIComponent(a.key)}`,
+                ))}
+              </div>
+            </div>
+
+            <div className="radio-summary-section">
+              <h5>
+                By genre
+                {summary.genreCount < summary.total && <span className="radio-summary-hint"> ({summary.genreCount}/{summary.total} known)</span>}
+              </h5>
+              {summary.genres.length === 0 ? (
+                <p className="empty-state">No genre data available yet.</p>
+              ) : (
+                <div className="radio-summary-table">
+                  {summary.genres.map((g) => renderSummaryBar(g.key, g.count, g.avgMatch, summary.maxGenreCount))}
+                </div>
+              )}
+            </div>
+
+            <div className="radio-summary-section">
+              <h5>
+                By decade
+                {summary.yearCount < summary.total && <span className="radio-summary-hint"> ({summary.yearCount}/{summary.total} known)</span>}
+              </h5>
+              {summary.decades.length === 0 ? (
+                <p className="empty-state">No release-year data available yet.</p>
+              ) : (
+                <div className="radio-summary-table">
+                  {summary.decades.map((d) => renderSummaryBar(`${d.key}s`, d.count, d.avgMatch, summary.maxDecadeCount))}
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );
