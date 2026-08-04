@@ -5887,6 +5887,37 @@ function RadioTab({
     setGeneratingSession(null);
   };
 
+  // Push-to-YouTube-Music for a generated (spotify+discovery) session - the
+  // "lowest hanging fruit" version of Phase 2's push step (see main.py's
+  // push_radio_playlist_to_ytmusic). Reuses YtMusicPushPanel wholesale
+  // (same component the Library tab's own push already renders) rather
+  // than a bespoke status/progress UI - it already polls, shows a
+  // progress bar, and handles done/error/queued, so there was nothing
+  // left to rebuild here beyond an onPush handler for this session's data.
+  const [pushingToYtMusic, setPushingToYtMusic] = useState(false);
+  const [ytMusicPushPanelOpen, setYtMusicPushPanelOpen] = useState(false);
+  // Captured at the moment the trigger button is clicked (see headerAction
+  // below, which receives RadioPlaylistPreview's current filteredPlaylist
+  // as a render-prop argument) - null pushes the whole server-side
+  // playlist, an array restricts to just those item_ids, letting a
+  // client-side facet filter scope what actually gets pushed.
+  const [pushTargetItemIds, setPushTargetItemIds] = useState(null);
+
+  const pushDiscoverToYtMusicPlaylist = async () => {
+    if (!generatingSession?.id) return;
+    setPushingToYtMusic(true);
+    try {
+      await axios.post(
+        `${apiBase}/radio/${generatingSession.id}/push-to-ytmusic`,
+        pushTargetItemIds ? { item_ids: pushTargetItemIds } : {},
+      );
+    } catch (err) {
+      console.error('Error pushing Discover list to YouTube Music:', err);
+    } finally {
+      setPushingToYtMusic(false);
+    }
+  };
+
   useEffect(() => {
     const q = trackQuery.trim();
     if (q.length < 2) { setTrackResults([]); return; }
@@ -6457,17 +6488,35 @@ function RadioTab({
           onPlaylistChange={updateGeneratingPlaylist}
           onReorder={(itemId) => axios.post(`${apiBase}/radio/${generatingSession.id}/reorder`, { item_id: itemId }).catch((err) => console.error('Error reordering radio playlist:', err))}
           onRemove={(itemId) => axios.post(`${apiBase}/radio/${generatingSession.id}/remove`, { item_id: itemId }).catch((err) => console.error('Error removing radio playlist item:', err))}
-          headerAction={(
+          headerAction={(filteredPlaylist, filtersActive) => (
             <div className="radio-playlist-preview-actions">
-              {/* Phase 2: replace with a "Push to Spotify" button calling the
-                  new spotify_push_job.py trigger. Until then, Generate
-                  produces a reviewable/reorderable playlist with no play
-                  action. */}
+              {/* Phase 2 seam: a "Push to Spotify" button (spotify_push_job.py,
+                  not yet built) belongs here too, alongside YouTube Music. */}
+              {generatingSession.generation_status === 'ready' && (
+                <button
+                  className="scan-btn"
+                  title={filtersActive ? 'Pushes only the tracks the current filter shows' : 'Pushes the whole list'}
+                  onClick={() => {
+                    setPushTargetItemIds(filtersActive ? filteredPlaylist.map((t) => t.item_id) : null);
+                    setYtMusicPushPanelOpen(true);
+                  }}
+                >
+                  ▶️ Push {(filtersActive ? filteredPlaylist : generatingSession.playlist).length} to YouTube Music
+                </button>
+              )}
               <button className="scan-btn radio-stop-btn" onClick={cancelGeneratedRadio}>
                 {generatingSession.generation_status === 'generating' ? 'Cancel' : 'Discard'}
               </button>
             </div>
           )}
+        />
+      )}
+      {ytMusicPushPanelOpen && (
+        <YtMusicPushPanel
+          apiBase={apiBase}
+          onPush={pushDiscoverToYtMusicPlaylist}
+          pushing={pushingToYtMusic}
+          onClose={() => setYtMusicPushPanelOpen(false)}
         />
       )}
     </section>
@@ -6813,7 +6862,7 @@ function RadioPlaylistPreview({ session, onPlaylistChange, onReorder, onRemove, 
           <span className="count"> · {session.playlist.length}{session.target_length ? `/${session.target_length}` : ''} tracks</span>
           {session.generation_status === 'generating' && <span className="count building"> · building…</span>}
         </h3>
-        {headerAction}
+        {headerAction(filteredPlaylist, filtersActive)}
       </div>
       <p className="hint">⬆ moves a track to play next, ✕ removes it.</p>
       {filtersActive && (

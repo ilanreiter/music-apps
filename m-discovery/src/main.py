@@ -3148,6 +3148,50 @@ def generate_radio_playlist(params: RadioGenerateRequest):
 
     return get_radio_session(session_id)
 
+class RadioPushYtmusicRequest(BaseModel):
+    # Which playlist items to push, by their stable item_id (same identity
+    # reorder/remove already use) - None/omitted pushes the whole
+    # server-side playlist; a list restricts to just those items (in the
+    # playlist's own order, not the order given here), letting the caller
+    # push only whatever a client-side facet filter currently has in view.
+    item_ids: Optional[List[int]] = None
+
+class RadioPushYtmusicResponse(BaseModel):
+    job_id: int
+
+@app.post("/api/radio/{session_id}/push-to-ytmusic", response_model=RadioPushYtmusicResponse)
+def push_radio_playlist_to_ytmusic(session_id: int, params: RadioPushYtmusicRequest = RadioPushYtmusicRequest()):
+    """Pushes a generated (spotify+discovery) session's reviewed playlist to
+    YouTube Music - the "lowest hanging fruit" version of Phase 2's real
+    "push somewhere" step, reusing ytmusic_push_job.py's already-built,
+    already-quota-paced worker wholesale rather than writing a new one for
+    Spotify first. Unlike the Spotify-cache-hit-only shortcut this was
+    weighed against, this resolves the *whole* list via a real search per
+    track (see ytmusic_push_job.run) - a track from radio_session.playlist
+    with no known_track_id is always a cache 'miss' there, by design."""
+    session = get_radio_session(session_id)
+    if session is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No radio session with that id")
+    if not session['playlist']:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Nothing to push - the playlist is empty")
+    if not ytmusic_connect.is_connected():
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="YouTube Music not connected")
+
+    playlist = session['playlist']
+    if params.item_ids is not None:
+        wanted = set(params.item_ids)
+        playlist = [t for t in playlist if t.get('item_id') in wanted]
+        if not playlist:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Nothing to push - none of those items are still on the playlist")
+
+    push_tracks = [{"track_name": t['track_name'], "artist_name": t['artist_name']} for t in playlist]
+    job_id = enqueue_ytmusic_push_job(session['seed_description'] or f"Discover session {session_id}", push_tracks)
+    if job_id is None:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Could not start the YouTube Music push")
+    set_radio_session_ytmusic_job(session_id, None, job_id)
+    _start_ytmusic_push_job_background()
+    return {"job_id": job_id}
+
 @app.post("/api/radio/start", response_model=RadioStartResponse)
 def start_radio(params: RadioStartRequest, db: psycopg2.extensions.connection = Depends(get_db)):
     if not lastfm.is_configured():
