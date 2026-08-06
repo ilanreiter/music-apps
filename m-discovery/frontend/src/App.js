@@ -2229,7 +2229,7 @@ function App() {
     // seed: { type: 'track'|'artist'|'playlist', description, seedArtists: string[], seedTrack?, engine? }
     const destinationType = resolveRadioDestinationType();
     if (!destinationType) {
-      setRadioStatus('Select a Spotify Connect device, This Browser, or YouTube Music (below) to use Radio.');
+      setRadioStatus('Select This Browser or YouTube Music (below) to use Radio.');
       return;
     }
     if (destinationType === 'ytmusic' && !ytMusicConnected) {
@@ -4639,8 +4639,8 @@ function PlayerBar({
         ) : (
           <p className="player-no-local-file">
             {track.source === 'ytmusic'
-              ? 'This track has no local copy - select a Spotify Connect device, or open it on YouTube Music.'
-              : 'This track is only on Spotify - select a Spotify Connect device to play it.'}
+              ? 'This track has no local copy - open it on YouTube Music to play it.'
+              : 'This track is only on Spotify - open it in Spotify to play it.'}
           </p>
         ))}
       </div>
