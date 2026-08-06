@@ -453,8 +453,8 @@ def get_playlist_tracks(playlist_id):
         # "Private video"/"Deleted video" as snippet.title for these, which
         # is truthy. Caught this because it was polluting the Playlists tab's
         # "All Tracks" cache (296 of ~5,257 tracks on this account) and would
-        # have wasted that many pointless Spotify searches in
-        # playlist_match_prewarm on titles with no artist to match against.
+        # have wasted that many pointless Spotify searches on titles with no
+        # artist to match against.
         if not video_id or not title or title in ('Private video', 'Deleted video'):
             continue
         # snippet.channelTitle is the *playlist's own owner* (this account),

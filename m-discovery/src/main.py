@@ -16,7 +16,7 @@ from .database import (
     create_radio_session, get_radio_session, append_seen_track_keys, set_radio_session_track_state,
     set_radio_session_generation_status, append_radio_playlist_items, set_radio_session_playlist,
     set_radio_session_ytmusic_job, stop_radio_session, append_tracks_to_ytmusic_push_job,
-    has_active_spotify_radio_session, count_searches_since_last_reset, get_spotify_quota_state,
+    count_searches_since_last_reset, get_spotify_quota_state,
     set_prewarm_paused, is_prewarm_paused, upsert_radio_discovered_track,
     get_radio_cooldown_days, set_radio_cooldown_days, get_radio_tuning, set_radio_tuning,
     get_active_generated_radio_session_id,
@@ -36,7 +36,6 @@ from . import ytmusic_connect
 from . import ytmusic_push_job
 from . import external_artwork
 from . import spotify_prewarm
-from . import playlist_match_prewarm
 from . import tag_cleanup
 from . import playback_advancer
 from . import shazam_identify
@@ -134,12 +133,6 @@ external_artwork_progress = {"status": "idle"}
 
 spotify_prewarm_lock = threading.Lock()
 spotify_prewarm_progress = {"status": "idle"}
-
-# Resolves a Spotify match for every cached YouTube Music playlist track that
-# doesn't have one yet (see playlist_match_prewarm.py) - same idle-gated
-# lock+progress-dict shape as spotify_prewarm above, for the same reasons.
-playlist_match_prewarm_lock = threading.Lock()
-playlist_match_prewarm_progress = {"status": "idle"}
 
 # Guards the two /playlists/all-tracks routes' refresh path (fetch-live then
 # replace_playlist_track_cache) - confirmed live this is a real risk, not
@@ -301,9 +294,9 @@ class RadioStartRequest(BaseModel):
     seed_type: str
     seed_description: Optional[str] = None
     seed_artists: List[str]
-    # 'browser' | 'spotify' | 'ytmusic' - decides whether this session's
-    # /more calls return tracks to play (browser/spotify) or push into a
-    # YouTube Music playlist instead (ytmusic, see append_tracks_to_ytmusic_push_job).
+    # 'browser' | 'ytmusic' - decides whether this session's /more calls
+    # return tracks to play (browser) or push into a YouTube Music playlist
+    # instead (ytmusic, see append_tracks_to_ytmusic_push_job).
     destination_type: str
     # The literal track/artist's-track/playlist's-track the user actually
     # picked, when the frontend has one - so the picked track can play
@@ -314,28 +307,13 @@ class RadioStartRequest(BaseModel):
     # suggest it either.
     seed_track_name: Optional[str] = None
     seed_artist_name: Optional[str] = None
-    # 'discovery' (default) - this app's own Last.fm-driven candidate
-    # generation, matched/queued track by track, same as always. 'spotify_native' -
-    # only meaningful for destination_type == 'spotify': generates no batch
-    # at all, since the frontend seeds Spotify's own account-level autoplay
-    # with a single track and playback_advancer._advance_spotify_native just
-    # mirrors whatever Spotify queues on its own from then on.
+    # Always 'discovery' now - this app's own Last.fm-driven candidate
+    # generation, matched/queued track by track. Kept as a field (rather than
+    # dropped outright) since radio_session.engine is still a stored column.
     engine: Optional[str] = 'discovery'
 
 class RadioMoreRequest(BaseModel):
     count: Optional[int] = 10
-
-class RadioGenerateRequest(BaseModel):
-    """Only ever spotify+discovery (see generate_radio_playlist) - unlike
-    RadioStartRequest there's no destination_type/engine field, since this
-    route doesn't support anything else."""
-    seed_type: str
-    seed_description: Optional[str] = None
-    seed_artists: List[str]
-    seed_track_name: Optional[str] = None
-    seed_artist_name: Optional[str] = None
-    target_length: Optional[int] = 500
-    include_library_tracks: Optional[bool] = True
 
 class LibraryScanRequest(BaseModel):
     root_path: str
@@ -374,15 +352,8 @@ class SpotifyPrewarmStatus(BaseModel):
     error: Optional[str] = None
     # The manual override's current persisted state (see database.is_prewarm_paused) -
     # included here (rather than a separate endpoint) so the existing status
-    # poll already picks it up for free. Shared with playlist_match_prewarm,
-    # which draws from the same switch - see PlaylistMatchPrewarmStatus.paused.
+    # poll already picks it up for free.
     paused: bool = False
-
-class PlaylistMatchPrewarmStatus(BaseModel):
-    status: str  # idle | running | waiting_active_use | waiting_not_connected | done | error
-    processed: Optional[int] = None
-    matched: Optional[int] = None
-    error: Optional[str] = None
 
 class TagCleanupStatus(BaseModel):
     status: str  # idle | running | done | error
@@ -484,41 +455,6 @@ class ChromecastStatus(BaseModel):
     volume: Optional[int] = None
     content_id: Optional[str] = None
 
-class SpotifyDevice(BaseModel):
-    id: str
-    name: str
-    status: str = 'unknown'  # 'ok' | 'failed' | 'unknown' - see spotify_connect._device_last_outcome
-
-class SpotifyPlayRequest(BaseModel):
-    context_uri: str
-    track_uri: Optional[str] = None
-    clear_queue: bool = False
-
-class SpotifyPlayUrisRequest(BaseModel):
-    uris: List[str]
-    clear_queue: bool = False
-
-class SpotifyQueueRequest(BaseModel):
-    uri: str
-
-class SpotifyVolumeRequest(BaseModel):
-    level: int
-
-class SpotifySeekRequest(BaseModel):
-    position_ms: int
-
-class SpotifyStatus(BaseModel):
-    reachable: bool
-    status: Optional[str] = None
-    position_ms: Optional[int] = None
-    duration_ms: Optional[int] = None
-    volume: Optional[int] = None
-    track_uri: Optional[str] = None
-    title: Optional[str] = None
-    artist: Optional[str] = None
-    album: Optional[str] = None
-    artwork_url: Optional[str] = None
-
 class SpotifyPlaylist(BaseModel):
     id: str
     name: str
@@ -554,12 +490,6 @@ class SpotifyMatchResult(BaseModel):
     # database._record_track_played can stamp last_played_at on the right
     # row regardless of source.
     radio_track_id: Optional[int] = None
-
-class NativeRadioSeedRequest(BaseModel):
-    track_uri: str
-
-class NativeRadioSeedResponse(BaseModel):
-    context_uri: str
 
 # Dependency to get a database connection
 def get_db():
@@ -597,37 +527,12 @@ async def startup_event():
             print(f"Resuming external artwork backfill in the background ({remaining} tracks not yet checked).")
             _start_external_artwork_background()
 
-    # Same idea for the Spotify pre-warm job: it needs a connected account to
-    # do anything, so only auto-start it if one's already linked at boot.
-    if spotify_connect.is_connected():
-        conn = get_db_connection()
-        if conn:
-            try:
-                cur = conn.cursor()
-                cur.execute("SELECT COUNT(*) FROM known_tracks WHERE spotify_checked IS NOT TRUE")
-                remaining = cur.fetchone()[0]
-                cur.close()
-            finally:
-                conn.close()
-            if remaining > 0:
-                print(f"Resuming Spotify pre-warm in the background ({remaining} tracks not yet checked).")
-                _start_spotify_prewarm_background()
-
-    # Same idea for the YT-Music-to-Spotify match backfill: only useful once
-    # a YT Music "All Tracks" cache actually exists with unmatched rows in it.
-    if spotify_connect.is_connected():
-        conn = get_db_connection()
-        if conn:
-            try:
-                cur = conn.cursor()
-                cur.execute("SELECT COUNT(*) FROM playlist_track_cache WHERE platform = 'ytmusic' AND matched_at IS NULL")
-                remaining = cur.fetchone()[0]
-                cur.close()
-            finally:
-                conn.close()
-            if remaining > 0:
-                print(f"Resuming playlist match pre-warm in the background ({remaining} YouTube Music tracks not yet checked).")
-                _start_playlist_match_prewarm_background()
+    # spotify_prewarm.py is no longer auto-started at boot - Spotify Connect
+    # playback is gone, so this job's only remaining purpose is pre-populating
+    # known_tracks.spotify_track_id for the Push-to-Playlist feature, which
+    # isn't worth spending search budget on unattended. Paused by default
+    # (database.is_prewarm_paused); toggle it on manually via
+    # POST /api/spotify/prewarm/pause if you want it running.
 
     # Same auto-resume principle for the paced YouTube Music push queue (see
     # ytmusic_push_job.py) - each job's progress lives entirely in its own
@@ -1366,119 +1271,6 @@ def spotify_auth_logout():
     spotify_connect.disconnect()
     return {"status": "disconnected"}
 
-def _get_spotify_device_or_404(device_id: str):
-    device = spotify_connect.get_device(device_id)
-    if not device:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Unknown Spotify Connect device")
-    return device
-
-@app.get("/api/spotify/devices", response_model=List[SpotifyDevice])
-def list_spotify_devices():
-    return spotify_connect.list_devices()
-
-@app.post("/api/spotify/devices/{device_id}/play")
-def spotify_play(device_id: str, params: SpotifyPlayRequest):
-    _get_spotify_device_or_404(device_id)
-    result = spotify_connect.play(device_id, params.context_uri, params.track_uri, drain_queue=params.clear_queue)
-    # 'superseded' (a newer play()/play_uris() call for this device already
-    # took over) is not an error - a normal 200 here means the caller's own
-    # stale request simply has nothing further to do, rather than surfacing
-    # a misleading "couldn't reach Spotify" for what was actually just a
-    # race between two of the user's own quick actions.
-    if result == 'superseded':
-        return {"status": "superseded"}
-    if not result:
-        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Could not reach Spotify")
-    return {"status": "playing"}
-
-@app.post("/api/spotify/devices/{device_id}/play-uris")
-def spotify_play_uris(device_id: str, params: SpotifyPlayUrisRequest):
-    _get_spotify_device_or_404(device_id)
-    result = spotify_connect.play_uris(device_id, params.uris, drain_queue=params.clear_queue)
-    if result == 'superseded':
-        return {"status": "superseded"}
-    if not result:
-        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Could not reach Spotify")
-    return {"status": "playing"}
-
-@app.post("/api/spotify/devices/{device_id}/queue")
-def spotify_add_to_queue(device_id: str, params: SpotifyQueueRequest):
-    _get_spotify_device_or_404(device_id)
-    if not spotify_connect.add_to_queue(device_id, params.uri):
-        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Could not reach Spotify")
-    return {"status": "queued"}
-
-@app.post("/api/spotify/devices/{device_id}/pause")
-def spotify_pause(device_id: str):
-    _get_spotify_device_or_404(device_id)
-    if not spotify_connect.pause(device_id):
-        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Could not reach Spotify")
-    return {"status": "paused"}
-
-@app.post("/api/spotify/devices/{device_id}/resume")
-def spotify_resume(device_id: str):
-    _get_spotify_device_or_404(device_id)
-    if not spotify_connect.resume(device_id):
-        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Could not reach Spotify")
-    return {"status": "playing"}
-
-@app.post("/api/spotify/devices/{device_id}/stop")
-def spotify_stop(device_id: str):
-    _get_spotify_device_or_404(device_id)
-    if not spotify_connect.stop(device_id):
-        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Could not reach Spotify")
-    return {"status": "stopped"}
-
-@app.post("/api/spotify/devices/{device_id}/seek")
-def spotify_seek(device_id: str, params: SpotifySeekRequest):
-    _get_spotify_device_or_404(device_id)
-    if not spotify_connect.seek(device_id, params.position_ms):
-        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Could not reach Spotify")
-    return {"status": "ok"}
-
-@app.post("/api/spotify/devices/{device_id}/volume")
-def spotify_set_volume(device_id: str, params: SpotifyVolumeRequest):
-    _get_spotify_device_or_404(device_id)
-    if not spotify_connect.set_volume(device_id, params.level):
-        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Could not reach Spotify")
-    return {"status": "ok"}
-
-@app.post("/api/spotify/devices/{device_id}/next")
-def spotify_next(device_id: str):
-    _get_spotify_device_or_404(device_id)
-    if not spotify_connect.next_track(device_id):
-        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Could not reach Spotify")
-    return {"status": "ok"}
-
-@app.post("/api/spotify/devices/{device_id}/previous")
-def spotify_previous(device_id: str):
-    _get_spotify_device_or_404(device_id)
-    if not spotify_connect.previous_track(device_id):
-        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Could not reach Spotify")
-    return {"status": "ok"}
-
-@app.get("/api/spotify/devices/{device_id}/status", response_model=SpotifyStatus)
-def spotify_get_status(device_id: str):
-    _get_spotify_device_or_404(device_id)
-    result = spotify_connect.get_status(device_id)
-    if result is None:
-        return {"reachable": False}
-    return result
-
-@app.post("/api/spotify/devices/{device_id}/clear-queue")
-def spotify_clear_queue(device_id: str):
-    """Manual escape hatch for whenever a new session's automatic drain
-    (play()/play_uris()'s drain_queue=True) still wasn't enough - see
-    spotify_connect.clear_queue_for_device/clear_queue's own docstrings for
-    why that can happen (an actively-refilling native context, not just
-    ordinary leftover residue). Skips ahead on the real device right now,
-    independent of starting anything new."""
-    _get_spotify_device_or_404(device_id)
-    drained = spotify_connect.clear_queue_for_device(device_id)
-    if drained is None:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Spotify not connected")
-    return {"drained": drained}
-
 @app.get("/api/spotify/playlists", response_model=List[SpotifyPlaylist])
 def list_spotify_playlists():
     if not spotify_connect.is_connected():
@@ -1520,8 +1312,8 @@ def _attach_ytmusic_track_extras(tracks):
     """Mirror of _attach_spotify_track_extras above, for a live 'By
     Playlist' YouTube Music track list. matched_spotify_uri here can come
     from the known_tracks bridge or directly from this same track's own
-    playlist_track_cache row (kept fresh by playlist_match_prewarm/
-    discover-match/bulk_backfill_cross_platform_matches)."""
+    playlist_track_cache row (kept fresh by discover-match/
+    bulk_backfill_cross_platform_matches)."""
     ids = [t['video_id'] for t in tracks]
     if not ids:
         return tracks
@@ -1716,11 +1508,7 @@ def get_ytmusic_playlist_tracks(playlist_id: str):
 
 @app.get("/api/ytmusic/playlists/all-tracks", response_model=PlaylistAllTracksResponse)
 def get_ytmusic_all_playlist_tracks(refresh: bool = False):
-    """Same caching approach as the Spotify equivalent above. A refresh here
-    can introduce new unmatched rows (new/changed playlist tracks), so it
-    kicks the Spotify-match background job in case it's gone idle/done -
-    _start_playlist_match_prewarm_background is a no-op if one's already
-    running."""
+    """Same caching approach as the Spotify equivalent above."""
     if not ytmusic_connect.is_connected():
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="YouTube Music not connected")
     if not refresh:
@@ -1730,7 +1518,6 @@ def get_ytmusic_all_playlist_tracks(refresh: bool = False):
     with _playlist_cache_refresh_locks['ytmusic']:
         tracks, skipped = ytmusic_connect.get_all_playlist_tracks()
         replace_playlist_track_cache('ytmusic', tracks, skipped)
-    _start_playlist_match_prewarm_background()
     return get_playlist_track_cache('ytmusic')
 
 @app.post("/api/ytmusic/auth/start")
@@ -1859,9 +1646,8 @@ def _match_track_to_spotify(db, track_id):
         return {"matched": True, "uri": f"spotify:track:{cached_id}", "artwork_url": cached_art}
 
     # Exact-id cross-reference before a live search - if this same track was
-    # already matched to Spotify via a YT Music playlist (playlist_match_prewarm
-    # or the discover-match route below), reuse that instead of searching
-    # again. Symmetric to playlist_match_prewarm's own known_tracks check.
+    # already matched to Spotify via a YT Music playlist (the discover-match
+    # route below), reuse that instead of searching again.
     if ytmusic_video_id:
         cur.execute(
             "SELECT matched_spotify_uri, artwork_url FROM playlist_track_cache WHERE platform = 'ytmusic' AND track_id = %s",
@@ -1945,7 +1731,7 @@ def _match_track_to_spotify(db, track_id):
     if match and ytmusic_video_id:
         # Completes the cross-reference from this direction too - a YT Music
         # playlist track sharing this exact video_id never has to search
-        # Spotify itself now (see playlist_match_prewarm.py).
+        # Spotify itself now.
         backfill_ytmusic_cache_match(ytmusic_video_id, match['uri'])
 
     if not match:
@@ -2048,21 +1834,6 @@ def match_discovered_track_to_spotify(params: DiscoverTrackMatchRequest):
         backfill_ytmusic_cache_match(params.ytmusic_video_id, None)
     return {"matched": False, "reason": "no_match"}
 
-@app.post("/api/spotify/native-radio-seed", response_model=NativeRadioSeedResponse)
-def seed_native_radio(params: NativeRadioSeedRequest):
-    """Replaces the reused spotify_native radio playlist's one track with
-    track_uri and returns its context_uri - see
-    spotify_connect.ensure_radio_seed_playlist for why a real context
-    (rather than the bare track_uri the frontend already has) is what a
-    spotify_native session actually needs to play: confirmed live that's the
-    only way Spotify's own Autoplay gets a handoff point at all."""
-    if not spotify_connect.is_connected():
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Spotify not connected")
-    context_uri = spotify_connect.seed_radio_playlist(params.track_uri)
-    if context_uri is None:
-        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Could not seed the Spotify Radio playlist")
-    return {"context_uri": context_uri}
-
 class DiscoverPreviewRequest(BaseModel):
     track_name: str
     artist_name: str
@@ -2116,7 +1887,7 @@ def _start_spotify_prewarm_background():
 
         def _run():
             try:
-                spotify_prewarm.run(get_db_connection, spotify_prewarm_progress, _is_idle, has_active_spotify_radio_session)
+                spotify_prewarm.run(get_db_connection, spotify_prewarm_progress, _is_idle)
             finally:
                 spotify_prewarm_lock.release()
 
@@ -2135,12 +1906,10 @@ class PrewarmPauseRequest(BaseModel):
 
 @app.post("/api/spotify/prewarm/pause")
 async def set_spotify_prewarm_paused(params: PrewarmPauseRequest):
-    """Manual, explicit override for both background search-consuming jobs
-    (spotify_prewarm.py, playlist_match_prewarm.py) - shares one switch
-    since both draw against the same daily search budget and there's no
-    reason to pause one without the other. Checked ahead of their existing
-    is_radio_active/is_idle gating, for whenever those aren't reason enough
-    on their own to stop consuming budget right now."""
+    """Manual, explicit override for the background search-consuming
+    spotify_prewarm.py job. Checked ahead of its existing is_idle gating, for
+    whenever that isn't reason enough on its own to stop consuming budget
+    right now."""
     set_prewarm_paused(params.paused)
     return {"paused": params.paused}
 
@@ -2297,48 +2066,6 @@ async def get_spotify_search_budget():
         "last_adjusted_at": quota_state["last_adjusted_at"],
         "last_adjustment_reason": quota_state["last_adjustment_reason"],
     }
-
-def _start_playlist_match_prewarm_background():
-    """Kicks off the background YT-Music-to-Spotify match job if one isn't
-    already running - same non-blocking-lock pattern as
-    _start_spotify_prewarm_background, for the same reason (a run interrupted
-    by a container rebuild needs to auto-resume, since the in-memory
-    lock/progress don't survive the process exiting)."""
-    if not playlist_match_prewarm_lock.acquire(blocking=False):
-        return False
-    try:
-        playlist_match_prewarm_progress.clear()
-        playlist_match_prewarm_progress.update(status="running")
-
-        def _run():
-            try:
-                playlist_match_prewarm.run(playlist_match_prewarm_progress, _is_idle, has_active_spotify_radio_session)
-            finally:
-                playlist_match_prewarm_lock.release()
-
-        threading.Thread(target=_run, daemon=True).start()
-        return True
-    except Exception:
-        playlist_match_prewarm_lock.release()
-        raise
-
-@app.get("/api/playlists/match-prewarm/status", response_model=PlaylistMatchPrewarmStatus)
-async def get_playlist_match_prewarm_status():
-    return playlist_match_prewarm_progress
-
-@app.get("/api/playlists/match-prewarm/stats")
-async def get_playlist_match_prewarm_stats(db: psycopg2.extensions.connection = Depends(get_db)):
-    # Same "cumulative across restarts" reasoning as get_spotify_prewarm_stats
-    # above - playlist_match_prewarm_progress only tracks this run's own counts.
-    cur = db.cursor()
-    cur.execute("SELECT COUNT(*) FROM playlist_track_cache WHERE platform = 'ytmusic'")
-    total = cur.fetchone()[0]
-    cur.execute("SELECT COUNT(*) FROM playlist_track_cache WHERE platform = 'ytmusic' AND matched_at IS NOT NULL")
-    checked = cur.fetchone()[0]
-    cur.execute("SELECT COUNT(*) FROM playlist_track_cache WHERE platform = 'ytmusic' AND matched_spotify_uri IS NOT NULL")
-    matched = cur.fetchone()[0]
-    cur.close()
-    return {"total": total, "checked": checked, "matched": matched}
 
 def _start_ytmusic_push_job_background():
     """Kicks off the background YouTube Music push job if one isn't already
@@ -2990,39 +2717,6 @@ class RadioPlaylistItem(BaseModel):
     year: Optional[int] = None
     duration_seconds: Optional[int] = None
 
-class RadioLiveStatus(BaseModel):
-    """A direct, account-wide read of Spotify's real playback state - not
-    derived from playback_session's own tracked destination_type/
-    destination_id, which is shared with every other playback mode
-    (library casts, Discover, WiiM, Chromecast) and can point at something
-    else entirely if the user switched the app's generic destination for
-    an unrelated reason. Lets the Radio tab answer "is my session actually
-    still going" independent of whatever else the app is currently
-    tracking - confirmed live this was a real, recurring gap: switching
-    the generic destination to a Chromecast (playing nothing) made the
-    Radio tab show "paused, no device" even while this exact radio session
-    was still genuinely playing on Spotify.
-
-    reachable=False (rather than omitting live_status altogether) marks a
-    genuine fetch attempt that failed - a Spotify API rate limit, a network
-    blip, anything transient - distinct from the field being absent because
-    it never applied at all (destination isn't spotify, or the session
-    isn't 'active'). Confirmed live this distinction matters: the frontend's
-    own fallback logic (App.js), built for "no live_status *yet*, still
-    starting," was silently also catching "live_status fetch just failed"
-    the same way - showing old cached now_playing/destStatus as if it were
-    current with zero indication anything was stale. A rate-limited hour
-    displayed as a perfectly normal "On Air, Playing on Living Room" the
-    whole time."""
-    reachable: bool = True
-    is_playing: bool
-    track_name: Optional[str] = None
-    artist_name: Optional[str] = None
-    artwork_url: Optional[str] = None
-    active_device_name: Optional[str] = None
-    position_ms: Optional[int] = None
-    duration_ms: Optional[int] = None
-
 class RadioSessionInfo(BaseModel):
     id: int
     status: str  # 'active' | 'stopped'
@@ -3030,123 +2724,11 @@ class RadioSessionInfo(BaseModel):
     seed_description: Optional[str] = None
     destination_type: Optional[str] = None
     engine: str
-    # Pre-generated playlist support - see generate_radio_playlist.
+    # Pre-generated playlist support - see push_radio_playlist_to_ytmusic/
+    # reorder_radio_playlist/remove_radio_playlist_item.
     generation_status: str = 'ready'  # 'generating' | 'ready' | 'error'
     target_length: Optional[int] = None
     playlist: List[RadioPlaylistItem] = []
-    live_status: Optional[RadioLiveStatus] = None
-
-# How many tracks generate_radio_batch_track_first is asked for per call
-# while building a full pre-generated playlist - small enough that one
-# call's own internal work stays quick and progress can be checked/persisted
-# often, large enough that reaching a few hundred net-new tracks doesn't need
-# an excessive number of round trips through the whole tiered-generation
-# machinery. Reaching a genuinely large target_length (500+) can still mean
-# 10+ of these calls and 100+ underlying Last.fm requests - fine for a
-# background thread, not something to do inside the /generate request itself.
-RADIO_GENERATE_BATCH_SIZE = 40
-# Hard ceiling regardless of what the UI sends - a pathological input
-# shouldn't be able to turn one /generate call into an unbounded background
-# job.
-RADIO_GENERATE_MAX_LENGTH = 1000
-
-def _run_radio_generation(session_id, seed_artists, seed_track_name, seed_artist_name, target_length, include_library_tracks=True):
-    """Background job (see generate_radio_playlist) - builds the session's
-    full playlist upfront by repeatedly calling
-    radio_engine.generate_radio_batch_track_first, the same incremental
-    generator /api/radio/{id}/more and playback_advancer's refill already
-    use, just looped here until target_length is reached instead of once per
-    request/tick. Every batch's tracks are tagged with a stable item_id
-    (append_radio_playlist_items) and appended to radio_session.playlist, and
-    the generator's own persisted state (track_frontier/discovery_state/
-    seen_track_keys) is saved after every batch so a later low-playlist
-    refill (playback_advancer._advance_spotify) picks up exactly where this
-    left off rather than restarting the walk.
-
-    Runs on its own connection (get_db_connection directly, not the
-    request-scoped Depends(get_db)) since this outlives the HTTP request that
-    kicked it off."""
-    conn = get_db_connection()
-    if conn is None:
-        set_radio_session_generation_status(session_id, 'error')
-        return
-    try:
-        session = {
-            'seed_artists': seed_artists, 'seed_track_name': seed_track_name,
-            'seed_artist_name': seed_artist_name, 'track_frontier': [], 'discovery_state': {},
-            'include_library_tracks': include_library_tracks,
-        }
-        seed_key = radio_engine.radio_track_key(seed_track_name, seed_artist_name) if seed_track_name and seed_artist_name else None
-        seen_keys = [seed_key] if seed_key else []
-        total = 0
-        while total < target_length:
-            batch_count = min(RADIO_GENERATE_BATCH_SIZE, target_length - total)
-            track_dicts, track_frontier, discovery_state, _degraded = radio_engine.generate_radio_batch_track_first(
-                session, seen_keys, batch_count, conn,
-            )
-            if not track_dicts:
-                # Genuine exhaustion within one call - track_frontier and the
-                # deferred pool are both dry, same signal /more's own
-                # `exhausted` flag uses. Nothing more to generate right now;
-                # the session still works with fewer than target_length
-                # tracks, and playback_advancer's own refill will try again
-                # once actual playback catches up.
-                break
-            for t in track_dicts:
-                t['source'] = 'in_library' if ('id' in t or 'spotify_uri' in t) else 'unresolved'
-            append_radio_playlist_items(session_id, track_dicts)
-            new_keys = [radio_engine.radio_track_key(t['track_name'], t['artist_name']) for t in track_dicts]
-            seen_keys.extend(new_keys)
-            append_seen_track_keys(session_id, new_keys)
-            set_radio_session_track_state(session_id, track_frontier, discovery_state)
-            session['track_frontier'] = track_frontier
-            session['discovery_state'] = discovery_state
-            total += len(track_dicts)
-        set_radio_session_generation_status(session_id, 'ready')
-    except Exception as e:
-        print(f"Radio playlist generation failed for session {session_id}: {e}")
-        set_radio_session_generation_status(session_id, 'error')
-    finally:
-        conn.close()
-
-@app.post("/api/radio/generate", response_model=RadioSessionInfo)
-def generate_radio_playlist(params: RadioGenerateRequest):
-    """Kicks off the new pre-generated-playlist flow (spotify+discovery
-    only - other seed/destination combos keep using /api/radio/start's
-    immediate-start behavior, unchanged). Returns as soon as the session row
-    exists, with generation_status='generating' - the frontend polls
-    GET /api/radio/{id} until it flips to 'ready' (or 'error') and renders
-    the resulting playlist before anything plays; see
-    /api/radio/{id}/play for the explicit "start playback" step."""
-    if not lastfm.is_configured():
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Last.fm not configured - set LASTFM_API_KEY")
-    if not params.seed_artists:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No seed artists to start radio from")
-
-    target_length = max(1, min(params.target_length or 500, RADIO_GENERATE_MAX_LENGTH))
-    seed_description = params.seed_description or f"Radio from {', '.join(params.seed_artists[:3])}"
-    seed_key = (
-        radio_engine.radio_track_key(params.seed_track_name, params.seed_artist_name)
-        if params.seed_track_name and params.seed_artist_name else None
-    )
-
-    include_library_tracks = params.include_library_tracks if params.include_library_tracks is not None else True
-    session_id = create_radio_session(
-        seed_type=params.seed_type, seed_description=seed_description, seed_artists=params.seed_artists,
-        destination_type='spotify', seen_track_keys=[seed_key] if seed_key else [], engine='discovery',
-        seed_track_name=params.seed_track_name, seed_artist_name=params.seed_artist_name,
-        target_length=target_length, generation_status='generating', include_library_tracks=include_library_tracks,
-    )
-    if session_id is None:
-        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Could not start a radio session")
-
-    threading.Thread(
-        target=_run_radio_generation,
-        args=(session_id, params.seed_artists, params.seed_track_name, params.seed_artist_name, target_length, include_library_tracks),
-        daemon=True,
-    ).start()
-
-    return get_radio_session(session_id)
 
 class RadioPushYtmusicRequest(BaseModel):
     # Which playlist items to push, by their stable item_id (same identity
@@ -3198,56 +2780,26 @@ def start_radio(params: RadioStartRequest, db: psycopg2.extensions.connection = 
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Last.fm not configured - set LASTFM_API_KEY")
     if not params.seed_artists:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No seed artists to start radio from")
-    if params.destination_type not in ('browser', 'spotify', 'ytmusic'):
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="destination_type must be 'browser', 'spotify', or 'ytmusic'")
+    if params.destination_type not in ('browser', 'ytmusic'):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="destination_type must be 'browser' or 'ytmusic'")
     engine = params.engine or 'discovery'
-    if engine not in ('discovery', 'spotify_native'):
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="engine must be 'discovery' or 'spotify_native'")
-    if engine == 'spotify_native' and params.destination_type != 'spotify':
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="spotify_native only applies to the spotify destination")
+    if engine != 'discovery':
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="engine must be 'discovery'")
 
     seed_description = params.seed_description or f"Radio from {', '.join(params.seed_artists[:3])}"
     has_seed_track = bool(params.seed_track_name and params.seed_artist_name)
     seed_key = radio_engine.radio_track_key(params.seed_track_name, params.seed_artist_name) if has_seed_track else None
 
-    # spotify_native seeds Spotify's own account-level autoplay with a single
-    # track and leaves it entirely alone from there - it never needs a batch
-    # of its own candidates at all (no Last.fm call, no generate_radio_batch_track_first),
-    # unlike 'discovery' which drives every track itself.
-    if engine == 'spotify_native':
-        session_id = create_radio_session(
-            seed_type=params.seed_type, seed_description=seed_description, seed_artists=params.seed_artists,
-            destination_type=params.destination_type, seen_track_keys=[seed_key] if seed_key else [], engine=engine,
-        )
-        if session_id is None:
-            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Could not start a radio session")
-        return {"session_id": session_id, "tracks": [], "degraded": False}
-
     # Excludes the seed track itself from the generated batch (via the
     # initial seen-keys arg) so it's never immediately re-suggested right
     # after playing - the frontend plays it separately, first, using the
-    # richer object it already has (a real local file, a cached Spotify
-    # match, or a native playlist track) rather than this plain
-    # track_name/artist_name reconstruction.
+    # richer object it already has (a real local file or a native playlist
+    # track) rather than this plain track_name/artist_name reconstruction.
     initial_seen = [seed_key] if seed_key else []
     degraded = False
     track_frontier = []
     discovery_state = {}
-    if params.destination_type == 'spotify':
-        # No session row exists yet to read persisted track_frontier/
-        # discovery_state from - a bare in-memory stand-in with just the
-        # seed info is enough for generate_radio_batch_track_first to
-        # bootstrap its own frontier from scratch (see
-        # radio_engine._bootstrap_track_frontier).
-        pending_session = {
-            'seed_artists': params.seed_artists, 'seed_track_name': params.seed_track_name,
-            'seed_artist_name': params.seed_artist_name, 'track_frontier': [], 'discovery_state': {},
-        }
-        track_dicts, track_frontier, discovery_state, degraded = radio_engine.generate_radio_batch_track_first(
-            pending_session, initial_seen, 15, db,
-        )
-    else:
-        track_dicts = radio_engine.generate_fresh_radio_tracks(params.seed_artists, params.destination_type, initial_seen, 15, db)
+    track_dicts = radio_engine.generate_fresh_radio_tracks(params.seed_artists, params.destination_type, initial_seen, 15, db)
     seen_keys = [radio_engine.radio_track_key(t['track_name'], t['artist_name']) for t in track_dicts]
     if seed_key:
         seen_keys.append(seed_key)
@@ -3297,15 +2849,9 @@ def get_more_radio_tracks(session_id: int, params: RadioMoreRequest, db: psycopg
 
     count = max(1, min(params.count or 10, 30))
     degraded = False
-    if session['destination_type'] == 'spotify':
-        track_dicts, track_frontier, discovery_state, degraded = radio_engine.generate_radio_batch_track_first(
-            session, session['seen_track_keys'] or [], count, db,
-        )
-        set_radio_session_track_state(session_id, track_frontier, discovery_state)
-    else:
-        track_dicts = radio_engine.generate_fresh_radio_tracks(
-            session['seed_artists'], session['destination_type'], session['seen_track_keys'] or [], count, db,
-        )
+    track_dicts = radio_engine.generate_fresh_radio_tracks(
+        session['seed_artists'], session['destination_type'], session['seen_track_keys'] or [], count, db,
+    )
     if track_dicts:
         append_seen_track_keys(session_id, [radio_engine.radio_track_key(t['track_name'], t['artist_name']) for t in track_dicts])
 
@@ -3316,164 +2862,6 @@ def get_more_radio_tracks(session_id: int, params: RadioMoreRequest, db: psycopg
         return {"tracks": [], "exhausted": len(track_dicts) == 0}
 
     return {"tracks": [Track(**t) for t in track_dicts], "exhausted": len(track_dicts) == 0, "degraded": degraded}
-
-class RadioPlayRequest(BaseModel):
-    device_id: str
-
-@app.post("/api/radio/{session_id}/play", response_model=RadioSessionInfo)
-def play_radio_session(session_id: int, params: RadioPlayRequest):
-    """The explicit "start playback" step (spec point 4) - separate from
-    /api/radio/generate on purpose, so a generated playlist can be reviewed/
-    reordered/deleted before anything actually plays. Only for a session
-    built by /api/radio/generate (spotify+discovery, generation_status
-    already 'ready')."""
-    session = get_radio_session(session_id)
-    if session is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No radio session with that id")
-    if session['destination_type'] != 'spotify' or session['engine'] != 'discovery':
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Only spotify+discovery radio sessions support /play")
-    if session['generation_status'] != 'ready':
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Playlist is not ready yet (status: {session['generation_status']})")
-    playlist = session['playlist'] or []
-    if not playlist:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Generated playlist is empty")
-
-    # Spec point 1: clear, then actually verify it's clear - today's
-    # pre-start clear (frontend, handleStartRadio) fires clear_queue_for_device
-    # and moves on with no readback at all. clear_queue_for_device_verified
-    # is a genuine multi-attempt retry (see its own docstring), not just one
-    # extra hardcoded pass.
-    _drained, fully_cleared = spotify_connect.clear_queue_for_device_verified(params.device_id)
-    if not fully_cleared:
-        print(f"radio play {session_id}: queue still not empty on {params.device_id} after {spotify_connect.CLEAR_QUEUE_VERIFY_MAX_ATTEMPTS} clear attempts - starting anyway")
-
-    # Same bounded-miss tolerance _advance_spotify_radio_playlist's own
-    # refill loop already uses (SPOTIFY_MATCH_CONSECUTIVE_CAP) - confirmed
-    # live that trying only playlist[0] and giving up entirely left every
-    # retry doomed forever: a similarity search can easily surface a track
-    # that doesn't actually exist on Spotify under that title/artist (here,
-    # playlist[0] was a clean no_match, not a rate limit), and since nothing
-    # ever popped that dead entry off the front, "Please try again" just hit
-    # the exact same track and failed the exact same way every time.
-    first_item = None
-    match_result = None
-    skipped = 0
-    while playlist and skipped < playback_advancer.SPOTIFY_MATCH_CONSECUTIVE_CAP:
-        candidate = playlist[0]
-        result = playback_advancer.resolve_playlist_item(candidate)
-        playlist = playlist[1:]
-        if result.get('reason') == 'unavailable':
-            # Rate-limited - stop entirely rather than burning through the
-            # rest of the list on further doomed searches (same rule the
-            # refill loop follows), and don't consume this one since it was
-            # never actually attempted against a real search.
-            playlist = [candidate] + playlist
-            break
-        if result.get('matched'):
-            first_item = candidate
-            match_result = result
-            break
-        skipped += 1
-    if match_result is None:
-        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Could not find a playable track to start the playlist with")
-
-    play_result = spotify_connect.play_uris(params.device_id, [match_result['uri']])
-    if play_result == 'superseded':
-        # A newer play()/play_uris() call for this device already won - see
-        # play_uris' own docstring. Not an error; just don't clobber
-        # whatever that newer call already set.
-        return get_radio_session(session_id)
-    if play_result is not True:
-        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Could not start playback on that device")
-
-    now_playing = {
-        'id': match_result['uri'], 'uri': match_result['uri'], 'source': 'spotify', 'context_uri': None,
-        'track_name': first_item['track_name'], 'artist_name': first_item['artist_name'],
-        'album_name': first_item.get('album_name'), 'artwork_url': match_result.get('artwork_url'),
-        'radio_session_id': session_id,
-        'selection_reason': first_item.get('selection_reason'), 'selection_engine': first_item.get('selection_engine'),
-        'match': first_item.get('match'),
-    }
-    if first_item.get('id') is not None:
-        now_playing['local_id'] = first_item['id']
-    if first_item.get('radio_track_id') is not None:
-        now_playing['radio_track_id'] = first_item['radio_track_id']
-
-    # Persists whatever's left of the playlist - `playlist` was already
-    # advanced past both the matched item and any unmatched ones skipped
-    # ahead of it in the loop above, so this is not just "pop position 0"
-    # anymore. _advance_spotify's retargeted refill loop (playback_advancer.py)
-    # picks up from here on its very next tick, walking the remainder to
-    # (re)fill the lookahead queue back up to depth 2.
-    set_radio_session_playlist(session_id, playlist)
-    save_playback_session(
-        destination_type='spotify', destination_id=params.device_id,
-        now_playing=now_playing, queue=[], spotify_match_pool={'radio_session_id': session_id},
-    )
-    return get_radio_session(session_id)
-
-class RadioSwitchDeviceRequest(BaseModel):
-    device_id: str
-
-@app.post("/api/radio/{session_id}/switch-device", response_model=RadioSessionInfo)
-def switch_radio_device(session_id: int, params: RadioSwitchDeviceRequest):
-    """Moves an already-*playing* radio session to a different Spotify
-    Connect device, continuing from whatever's currently playing rather than
-    restarting from the top of the playlist - unlike /play (which always
-    pops playlist[0], the "start a brand new session" case), this reuses the
-    existing now_playing/queue as-is and just re-targets which device they
-    play on.
-
-    A previous approach let the frontend's own generic "cast to device on
-    change" effect handle this by blindly re-sending [now_playing, ...queue]
-    - that effect has no concept of radio_session.playlist at all, and
-    racing it against this session's own reconciliation
-    (playback_advancer._reconcile_radio_queue) corrupted the queue and left
-    a device stuck - confirmed live. That effect now skips entirely for an
-    active radio session (see App.js), and this route is the replacement:
-    same clear-then-verify tooling /play uses, then plays the *current*
-    track (not the playlist's next one) and re-establishes the same
-    already-committed lookahead queue on the new device."""
-    session = get_radio_session(session_id)
-    if session is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No radio session with that id")
-    if session['destination_type'] != 'spotify' or session['engine'] != 'discovery':
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Only spotify+discovery radio sessions support switching devices")
-    if session['status'] != 'active':
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="This radio session has been stopped")
-
-    playback = get_playback_session() or {}
-    now_playing = playback.get('now_playing')
-    if not now_playing or now_playing.get('radio_session_id') != session_id:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="This radio session isn't the one currently playing")
-
-    # Same clear-then-verify as /play.
-    _drained, fully_cleared = spotify_connect.clear_queue_for_device_verified(params.device_id)
-    if not fully_cleared:
-        print(f"radio switch-device {session_id}: queue still not empty on {params.device_id} after {spotify_connect.CLEAR_QUEUE_VERIFY_MAX_ATTEMPTS} clear attempts - switching anyway")
-
-    play_result = spotify_connect.play_uris(params.device_id, [now_playing['uri']])
-    if play_result == 'superseded':
-        return get_radio_session(session_id)
-    if play_result is not True:
-        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Could not start playback on that device")
-
-    # The already-committed lookahead (up to 2 tracks, already resolved to
-    # real Spotify URIs) is meaningless on the *old* device now - re-add it
-    # to the new one so Up Next doesn't sit empty until the advancer's next
-    # refill tick happens to top it back up.
-    committed_queue = playback.get('queue') or []
-    for item in committed_queue:
-        if item.get('uri'):
-            spotify_connect.add_to_queue(params.device_id, item['uri'])
-
-    save_playback_session(
-        destination_type='spotify', destination_id=params.device_id,
-        now_playing=now_playing, queue=committed_queue,
-        shuffle_enabled=playback.get('shuffle_enabled', False), spotify_match_pool=playback.get('spotify_match_pool'),
-        chromecast_pushed_count=playback.get('chromecast_pushed_count'), last_status=playback.get('last_status'),
-    )
-    return get_radio_session(session_id)
 
 @app.get("/api/radio/active-generated")
 def get_active_generated_radio_session():
@@ -3500,32 +2888,6 @@ def get_radio_session_route(session_id: int):
     session = get_radio_session(session_id)
     if session is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No radio session with that id")
-    if session['destination_type'] == 'spotify' and session['status'] == 'active':
-        # device_id is unused inside get_status (GET /me/player has always
-        # been account-wide) - this is a direct read of reality, not routed
-        # through playback_session's own tracked destination at all, so it
-        # stays correct even if the generic destination has been switched
-        # to something else entirely (see RadioLiveStatus's own docstring).
-        live = spotify_connect.get_status(None)
-        if live and live.get('reachable'):
-            session['live_status'] = {
-                'reachable': True,
-                'is_playing': live.get('status') == 'play',
-                'track_name': live.get('title'),
-                'artist_name': live.get('artist'),
-                'artwork_url': live.get('artwork_url'),
-                'active_device_name': live.get('active_device_name'),
-                'position_ms': live.get('position_ms'),
-                'duration_ms': live.get('duration_ms'),
-            }
-        else:
-            # Distinct from "live_status not present at all" (this branch's
-            # own guard not matching - non-spotify or non-active session,
-            # where it genuinely doesn't apply) - this is a real attempt
-            # that failed (rate limit, network blip). See RadioLiveStatus's
-            # own docstring for why the frontend needs this told apart from
-            # silence.
-            session['live_status'] = {'reachable': False, 'is_playing': False}
     return session
 
 class RadioQueueItemRequest(BaseModel):
@@ -3533,14 +2895,10 @@ class RadioQueueItemRequest(BaseModel):
 
 def _reorder_or_remove_committed(session_id, item_id, committed_queue, playback, remove):
     """Shared by /reorder and /remove for the case where item_id is already
-    committed (add_to_queue'd) - present in the singleton playback_session
-    row's own queue, not radio_session.playlist. Returns True if it handled
-    (and persisted) the request, False if item_id wasn't found there (so the
-    caller falls through to check playlist instead). Either way, touching a
-    committed item means Spotify's real device queue no longer necessarily
-    matches - flags reconciliation (spec point 9) rather than fixing it
-    inline here, same edge-triggered check _advance_spotify_radio_playlist
-    already runs each tick."""
+    committed - present in the singleton playback_session row's own queue,
+    not radio_session.playlist. Returns True if it handled (and persisted)
+    the request, False if item_id wasn't found there (so the caller falls
+    through to check playlist instead)."""
     for i, entry in enumerate(committed_queue):
         if entry.get('item_id') != item_id:
             continue
@@ -3556,7 +2914,6 @@ def _reorder_or_remove_committed(session_id, item_id, committed_queue, playback,
             shuffle_enabled=playback.get('shuffle_enabled', False), spotify_match_pool=playback.get('spotify_match_pool'),
             chromecast_pushed_count=playback.get('chromecast_pushed_count'), last_status=playback.get('last_status'),
         )
-        playback_advancer.flag_radio_reconcile(session_id)
         return True
     return False
 
@@ -3613,50 +2970,4 @@ def stop_radio(session_id: int):
     if session is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No radio session with that id")
     stop_radio_session(session_id)
-    if session['destination_type'] == 'spotify':
-        playback = get_playback_session() or {}
-        now_playing = playback.get('now_playing') or {}
-        if now_playing.get('radio_session_id') == session_id and playback.get('destination_id'):
-            # Actually pauses the device, not just stops feeding it new
-            # tracks - confirmed live this matters now: the pre-generated-
-            # playlist flow always keeps a couple of tracks already
-            # add_to_queue'd ahead of time on the real device, so letting
-            # the current track "just finish naturally" (the old behavior)
-            # rolled straight into that leftover committed queue and kept
-            # playing indefinitely - Stop looked like it did nothing at all.
-            # pause() also records this app's own play/pause intent
-            # (spotify_connect._desired_state) as 'pause', so
-            # playback_advancer's auto-resume health check won't silently
-            # undo this a few seconds later. use_active_device=True - the
-            # goal here is "silence whatever's actually making noise", not
-            # necessarily whichever device this app last tracked, which can
-            # have drifted to a different (or merely mirrored) active device
-            # outside this app's control.
-            spotify_connect.pause(playback['destination_id'], use_active_device=True)
-            # Confirmed live: pausing alone leaves whatever this session had
-            # already add_to_queue'd (this app's own committed lookahead,
-            # plus any older undrained residue) sitting in Spotify's real
-            # queue - harmless while genuinely paused, but it resurfaces the
-            # moment the device is later resumed or skipped, either manually
-            # or by a future session's own passive reconciliation mistaking
-            # it for its own.
-            #
-            # Deliberately targets playback['destination_id'] - the device
-            # this radio session was actually using - NOT a fresh live
-            # active-device lookup the way pause() above does. Confirmed
-            # live this distinction matters: clear_queue_for_device_verified
-            # transfers control to its target device and then repeatedly
-            # calls next() on it, which is a far more invasive operation than
-            # pause() (silence whatever's making noise). Reading "whichever
-            # device Spotify currently considers active" at clear-time
-            # grabbed an unrelated, dormant device that merely happened to
-            # be the account's active pointer at that moment, forced a
-            # transfer onto it, and - combined with that device's own
-            # already-documented flakiness (see _maybe_auto_resume) - woke
-            # it into actually playing old unrelated residue out loud,
-            # instead of draining anything relevant to this session at all.
-            # Matches the existing precedent in /play and /switch-device
-            # below, both of which clear an explicit caller-tracked
-            # device_id, never a live-active lookup.
-            spotify_connect.clear_queue_for_device_verified(playback['destination_id'])
     return {"status": "stopped"}

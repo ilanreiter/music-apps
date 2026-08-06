@@ -408,13 +408,9 @@ def create_tables():
             print("Table 'spotify_quota_estimate' checked/created successfully.")
 
             # A manual, explicit "stop consuming search budget" switch for
-            # the background prewarm jobs (spotify_prewarm.py,
-            # playlist_match_prewarm.py) - separate from and in addition to
-            # their existing is_radio_active/is_idle gating, for whenever
-            # those aren't enough on their own (e.g. no radio session is
-            # actually 'active' server-side, so they're correctly - by their
-            # own existing rules - running full-tilt, but the user still
-            # wants a hard stop right now).
+            # the background spotify_prewarm.py job - separate from and in
+            # addition to its existing is_idle gating, for whenever that
+            # isn't enough on its own.
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS background_job_control (
                     id INTEGER PRIMARY KEY DEFAULT 1,
@@ -422,23 +418,6 @@ def create_tables():
                 );
             """)
             print("Table 'background_job_control' checked/created successfully.")
-
-            # One reused playlist backing spotify_native radio (see
-            # spotify_connect.ensure_radio_seed_playlist) - confirmed live
-            # Spotify's own Autoplay only continues once a real *context*
-            # (playlist/album/artist) finishes, never for a bare ad-hoc
-            # track URI, even with Autoplay turned on. A single-track
-            # playlist is the smallest context that satisfies that - its one
-            # track gets replaced every time a new native session starts,
-            # rather than creating a fresh playlist per session and
-            # littering the account.
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS spotify_radio_seed_playlist (
-                    id INTEGER PRIMARY KEY DEFAULT 1,
-                    playlist_id TEXT
-                );
-            """)
-            print("Table 'spotify_radio_seed_playlist' checked/created successfully.")
 
             # General-purpose cache for any (track_name, artist_name) text
             # search against Spotify's catalog - independent of known_tracks,
@@ -568,13 +547,12 @@ def create_tables():
             # columns just stay NULL on platform='ytmusic' rows.
             #
             # matched_spotify_uri/matched_at are ytmusic-only: a pre-resolved
-            # Spotify catalog match for this YouTube Music track, found by
-            # playlist_match_prewarm.py running the same search_track
-            # pipeline the live per-click match already used, just once in
-            # the background instead of on every play click. matched_at
-            # tracks whether a match attempt has even been made yet (NULL
-            # means "not tried" - distinct from "tried, no match found",
-            # which leaves matched_spotify_uri NULL but sets matched_at).
+            # Spotify catalog match for this YouTube Music track, found via
+            # the same search_track pipeline the live per-click match (Push
+            # to Playlist / discover-match) uses. matched_at tracks whether a
+            # match attempt has even been made yet (NULL means "not tried" -
+            # distinct from "tried, no match found", which leaves
+            # matched_spotify_uri NULL but sets matched_at).
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS playlist_track_cache (
                     platform TEXT NOT NULL,
@@ -1555,11 +1533,7 @@ def create_radio_session(seed_type, seed_description, seed_artists, destination_
     session is ever really "the" current one at a time, same as
     playback_session's single-row model. Without this, a session the user
     never explicitly stopped (closed the tab, navigated away mid-playback)
-    stays 'active' forever, and has_active_spotify_radio_session (used to
-    pause spotify_prewarm/playlist_match_prewarm) would see it and think
-    Radio is still running long after it genuinely isn't - confirmed live
-    this session: over a dozen abandoned test sessions kept both prewarm
-    jobs paused indefinitely."""
+    stays 'active' forever."""
     conn = None
     try:
         conn = get_db_connection()
@@ -1855,52 +1829,6 @@ def stop_radio_session(session_id):
         cur.close()
     except Error as e:
         print(f"Error stopping radio session {session_id}: {e}")
-    finally:
-        if conn:
-            conn.close()
-
-
-def has_active_spotify_radio_session():
-    """True while any radio_session is actively driving a Spotify Connect
-    destination - used to pause spotify_prewarm/playlist_match_prewarm (see
-    their is_radio_active param) so a long-running background sweep doesn't
-    compete with the user's own foreground listening for the same rate-
-    limited search budget."""
-    conn = None
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute("SELECT 1 FROM radio_session WHERE status = 'active' AND destination_type = 'spotify' LIMIT 1")
-        exists = cur.fetchone() is not None
-        cur.close()
-        return exists
-    except Error as e:
-        print(f"Error checking for an active Spotify radio session: {e}")
-        return False
-    finally:
-        if conn:
-            conn.close()
-
-
-def get_active_spotify_radio_session_summary():
-    """Like has_active_spotify_radio_session above but returns enough of the
-    row (id, engine) to actually act on - playback_advancer's autonomous
-    reclaim (see _maybe_reclaim_orphaned_spotify_radio) needs to know *which*
-    session to re-tag now_playing with and *which* engine's match_pool shape
-    to rebuild, not just that some session exists."""
-    conn = None
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute("SELECT id, engine FROM radio_session WHERE status = 'active' AND destination_type = 'spotify' LIMIT 1")
-        row = cur.fetchone()
-        cur.close()
-        if not row:
-            return None
-        return {'id': row[0], 'engine': row[1]}
-    except Error as e:
-        print(f"Error reading the active Spotify radio session summary: {e}")
-        return None
     finally:
         if conn:
             conn.close()
@@ -2204,49 +2132,9 @@ def set_spotify_search_blocked_until(blocked_until):
             conn.close()
 
 
-def get_spotify_radio_seed_playlist_id():
-    """The reused Spotify playlist id backing spotify_native radio (see
-    spotify_connect.ensure_radio_seed_playlist), or None if it's never been
-    created yet."""
-    conn = None
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute("SELECT playlist_id FROM spotify_radio_seed_playlist WHERE id = 1")
-        row = cur.fetchone()
-        cur.close()
-        return row[0] if row else None
-    except Error as e:
-        print(f"Error reading the Spotify Radio seed playlist id: {e}")
-        return None
-    finally:
-        if conn:
-            conn.close()
-
-
-def set_spotify_radio_seed_playlist_id(playlist_id):
-    conn = None
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute("""
-            INSERT INTO spotify_radio_seed_playlist (id, playlist_id)
-            VALUES (1, %s)
-            ON CONFLICT (id) DO UPDATE SET playlist_id = EXCLUDED.playlist_id
-        """, (playlist_id,))
-        conn.commit()
-        cur.close()
-    except Error as e:
-        print(f"Error setting the Spotify Radio seed playlist id: {e}")
-    finally:
-        if conn:
-            conn.close()
-
-
 def is_prewarm_paused():
-    """The manual override checked by spotify_prewarm.py and
-    playlist_match_prewarm.py alongside their existing is_radio_active/
-    is_idle gating - see background_job_control's own comment."""
+    """The manual override checked by spotify_prewarm.py alongside its
+    existing is_idle gating - see background_job_control's own comment."""
     conn = None
     try:
         conn = get_db_connection()
@@ -2478,8 +2366,8 @@ def replace_playlist_track_cache(platform, tracks, skipped_count):
     """Upserts every track's metadata for this platform, then drops any
     previously-cached row no longer present (removed from every playlist
     since the last refresh). Deliberately an upsert, not a delete-then-insert
-    - matched_spotify_uri/matched_at (playlist_match_prewarm's work) are not
-    touched here, so re-running Refresh never throws away a resolved match
+    - matched_spotify_uri/matched_at (a resolved cross-platform match) are
+    not touched here, so re-running Refresh never throws away a resolved match
     for a track that's still around. tracks is a list of dicts with keys
     track_id/track_name/artist_name/album/artwork_url/isrc/duration_ms/
     popularity/explicit/release_date/genre (missing/None is fine for any of
@@ -2546,7 +2434,7 @@ def get_playlist_track_cache(platform):
     """Returns {'tracks': [...], 'skipped_count': int, 'refreshed_at': iso str}
     for this platform ('spotify'/'ytmusic'), or None if nothing's cached yet.
     Each track dict includes matched_spotify_uri/matched_at (both None until
-    playlist_match_prewarm reaches that row, ytmusic-only)."""
+    a cross-platform match is resolved for that row, ytmusic-only)."""
     conn = None
     try:
         conn = get_db_connection()
@@ -2586,31 +2474,8 @@ def get_playlist_track_cache(platform):
             conn.close()
 
 
-def get_unmatched_ytmusic_tracks(limit=1):
-    """Rows playlist_match_prewarm hasn't attempted a Spotify match for yet -
-    matched_at IS NULL distinguishes "not tried" from "tried, no match"."""
-    conn = None
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT track_id, track_name, artist_name FROM playlist_track_cache
-            WHERE platform = 'ytmusic' AND matched_at IS NULL
-            LIMIT %s
-        """, (limit,))
-        rows = cur.fetchall()
-        cur.close()
-        return [{'track_id': r[0], 'track_name': r[1], 'artist_name': r[2]} for r in rows]
-    except Error as e:
-        print(f"Error reading unmatched ytmusic tracks: {e}")
-        return []
-    finally:
-        if conn:
-            conn.close()
-
-
 def set_track_match(track_id, matched_spotify_uri):
-    """Writes back playlist_match_prewarm's result for one ytmusic track -
+    """Writes back a resolved Spotify match for one ytmusic track -
     matched_spotify_uri is None on a genuine "no match found", which still
     sets matched_at so this row isn't retried forever."""
     conn = None
@@ -2700,9 +2565,8 @@ def backfill_known_track_ids(known_track_id, spotify_track_id=None, ytmusic_vide
 def backfill_ytmusic_cache_match(video_id, spotify_uri):
     """Same write as set_track_match, under a name that makes sense at its
     other call sites (the discover-match route, _match_track_to_spotify) -
-    those resolve a YT<->Spotify match via a different path than
-    playlist_match_prewarm itself, but playlist_track_cache should stay in
-    sync regardless of which code path found it."""
+    playlist_track_cache should stay in sync regardless of which code path
+    resolved the match."""
     set_track_match(video_id, spotify_uri)
 
 
@@ -2736,15 +2600,14 @@ def bulk_backfill_local_track_ids(platform):
 
 def bulk_backfill_cross_platform_matches(platform):
     """Populates cross-service availability in bulk right after every
-    refresh, backing the Playlists tab's availability badges - rather than
-    only ever relying on playlist_match_prewarm's slow paced background
-    resolution for a real, already-knowable answer.
+    refresh, backing the Playlists tab's availability badges, for a real,
+    already-knowable answer instead of waiting on a live per-click match.
 
     platform='ytmusic': a known_tracks-bridge quick win for
-    matched_spotify_uri - COALESCE means this never overwrites what the
-    paced prewarm job already found, it just gets there sooner for tracks
-    the local library already resolved. The prewarm job still handles
-    everything this bridge doesn't catch.
+    matched_spotify_uri - COALESCE means this never overwrites an
+    already-resolved match, it just gets there sooner for tracks the local
+    library already resolved. Anything this bridge doesn't catch is left for
+    a live discover-match lookup instead.
 
     platform='spotify': matched_ytmusic_video_id has no dedicated background
     job of its own - it's populated entirely as a byproduct here, via (1)
