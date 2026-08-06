@@ -5,7 +5,6 @@ import os
 import re
 import secrets
 import subprocess
-import threading
 import time
 from datetime import datetime, timedelta
 from urllib.parse import quote
@@ -714,23 +713,6 @@ def _search_and_score(track_name, artist_name):
     }
     database.set_cached_spotify_search(cache_key, True, match)
     return 'ok', match
-
-
-def search_track_direct(track_name, artist_name):
-    """Single Spotify /search call, no YouTube Music/Shazam bridging -
-    unlike search_track below, which exists specifically to rescue a
-    *local library file*'s own tag (which can be garbled, placeholder-only,
-    or an English transliteration of a native-script original), a Radio
-    candidate's track_name/artist_name comes straight from Last.fm's own
-    catalog data - already clean, canonical text with nothing for a bridge
-    to plausibly fix. Confirmed live this was a real cost, not theoretical:
-    a single miss (Spotify's own direct search finding nothing) fell through
-    to the YouTube Music bridge and searched *again* with whatever it
-    returned - two real /search calls logged for one candidate that still
-    never became a playable track either way. Same ('ok'|'unavailable',
-    match_or_None) shape _search_and_score already returns; only playback_advancer.py's
-    _match_text_candidate calls this today."""
-    return _search_and_score(track_name, artist_name)
 
 
 # Unauthenticated instance - search-only usage needs no login. Cheap to

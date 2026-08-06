@@ -13,13 +13,11 @@ from .database import (
     list_pending_ytmusic_push_jobs, delete_ytmusic_push_job,
     get_playlist_track_cache, replace_playlist_track_cache,
     find_known_track_external_match, backfill_known_track_ids, backfill_ytmusic_cache_match,
-    create_radio_session, get_radio_session, append_seen_track_keys, set_radio_session_track_state,
-    set_radio_session_generation_status, append_radio_playlist_items, set_radio_session_playlist,
+    create_radio_session, get_radio_session, append_seen_track_keys,
     set_radio_session_ytmusic_job, stop_radio_session, append_tracks_to_ytmusic_push_job,
     count_searches_since_last_reset, get_spotify_quota_state,
     set_track_matcher_paused, is_track_matcher_paused, upsert_radio_discovered_track,
     get_radio_cooldown_days, set_radio_cooldown_days, get_radio_tuning, set_radio_tuning,
-    get_active_generated_radio_session_id,
 )
 from .library_scanner import run_scan
 from .artwork import get_or_create_thumbnail, check_artwork_presence, cache_key_for, normalize_album_name, normalized_album_sql, save_thumbnail
@@ -191,7 +189,6 @@ async def track_activity(request, call_next):
     routine_poll_paths = {
         "/api/playback-session",
         "/api/wiim/devices",
-        "/api/spotify/devices",
         "/api/chromecast/devices",
         "/api/library/groups",
         "/api/spotify/search-budget",
@@ -234,31 +231,6 @@ class Track(BaseModel):
     # use them if ever populated, but they're currently always None.
     native_track_name: Optional[str] = None
     native_artist_name: Optional[str] = None
-    # Populated only for a radio_engine.generate_radio_batch_track_first
-    # candidate - id above already carries a known_tracks id for a library
-    # cache hit, but a radio_discovered_tracks cache hit (a track not in the
-    # library) has no known_tracks id to put there at all, so it needs its
-    # own pre-resolved spotify_uri/radio_track_id instead. Without these on
-    # this model, RadioStartResponse/RadioMoreResponse's List[Track]
-    # serialization silently dropped both - confirmed live this meant the
-    # seed-track-fallback and ytmusic-push paths (the only consumers of
-    # these routes' HTTP response, as opposed to playback_advancer's
-    # background refill, which reads radio_engine's raw dicts directly and
-    # was never affected) always needed a live search even for an already-
-    # cached discovered track, undermining the same "use cached ids to cut
-    # search rate" goal everywhere else in Radio already follows.
-    spotify_uri: Optional[str] = None
-    radio_track_id: Optional[int] = None
-    # Why this specific candidate was suggested (e.g. "Discovered - similar
-    # track") and which mechanism produced it ("Last.fm", "App logic") -
-    # see radio_engine.generate_radio_batch_track_first's own
-    # selection_reason/selection_engine tagging. Also needed here for the
-    # same reason as spotify_uri/radio_track_id above - without a declared
-    # field, it was silently dropped before reaching the frontend, so the
-    # seed-track-fallback and ytmusic-push paths' plays showed the Play
-    # Log's generic default reason instead of the real one.
-    selection_reason: Optional[str] = None
-    selection_engine: Optional[str] = None
 
 class DiscoveryHistoryEntry(BaseModel):
     id: Optional[int] = None
@@ -2683,47 +2655,6 @@ class RadioMoreResponse(BaseModel):
     # See RadioStartResponse.degraded.
     degraded: bool = False
 
-class RadioPlaylistItem(BaseModel):
-    """One row of a pre-generated radio_session.playlist - a text-level
-    Last.fm candidate, possibly already cache-resolved to a real Spotify
-    match (id/spotify_uri/radio_track_id set) but not yet actually searched
-    otherwise. item_id is stable identity (radio_session.next_item_id
-    counter), not array position - survives reorder/delete."""
-    item_id: int
-    track_name: str
-    artist_name: str
-    album_name: Optional[str] = None
-    selection_reason: Optional[str] = None
-    selection_engine: Optional[str] = None
-    # 'in_library' (already cache-resolved at generation time) or
-    # 'unresolved' (plain Last.fm text, no Spotify search attempted yet -
-    # deliberately not 'not_in_library', which would be a claim this hasn't
-    # earned).
-    source: Optional[str] = None
-    id: Optional[int] = None
-    spotify_uri: Optional[str] = None
-    radio_track_id: Optional[int] = None
-    artwork_url: Optional[str] = None
-    # Last.fm's own track.getSimilar score (0-1) relative to whichever
-    # already-collected track this one was actually found from (its BFS
-    # parent, not necessarily the original seed) - see
-    # lastfm.track_similar_tracks and radio_engine.generate_radio_batch_track_first.
-    match: Optional[float] = None
-    # 1 minus the compounded product of every hop's own match score along
-    # the BFS path back to the original seed - 0 at the seed itself,
-    # approaching 1 the longer/weaker the chain of hops that reached this
-    # track has been. See generate_radio_batch_track_first's own docstring.
-    drift: Optional[float] = None
-    # From the local file's own tags (known_tracks) - only ever set for a
-    # genuine library match (source='in_library' via a real known_tracks
-    # row, not a radio_discovered_tracks cache hit or a plain-text
-    # candidate, neither of which have this metadata at all). The frontend
-    # summary panel discloses how many tracks actually carry these rather
-    # than assuming full coverage.
-    genre: Optional[str] = None
-    year: Optional[int] = None
-    duration_seconds: Optional[int] = None
-
 class RadioSessionInfo(BaseModel):
     id: int
     status: str  # 'active' | 'stopped'
@@ -2731,55 +2662,6 @@ class RadioSessionInfo(BaseModel):
     seed_description: Optional[str] = None
     destination_type: Optional[str] = None
     engine: str
-    # Pre-generated playlist support - see push_radio_playlist_to_ytmusic/
-    # reorder_radio_playlist/remove_radio_playlist_item.
-    generation_status: str = 'ready'  # 'generating' | 'ready' | 'error'
-    target_length: Optional[int] = None
-    playlist: List[RadioPlaylistItem] = []
-
-class RadioPushYtmusicRequest(BaseModel):
-    # Which playlist items to push, by their stable item_id (same identity
-    # reorder/remove already use) - None/omitted pushes the whole
-    # server-side playlist; a list restricts to just those items (in the
-    # playlist's own order, not the order given here), letting the caller
-    # push only whatever a client-side facet filter currently has in view.
-    item_ids: Optional[List[int]] = None
-
-class RadioPushYtmusicResponse(BaseModel):
-    job_id: int
-
-@app.post("/api/radio/{session_id}/push-to-ytmusic", response_model=RadioPushYtmusicResponse)
-def push_radio_playlist_to_ytmusic(session_id: int, params: RadioPushYtmusicRequest = RadioPushYtmusicRequest()):
-    """Pushes a generated (spotify+discovery) session's reviewed playlist to
-    YouTube Music - the "lowest hanging fruit" version of Phase 2's real
-    "push somewhere" step, reusing ytmusic_push_job.py's already-built,
-    already-quota-paced worker wholesale rather than writing a new one for
-    Spotify first. Unlike the Spotify-cache-hit-only shortcut this was
-    weighed against, this resolves the *whole* list via a real search per
-    track (see ytmusic_push_job.run) - a track from radio_session.playlist
-    with no known_track_id is always a cache 'miss' there, by design."""
-    session = get_radio_session(session_id)
-    if session is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No radio session with that id")
-    if not session['playlist']:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Nothing to push - the playlist is empty")
-    if not ytmusic_connect.is_connected():
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="YouTube Music not connected")
-
-    playlist = session['playlist']
-    if params.item_ids is not None:
-        wanted = set(params.item_ids)
-        playlist = [t for t in playlist if t.get('item_id') in wanted]
-        if not playlist:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Nothing to push - none of those items are still on the playlist")
-
-    push_tracks = [{"track_name": t['track_name'], "artist_name": t['artist_name']} for t in playlist]
-    job_id = enqueue_ytmusic_push_job(session['seed_description'] or f"Discover session {session_id}", push_tracks)
-    if job_id is None:
-        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Could not start the YouTube Music push")
-    set_radio_session_ytmusic_job(session_id, None, job_id)
-    _start_ytmusic_push_job_background()
-    return {"job_id": job_id}
 
 @app.post("/api/radio/start", response_model=RadioStartResponse)
 def start_radio(params: RadioStartRequest, db: psycopg2.extensions.connection = Depends(get_db)):
@@ -2804,8 +2686,6 @@ def start_radio(params: RadioStartRequest, db: psycopg2.extensions.connection = 
     # track) rather than this plain track_name/artist_name reconstruction.
     initial_seen = [seed_key] if seed_key else []
     degraded = False
-    track_frontier = []
-    discovery_state = {}
     track_dicts = radio_engine.generate_fresh_radio_tracks(params.seed_artists, params.destination_type, initial_seen, 15, db)
     seen_keys = [radio_engine.radio_track_key(t['track_name'], t['artist_name']) for t in track_dicts]
     if seed_key:
@@ -2819,12 +2699,9 @@ def start_radio(params: RadioStartRequest, db: psycopg2.extensions.connection = 
         seen_track_keys=seen_keys,
         seed_track_name=params.seed_track_name,
         seed_artist_name=params.seed_artist_name,
-        track_frontier=track_frontier,
     )
     if session_id is None:
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Could not start a radio session")
-    if discovery_state:
-        set_radio_session_track_state(session_id, track_frontier, discovery_state)
 
     if params.destination_type == 'ytmusic':
         if not ytmusic_connect.is_connected():
@@ -2870,17 +2747,6 @@ def get_more_radio_tracks(session_id: int, params: RadioMoreRequest, db: psycopg
 
     return {"tracks": [Track(**t) for t in track_dicts], "exhausted": len(track_dicts) == 0, "degraded": degraded}
 
-@app.get("/api/radio/active-generated")
-def get_active_generated_radio_session():
-    """Lets the frontend restore Discover's own generatingSession state
-    after a page refresh (or a fresh tab) - see database.get_active_generated_radio_session_id's
-    own docstring for why a generated session needs a separate restore path
-    from the live-session one below (it's never tagged onto
-    playback_session.now_playing at all). {"session_id": None} rather than
-    404 when there isn't one - this is a routine "is there anything to
-    restore" check, not an error case."""
-    return {"session_id": get_active_generated_radio_session_id()}
-
 @app.get("/api/radio/{session_id}", response_model=RadioSessionInfo)
 def get_radio_session_route(session_id: int):
     """Lets the frontend confirm a radio_session_id it already has (from a
@@ -2902,10 +2768,9 @@ class RadioQueueItemRequest(BaseModel):
 
 def _reorder_or_remove_committed(session_id, item_id, committed_queue, playback, remove):
     """Shared by /reorder and /remove for the case where item_id is already
-    committed - present in the singleton playback_session row's own queue,
-    not radio_session.playlist. Returns True if it handled (and persisted)
-    the request, False if item_id wasn't found there (so the caller falls
-    through to check playlist instead)."""
+    committed - present in the singleton playback_session row's own queue.
+    Returns True if it handled (and persisted) the request, False if
+    item_id wasn't found there."""
     for i, entry in enumerate(committed_queue):
         if entry.get('item_id') != item_id:
             continue
@@ -2927,12 +2792,8 @@ def _reorder_or_remove_committed(session_id, item_id, committed_queue, playback,
 @app.post("/api/radio/{session_id}/reorder", response_model=RadioSessionInfo)
 def reorder_radio_playlist(session_id: int, params: RadioQueueItemRequest):
     """Spec point 7 - moves item_id to the front of wherever it currently
-    lives. A not-yet-committed playlist item promotes within the pending
-    list only (cheap, purely local - it becomes whatever the refill loop
-    tries next, no Spotify interaction needed). An already-committed item
-    (one of the up-to-2 already add_to_queue'd lookahead tracks) swaps
-    within that small set instead, since it's already resolved - see
-    _reorder_or_remove_committed."""
+    lives. Only ever an already-committed item (one of the up-to-2 already
+    add_to_queue'd lookahead tracks) - see _reorder_or_remove_committed."""
     session = get_radio_session(session_id)
     if session is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No radio session with that id")
@@ -2941,21 +2802,14 @@ def reorder_radio_playlist(session_id: int, params: RadioQueueItemRequest):
     if _reorder_or_remove_committed(session_id, params.item_id, playback.get('queue') or [], playback, remove=False):
         return get_radio_session(session_id)
 
-    playlist = list(session.get('playlist') or [])
-    for i, item in enumerate(playlist):
-        if item.get('item_id') == params.item_id:
-            if i > 0:
-                set_radio_session_playlist(session_id, [playlist[i]] + playlist[:i] + playlist[i + 1:])
-            return get_radio_session(session_id)
-
     raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No playlist item with that id")
 
 @app.post("/api/radio/{session_id}/remove", response_model=RadioSessionInfo)
 def remove_radio_playlist_item(session_id: int, params: RadioQueueItemRequest):
-    """Spec point 8. Same split as reorder - a committed item needs the
-    singleton playback_session.queue touched (and reconciliation flagged)
-    since Spotify's real device was already told to queue it; a pending
-    playlist item is a pure local splice."""
+    """Spec point 8. A committed item needs the singleton
+    playback_session.queue touched (and reconciliation flagged) since
+    Spotify's real device was already told to queue it - see
+    _reorder_or_remove_committed."""
     session = get_radio_session(session_id)
     if session is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No radio session with that id")
@@ -2964,12 +2818,7 @@ def remove_radio_playlist_item(session_id: int, params: RadioQueueItemRequest):
     if _reorder_or_remove_committed(session_id, params.item_id, playback.get('queue') or [], playback, remove=True):
         return get_radio_session(session_id)
 
-    playlist = session.get('playlist') or []
-    new_playlist = [item for item in playlist if item.get('item_id') != params.item_id]
-    if len(new_playlist) == len(playlist):
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No playlist item with that id")
-    set_radio_session_playlist(session_id, new_playlist)
-    return get_radio_session(session_id)
+    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No playlist item with that id")
 
 @app.post("/api/radio/{session_id}/stop")
 def stop_radio(session_id: int):
