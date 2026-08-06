@@ -2313,19 +2313,13 @@ function App() {
   const RADIO_PLAYLIST_ARTIST_LIMIT = 8;
 
   // Pulled out of startRadioFromPlaylist below so RadioTab's own picker can
-  // build the seed object and hand it to startGeneratedRadio directly (the
-  // spotify+discovery reviewable-playlist flow) instead of always going
-  // through handleStartRadio's old live-start path - the same distinction
+  // build the seed object directly instead of always going through
+  // handleStartRadio's old live-start path - the same distinction
   // startFromTrack/startFromArtist already make, just closing the gap for
   // the playlist seed type too. Throws on failure - callers decide how to
   // surface it (startRadioFromPlaylist below catches it; RadioTab's
   // startFromPlaylist does its own try/catch around this too).
-  // generated: true when this seed is headed into the generate-then-review
-  // flow (Spotify) rather than a genuinely continuous radio session (This
-  // Browser/YouTube Music, or spotify_native) - changes only the built
-  // description text, "Radio from X" being actively wrong for a one-time
-  // reviewable playlist that never starts playing anything on its own.
-  const resolveRadioSeedFromPlaylist = async (platform, playlistId, playlistName, engine = 'discovery', generated = false) => {
+  const resolveRadioSeedFromPlaylist = async (platform, playlistId, playlistName, engine = 'discovery') => {
     const endpoint = platform === 'spotify'
       ? `${API_BASE_URL}/spotify/playlists/${playlistId}/tracks`
       : `${API_BASE_URL}/ytmusic/playlists/${playlistId}/tracks`;
@@ -2352,7 +2346,7 @@ function App() {
     const seedTrack = tracks.length > 0
       ? (platform === 'spotify' ? mapSpotifyTrack(tracks[0], playlistName) : mapYtMusicTrack(tracks[0], playlistName))
       : null;
-    return { type: 'playlist', description: `${generated ? 'Discover from' : 'Radio from'} ${playlistName}`, seedArtists: artists, seedTrack, engine };
+    return { type: 'playlist', description: `Radio from ${playlistName}`, seedArtists: artists, seedTrack, engine };
   };
 
   const startRadioFromPlaylist = async (platform, playlistId, playlistName, engine = 'discovery') => {
@@ -2484,12 +2478,12 @@ function App() {
       togglePlay();
       return;
     }
-    // Discover suggestions have no local file and no known_tracks row. With
-    // a Spotify Connect destination selected, match+play (+queue the rest of
-    // the list) in full; with This Browser selected, fall back to a 30s
-    // preview the same way, so Next/Prev still walk through the list. WiiM/
-    // Chromecast can't do either (previews only ever play through this
-    // browser's own <audio> element, by design - see sampleQueueDiscoveredTracks).
+    // Discover suggestions have no local file and no known_tracks row - with
+    // This Browser selected, play a 30s preview so Next/Prev still walk
+    // through the list. Any other destination (WiiM/Chromecast) can't play a
+    // preview at all (previews only ever play through this browser's own
+    // <audio> element, by design - see sampleQueueDiscoveredTracks), so it's
+    // just a hint to switch back.
     if (track.source === 'discover') {
       const startIndex = list.findIndex((t) => t.id === track.id);
       const candidates = startIndex >= 0 ? list.slice(startIndex) : [track];
@@ -2500,10 +2494,8 @@ function App() {
       }
       return;
     }
-    // YouTube Music playlist tracks: with a Spotify Connect destination,
-    // match+play (+queue the rest) on Spotify, same pipeline Discover uses.
-    // Any other destination: if this exact video also turned out to be a
-    // local file (local_id, via the known_tracks cross-reference - see
+    // YouTube Music playlist tracks: if this exact video also turned out to
+    // be a local file (local_id, via the known_tracks cross-reference - see
     // mapYtMusicTrack), stream it there directly (This Browser, WiiM, or
     // Chromecast - all three can stream a local file the same way), no
     // different from a genuine local-library track. Otherwise, with This
@@ -3775,8 +3767,6 @@ function App() {
           <RadioTab
             apiBase={API_BASE_URL}
             outputDevice={outputDevice}
-            setOutputDevice={setOutputDevice}
-            outputDevices={outputDevices}
             ytMusicConnected={ytMusicConnected}
             radioDestination={radioDestination}
             setRadioDestination={setRadioDestination}
@@ -3957,9 +3947,9 @@ function SettingsPanel({
   // Local state updates live while dragging a slider for instant feedback;
   // the actual save only fires on release (onMouseUp/onTouchEnd/onKeyUp -
   // range inputs' onChange fires continuously during a drag, which would
-  // otherwise mean one POST per pixel moved) - keyed the same way
-  // clearQueueResult etc. above are, one shared object rather than 4
-  // separate useState calls since these always load/save together.
+  // otherwise mean one POST per pixel moved) - one shared object rather
+  // than several separate useState calls since these always load/save
+  // together.
   const [radioTuning, setRadioTuning] = useState(null);
   const [radioTuningSaved, setRadioTuningSaved] = useState(false);
 

@@ -25,18 +25,12 @@ BATCH_SIZE = 5
 IDLE_POLL_INTERVAL_SECONDS = 30
 
 
-def run(get_connection, progress, is_idle, is_radio_active=lambda: False):
+def run(get_connection, progress, is_idle):
     """Slowly works through known_tracks where spotify_checked IS NOT TRUE,
     one row every PREWARM_INTERVAL_SECONDS, only while the app is idle (no
     recent requests - see main.py's activity-tracking middleware) and
     Spotify is connected. Runs in a background thread (started once at app
     startup if there's work to do) until the whole library is checked.
-
-    Also pauses for as long as is_radio_active() is true (a Spotify-
-    destination Radio session is running) - Radio and this job share the
-    same rate-limited search budget, and a listening session should never
-    have to compete with a background sweep for it (see
-    database.has_active_spotify_radio_session).
 
     Never marks a row checked on an 'unavailable' (rate-limited) result -
     same rule the interactive match endpoints already follow - so a track
@@ -48,14 +42,10 @@ def run(get_connection, progress, is_idle, is_radio_active=lambda: False):
     while True:
         if database.is_track_matcher_paused():
             # A manual, explicit override - checked first, ahead of the
-            # is_radio_active/is_idle gating below, since this exists
-            # specifically for whenever those two aren't reason enough on
-            # their own to stop consuming search budget right now.
+            # is_idle gating below, since this exists specifically for
+            # whenever that isn't reason enough on its own to stop
+            # consuming search budget right now.
             progress['status'] = 'paused_manually'
-            time.sleep(IDLE_POLL_INTERVAL_SECONDS)
-            continue
-        if is_radio_active():
-            progress['status'] = 'waiting_radio_active'
             time.sleep(IDLE_POLL_INTERVAL_SECONDS)
             continue
         if not is_idle():

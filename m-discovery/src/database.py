@@ -245,18 +245,12 @@ def create_tables():
                     updated_at TIMESTAMP DEFAULT NOW()
                 );
             """)
-            # Exact count of real Spotify account-queue adds (spotify_connect
-            # .add_to_queue) not yet accounted for by a drain - see
-            # clear_queue's own comment for why: GET /me/player/queue's
-            # reported length has its own quirks (confirmed live it can
-            # misreport), and the previous flat 20-item drain cap could
-            # leave real residue behind after a long-running session queued
-            # more than that over its lifetime, which then resurfaces later
-            # under a *new* session's own tracking. This is exact (we're the
-            # only thing ever calling add_to_queue for this app's own
-            # ad-hoc sessions), so clear_queue can drain precisely this many
-            # instead of guessing.
-            cur.execute("ALTER TABLE playback_session ADD COLUMN IF NOT EXISTS pending_queue_adds INTEGER NOT NULL DEFAULT 0;")
+            # pending_queue_adds used to count real Spotify account-queue adds
+            # (spotify_connect.add_to_queue) not yet accounted for by a drain -
+            # dropped along with Spotify Connect as a playback destination
+            # (add_to_queue/clear_queue no longer exist, so nothing ever
+            # incremented this again).
+            cur.execute("ALTER TABLE playback_session DROP COLUMN IF EXISTS pending_queue_adds;")
             print("Table 'playback_session' checked/created successfully.")
 
             # One row per running Radio session (track/artist/playlist-seeded
@@ -294,57 +288,28 @@ def create_tables():
             # tracks after it, at near-zero ongoing /search cost since
             # nothing past the seed goes through this app's own matching.
             cur.execute("ALTER TABLE radio_session ADD COLUMN IF NOT EXISTS engine TEXT NOT NULL DEFAULT 'discovery';")
-            # Track-first 'discovery' engine state (radio_engine.generate_radio_batch_track_first) -
-            # seed_track_name/seed_artist_name is the literal seed track (when
-            # one exists) that track_frontier bootstraps from. track_frontier
-            # is the persisted BFS queue of {artist_name, track_name, depth}
-            # dicts still awaiting a track.getSimilar call - has to survive
-            # across /more calls and playback_advancer refill ticks the same
-            # way seen_track_keys already does, or every call would restart
-            # the walk from the seed instead of continuing it.
-            # discovery_state is the drift-BFS's own reserve state -
-            # {'deferred': [...], 'max_drift': float} (see
-            # radio_engine.generate_radio_batch_track_first) - candidates
-            # found but not yet admitted because they drifted further from
-            # the seed than the search radius has grown to need yet. Column
-            # predates the drift-BFS rewrite (used to hold a tiered
-            # artist-fallback generator's fallback_expanded_artists list) -
-            # dropped and re-added rather than migrated in place, since that
-            # generator's own state had no meaningful mapping to this one.
-            # include_library_tracks - when False, generate_radio_batch_track_first
+            # include_library_tracks - when False, generate_fresh_radio_tracks
             # drops any candidate that matches a known_tracks row (a genuine
-            # local-library match, not a radio_discovered_tracks cache hit)
-            # from what it returns - lets Discover be pointed at "only stuff
-            # I don't already have" without touching how the walk itself
-            # explores (a library track's own neighbors are still explored
-            # exactly as before, it just isn't surfaced as a result itself).
+            # local-library match) from what it returns - lets Discover be
+            # pointed at "only stuff I don't already have" without touching
+            # how the search itself explores.
             cur.execute("ALTER TABLE radio_session ADD COLUMN IF NOT EXISTS include_library_tracks BOOLEAN NOT NULL DEFAULT TRUE;")
             cur.execute("ALTER TABLE radio_session ADD COLUMN IF NOT EXISTS seed_track_name TEXT;")
             cur.execute("ALTER TABLE radio_session ADD COLUMN IF NOT EXISTS seed_artist_name TEXT;")
-            cur.execute("ALTER TABLE radio_session ADD COLUMN IF NOT EXISTS track_frontier JSONB DEFAULT '[]'::jsonb;")
             cur.execute("ALTER TABLE radio_session DROP COLUMN IF EXISTS fallback_expanded_artists;")
-            cur.execute("ALTER TABLE radio_session ADD COLUMN IF NOT EXISTS discovery_state JSONB DEFAULT '{}'::jsonb;")
-            # Pre-generated, editable playlist support (the whole point being
-            # to generate a full ordered list *before* anything plays, so it
-            # can be reviewed/reordered/deleted, rather than discovering it a
-            # couple tracks at a time as the old model did). playlist is the
-            # ordered list of NOT-YET-PLAYED items, each carrying a stable
-            # item_id (from next_item_id, a per-session counter - identity,
-            # not array position, so reorder/delete-by-id survives reordering
-            # rather than racing a plain index). generation_status lets the
-            # frontend poll a background-generated playlist without blocking
-            # the request that kicked it off.
-            cur.execute("ALTER TABLE radio_session ADD COLUMN IF NOT EXISTS target_length INTEGER DEFAULT 500;")
-            cur.execute("ALTER TABLE radio_session ADD COLUMN IF NOT EXISTS playlist JSONB DEFAULT '[]'::jsonb;")
-            cur.execute("ALTER TABLE radio_session ADD COLUMN IF NOT EXISTS generation_status TEXT DEFAULT 'ready';")
-            cur.execute("ALTER TABLE radio_session ADD COLUMN IF NOT EXISTS next_item_id INTEGER DEFAULT 0;")
-            # A crash mid-generation would otherwise leave generation_status
-            # stuck at 'generating' forever - nothing else would ever set it,
-            # and the frontend's poll would spin indefinitely with no
-            # timeout. Anything still 'generating' at boot definitely isn't
-            # (the thread that was generating it is gone), so it's a genuine
-            # failure, not an in-progress job to wait on.
-            cur.execute("UPDATE radio_session SET generation_status = 'error' WHERE generation_status = 'generating';")
+            # track_frontier/discovery_state backed the old track-first
+            # drift-BFS generator (radio_engine.generate_radio_batch_track_first)
+            # and target_length/playlist/generation_status/next_item_id backed
+            # the pre-generated-playlist review flow built on top of it - both
+            # only ever existed to feed the Spotify-native radio flow, removed
+            # along with Spotify Connect as a playback destination. Dropped
+            # rather than left write-only now that nothing reads them.
+            cur.execute("ALTER TABLE radio_session DROP COLUMN IF EXISTS track_frontier;")
+            cur.execute("ALTER TABLE radio_session DROP COLUMN IF EXISTS discovery_state;")
+            cur.execute("ALTER TABLE radio_session DROP COLUMN IF EXISTS target_length;")
+            cur.execute("ALTER TABLE radio_session DROP COLUMN IF EXISTS playlist;")
+            cur.execute("ALTER TABLE radio_session DROP COLUMN IF EXISTS generation_status;")
+            cur.execute("ALTER TABLE radio_session DROP COLUMN IF EXISTS next_item_id;")
             print("Table 'radio_session' checked/created successfully.")
 
             # One row per real (non-short-circuited) Spotify /search call -
@@ -1310,87 +1275,6 @@ def update_chromecast_pushed_count(count):
             conn.close()
 
 
-def increment_pending_queue_adds():
-    """Bumps the exact count of real Spotify account-queue adds not yet
-    accounted for by a drain - called right after spotify_connect.add_to_queue
-    actually succeeds. See playback_session.pending_queue_adds' own comment
-    for why this exists (clear_queue used to only guess, via a flat cap and
-    Spotify's own not-fully-reliable queue-length report)."""
-    conn = None
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute("UPDATE playback_session SET pending_queue_adds = pending_queue_adds + 1 WHERE id = 1")
-        conn.commit()
-        cur.close()
-    except Error as e:
-        print(f"Error incrementing pending_queue_adds: {e}")
-    finally:
-        if conn:
-            conn.close()
-
-
-def take_pending_queue_adds():
-    """Reads the current pending_queue_adds count and resets it to 0 in the
-    same transaction - called at the start of a fresh drain (see
-    spotify_connect.clear_queue), so whatever a *new* session's own
-    add_to_queue calls add during/after that drain starts counting fresh
-    rather than being folded into what the drain was already accounting
-    for. Returns 0 on any error, same as "nothing tracked" - clear_queue
-    still has its own flat floor/API-reported-length fallback either way.
-
-    Resetting to 0 unconditionally here is deliberate and still correct -
-    see restore_pending_queue_adds, which clear_queue calls afterward with
-    whatever this batch didn't actually manage to drain (bounded by
-    CLEAR_QUEUE_SAFETY_CAP, or cut short by a superseding call). Without
-    that follow-up call, a backlog bigger than one bounded pass could reach
-    used to just vanish from tracking the moment this function ran, even
-    though it was still genuinely sitting in Spotify's real queue - the next
-    drain attempt (a new session, or a retry) started blind at 0 with no
-    memory a backlog was still owed."""
-    conn = None
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute("SELECT pending_queue_adds FROM playback_session WHERE id = 1")
-        row = cur.fetchone()
-        cur.execute("UPDATE playback_session SET pending_queue_adds = 0 WHERE id = 1")
-        conn.commit()
-        cur.close()
-        return row[0] if row else 0
-    except Error as e:
-        print(f"Error reading/resetting pending_queue_adds: {e}")
-        return 0
-    finally:
-        if conn:
-            conn.close()
-
-
-def restore_pending_queue_adds(count):
-    """Adds count back onto pending_queue_adds (increment, not overwrite) -
-    called by clear_queue with whatever a drain didn't actually manage to
-    skip past. Increments rather than sets, since take_pending_queue_adds
-    already reset the live counter to 0 right as this drain started - any
-    add_to_queue calls that happened concurrently during the drain (a
-    different session/tick topping up its own lookahead) have already been
-    counted fresh into that counter by the time this runs, and should be
-    added to, not clobbered by, whatever this drain still owes."""
-    if count <= 0:
-        return
-    conn = None
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute("UPDATE playback_session SET pending_queue_adds = pending_queue_adds + %s WHERE id = 1", (count,))
-        conn.commit()
-        cur.close()
-    except Error as e:
-        print(f"Error restoring pending_queue_adds: {e}")
-    finally:
-        if conn:
-            conn.close()
-
-
 def get_cached_spotify_search(track_key):
     """A previously-cached (track_name, artist_name) text search result, or
     None if never searched before - see spotify_search_cache's own comment.
@@ -1533,18 +1417,15 @@ RADIO_SEEN_TRACK_KEYS_CAP = 500
 
 
 def create_radio_session(seed_type, seed_description, seed_artists, destination_type, seen_track_keys, engine='discovery',
-                          seed_track_name=None, seed_artist_name=None, track_frontier=None,
-                          target_length=None, generation_status='ready', include_library_tracks=True):
+                          seed_track_name=None, seed_artist_name=None, include_library_tracks=True):
     """Starts a new radio_session row. seen_track_keys is the caller's
     already-lowercased list of "track|||artist" keys for the first batch of
     tracks it just generated, so a subsequent /more call's dedup starts from
     a non-empty set rather than repeating the very first batch.
 
-    seed_track_name/seed_artist_name/track_frontier are the track-first
-    engine's own persisted state (see radio_engine.generate_radio_batch_track_first) -
-    None/empty for a spotify_native session or one with no literal seed
-    track, in which case the generator bootstraps its own starting track on
-    the first call that needs one.
+    seed_track_name/seed_artist_name are the literal seed track (when one
+    exists) - None for a session with no specific track picked, just a seed
+    artist/artists.
 
     Retires every other still-'active' session first, in the same
     transaction - this is a personal single-user tool, so only one radio
@@ -1559,12 +1440,12 @@ def create_radio_session(seed_type, seed_description, seed_artists, destination_
         cur.execute("UPDATE radio_session SET status = 'stopped', updated_at = NOW() WHERE status = 'active'")
         cur.execute("""
             INSERT INTO radio_session (seed_type, seed_description, seed_artists, seen_track_keys, destination_type, engine, status,
-                                        seed_track_name, seed_artist_name, track_frontier, target_length, generation_status, include_library_tracks)
-            VALUES (%s, %s, %s, %s, %s, %s, 'active', %s, %s, %s, %s, %s, %s)
+                                        seed_track_name, seed_artist_name, include_library_tracks)
+            VALUES (%s, %s, %s, %s, %s, %s, 'active', %s, %s, %s)
             RETURNING id
         """, (
             seed_type, seed_description, Json(seed_artists), Json(seen_track_keys[-RADIO_SEEN_TRACK_KEYS_CAP:]), destination_type, engine,
-            seed_track_name, seed_artist_name, Json(track_frontier or []), target_length, generation_status, include_library_tracks,
+            seed_track_name, seed_artist_name, include_library_tracks,
         ))
         session_id = cur.fetchone()[0]
         conn.commit()
@@ -1586,8 +1467,7 @@ def get_radio_session(session_id):
         cur.execute("""
             SELECT id, seed_type, seed_description, seed_artists, seen_track_keys, destination_type,
                    ytmusic_playlist_id, ytmusic_push_job_id, status, engine,
-                   seed_track_name, seed_artist_name, track_frontier, discovery_state,
-                   target_length, playlist, generation_status, next_item_id, include_library_tracks
+                   seed_track_name, seed_artist_name, include_library_tracks
             FROM radio_session WHERE id = %s
         """, (session_id,))
         row = cur.fetchone()
@@ -1598,45 +1478,10 @@ def get_radio_session(session_id):
             'id': row[0], 'seed_type': row[1], 'seed_description': row[2], 'seed_artists': row[3],
             'seen_track_keys': row[4], 'destination_type': row[5], 'ytmusic_playlist_id': row[6],
             'ytmusic_push_job_id': row[7], 'status': row[8], 'engine': row[9],
-            'seed_track_name': row[10], 'seed_artist_name': row[11],
-            'track_frontier': row[12] or [], 'discovery_state': row[13] or {},
-            'target_length': row[14], 'playlist': row[15] or [], 'generation_status': row[16],
-            'next_item_id': row[17] or 0, 'include_library_tracks': row[18],
+            'seed_track_name': row[10], 'seed_artist_name': row[11], 'include_library_tracks': row[12],
         }
     except Error as e:
         print(f"Error reading radio session {session_id}: {e}")
-        return None
-    finally:
-        if conn:
-            conn.close()
-
-
-def get_active_generated_radio_session_id():
-    """The one radio_session (if any) a page refresh should restore into
-    Discover's own generatingSession state - a spotify+discovery session
-    still 'active' (create_radio_session retires every other session the
-    instant a new one starts, so at most one row ever qualifies) whose
-    generation is underway or already finished, waiting to be reviewed.
-    Unlike a *live* session (spotify_native/browser/ytmusic), a generated
-    one is never tagged onto playback_session.now_playing at all - nothing
-    plays until a future push step - so it has no other restore path.
-    Confirmed live this mattered: a completed generation looked identical
-    to "lost forever" after a refresh with nothing pointing back to it."""
-    conn = None
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT id FROM radio_session
-            WHERE status = 'active' AND destination_type = 'spotify' AND engine = 'discovery'
-                AND generation_status IN ('generating', 'ready')
-            LIMIT 1
-        """)
-        row = cur.fetchone()
-        cur.close()
-        return row[0] if row else None
-    except Error as e:
-        print(f"Error finding the active generated radio session: {e}")
         return None
     finally:
         if conn:
@@ -1668,152 +1513,6 @@ def append_seen_track_keys(session_id, new_keys):
         cur.close()
     except Error as e:
         print(f"Error appending seen track keys for radio session {session_id}: {e}")
-    finally:
-        if conn:
-            conn.close()
-
-
-def set_radio_session_track_state(session_id, track_frontier, discovery_state):
-    """Overwrite (not merge) - unlike seen_track_keys, both of these are
-    whole-state snapshots the generator recomputes in full on every call
-    (radio_engine.generate_radio_batch_track_first pops from/pushes onto its
-    own in-memory copy of track_frontier during a single call, and this just
-    persists wherever it ended up), not accumulating sets. discovery_state
-    is {'deferred': [...], 'max_drift': float} - see
-    generate_radio_batch_track_first's own docstring."""
-    conn = None
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute(
-            "UPDATE radio_session SET track_frontier = %s, discovery_state = %s, updated_at = NOW() WHERE id = %s",
-            (Json(track_frontier), Json(discovery_state), session_id),
-        )
-        conn.commit()
-        cur.close()
-    except Error as e:
-        print(f"Error saving track-first state for radio session {session_id}: {e}")
-    finally:
-        if conn:
-            conn.close()
-
-
-def set_radio_session_generation_status(session_id, generation_status):
-    conn = None
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute(
-            "UPDATE radio_session SET generation_status = %s, updated_at = NOW() WHERE id = %s",
-            (generation_status, session_id),
-        )
-        conn.commit()
-        cur.close()
-    except Error as e:
-        print(f"Error setting generation status for radio session {session_id}: {e}")
-    finally:
-        if conn:
-            conn.close()
-
-
-def append_radio_playlist_items(session_id, items):
-    """Assigns each item a stable item_id (from the session's own
-    next_item_id counter) and appends it to the session's playlist -
-    identity, not array position, so a later reorder/remove-by-id survives
-    the list being reordered or partially consumed in between. Read-merge-
-    write, same lost-write race tolerance as append_seen_track_keys (no
-    locking) - acceptable here since this is only ever called by the single
-    background generation thread or the single advancer thread for a given
-    session, never concurrently with itself.
-
-    Returns the items with their assigned item_id, so the caller (the
-    generation background job) can use them without a second read."""
-    conn = None
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute("SELECT playlist, next_item_id FROM radio_session WHERE id = %s", (session_id,))
-        row = cur.fetchone()
-        if not row:
-            cur.close()
-            return []
-        existing_playlist = row[0] or []
-        next_id = row[1] or 0
-        tagged = []
-        for item in items:
-            tagged_item = dict(item)
-            tagged_item['item_id'] = next_id
-            next_id += 1
-            tagged.append(tagged_item)
-        cur.execute(
-            "UPDATE radio_session SET playlist = %s, next_item_id = %s, updated_at = NOW() WHERE id = %s",
-            (Json(existing_playlist + tagged), next_id, session_id),
-        )
-        conn.commit()
-        cur.close()
-        return tagged
-    except Error as e:
-        print(f"Error appending playlist items for radio session {session_id}: {e}")
-        return []
-    finally:
-        if conn:
-            conn.close()
-
-
-def assign_radio_playlist_item_ids(session_id, items):
-    """Tags items with fresh stable item_ids and advances next_item_id -
-    unlike append_radio_playlist_items, does NOT touch the playlist column
-    at all. Needed by playback_advancer's consumption tick specifically:
-    that tick trims its own in-memory copy of playlist as it goes (popping
-    matched/discarded items) *in the same tick* it might also extend the
-    list, so a read-modify-write against the DB's playlist column here would
-    race against - and undo - that in-memory trimming. The caller merges
-    these tagged items into its own already-correct in-memory list and
-    persists the whole thing once via set_radio_session_playlist."""
-    conn = None
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute("SELECT next_item_id FROM radio_session WHERE id = %s", (session_id,))
-        row = cur.fetchone()
-        if not row:
-            cur.close()
-            return []
-        next_id = row[0] or 0
-        tagged = []
-        for item in items:
-            tagged_item = dict(item)
-            tagged_item['item_id'] = next_id
-            next_id += 1
-            tagged.append(tagged_item)
-        cur.execute("UPDATE radio_session SET next_item_id = %s WHERE id = %s", (next_id, session_id))
-        conn.commit()
-        cur.close()
-        return tagged
-    except Error as e:
-        print(f"Error assigning playlist item ids for radio session {session_id}: {e}")
-        return []
-    finally:
-        if conn:
-            conn.close()
-
-
-def set_radio_session_playlist(session_id, playlist):
-    """Overwrite (not merge) - callers (the advancer's consumption loop,
-    reorder/remove routes) always compute the full resulting list themselves
-    first, same idiom as set_radio_session_track_state."""
-    conn = None
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute(
-            "UPDATE radio_session SET playlist = %s, updated_at = NOW() WHERE id = %s",
-            (Json(playlist), session_id),
-        )
-        conn.commit()
-        cur.close()
-    except Error as e:
-        print(f"Error saving playlist for radio session {session_id}: {e}")
     finally:
         if conn:
             conn.close()
