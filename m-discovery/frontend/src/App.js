@@ -63,7 +63,7 @@ function mapYtMusicTrack(t, playlistName = null) {
     // Only ever present on a track pulled from the Playlists tab's "All
     // Tracks" cache (see fetchAllPlaylistTracksFlat) - undefined for a
     // drilled-into-one-playlist track, which comes straight from the live
-    // per-playlist endpoint and was never run through playlist_match_prewarm.
+    // per-playlist endpoint and never had a Spotify match resolved for it.
     // Backs the "available on Spotify" badge (see renderTrackCard).
     matched_spotify_uri: t.matched_spotify_uri,
     // Set when this same video also exists as a local file (see
@@ -2978,7 +2978,7 @@ function App() {
   };
 
   // Same idea as pushLibraryToSpotifyPlaylist, but for YouTube Music - unlike
-  // Spotify, there's no prewarmed match cache for YT Music, so a small push
+  // Spotify, there's no track-matcher cache for YT Music, so a small push
   // (<= YTMUSIC_LIBRARY_PUSH_LIMIT) is matched live and completes immediately,
   // same as before. A larger push can't fit in one request's worth of quota,
   // so the backend instead starts a paced multi-day background job and
@@ -3875,7 +3875,7 @@ function channelLabel(channels) {
   return `${channels}ch`;
 }
 
-function YtMusicSettingsSection({ ytMusicConnected, apiBase, onConnected, onDisconnect, matchPrewarmStatus }) {
+function YtMusicSettingsSection({ ytMusicConnected, apiBase, onConnected, onDisconnect }) {
   const [pairing, setPairing] = useState(null); // { verification_url, user_code } while a device-code login is in progress
   const [error, setError] = useState(null);
   const pollRef = useRef(null);
@@ -3920,21 +3920,6 @@ function YtMusicSettingsSection({ ytMusicConnected, apiBase, onConnected, onDisc
     return (
       <>
         <p className="hint">Connected. Discover playlists can be pushed to YouTube Music above.</p>
-        {matchPrewarmStatus && matchPrewarmStatus.status !== 'idle' && (
-          <p className="hint">
-            Resolving Spotify matches for YouTube Music playlist tracks (All Tracks mode): {matchPrewarmStatus.status === 'done'
-              ? `done — ${(matchPrewarmStatus.matched || 0).toLocaleString()} matched of ${(matchPrewarmStatus.processed || 0).toLocaleString()} checked`
-              : matchPrewarmStatus.status === 'waiting_active_use'
-                ? 'paused while the app is in use'
-                : matchPrewarmStatus.status === 'waiting_radio_active'
-                  ? 'paused while Radio is playing on Spotify'
-                  : matchPrewarmStatus.status === 'waiting_not_connected'
-                    ? 'paused (Spotify not connected)'
-                    : matchPrewarmStatus.status === 'error'
-                      ? `error: ${matchPrewarmStatus.error}`
-                      : `running — ${(matchPrewarmStatus.matched || 0).toLocaleString()} matched of ${(matchPrewarmStatus.processed || 0).toLocaleString()} checked so far`}
-          </p>
-        )}
         <button type="button" className="scan-btn" onClick={onDisconnect}>Disconnect YouTube Music</button>
       </>
     );
@@ -3965,8 +3950,7 @@ function SettingsPanel({
   onClose, rootPath, setRootPath, scanning, scanResult, scanError, onScan, outputDevices, apiBase,
   spotifyConnected, onSpotifyDisconnect, ytMusicConnected, onYtMusicConnected, onYtMusicDisconnect,
 }) {
-  const [prewarmStatus, setPrewarmStatus] = useState(null);
-  const [matchPrewarmStatus, setMatchPrewarmStatus] = useState(null);
+  const [trackMatcherStatus, setTrackMatcherStatus] = useState(null);
   // Radio playlist tuning - the user-adjustable versions of lastfm.py's own
   // MIN_TRACK_MATCH_SCORE/MIN_ARTIST_MATCH_SCORE/TRACK_SIMILAR_LIMIT/
   // SIMILAR_ARTISTS_PER_SEED constants (see database.get_radio_tuning).
@@ -3995,30 +3979,14 @@ function SettingsPanel({
     if (!spotifyConnected) return;
     let cancelled = false;
     const poll = () => {
-      axios.get(`${apiBase}/spotify/prewarm/status`).then((response) => {
-        if (!cancelled) setPrewarmStatus(response.data);
-      }).catch((err) => console.error('Error fetching Spotify pre-warm status:', err));
+      axios.get(`${apiBase}/spotify/track-matcher/status`).then((response) => {
+        if (!cancelled) setTrackMatcherStatus(response.data);
+      }).catch((err) => console.error('Error fetching Spotify track matcher status:', err));
     };
     poll();
     const intervalId = setInterval(poll, 10000);
     return () => { cancelled = true; clearInterval(intervalId); };
   }, [spotifyConnected, apiBase]);
-
-  // Resolves a Spotify match for cached YouTube Music playlist tracks in the
-  // background (see playlist_match_prewarm.py) - only meaningful once both
-  // are connected, since it needs Spotify to match against.
-  useEffect(() => {
-    if (!spotifyConnected || !ytMusicConnected) return;
-    let cancelled = false;
-    const poll = () => {
-      axios.get(`${apiBase}/playlists/match-prewarm/status`).then((response) => {
-        if (!cancelled) setMatchPrewarmStatus(response.data);
-      }).catch((err) => console.error('Error fetching playlist match pre-warm status:', err));
-    };
-    poll();
-    const intervalId = setInterval(poll, 10000);
-    return () => { cancelled = true; clearInterval(intervalId); };
-  }, [spotifyConnected, ytMusicConnected, apiBase]);
 
   return (
     <div className="settings-overlay" onClick={onClose}>
@@ -4080,19 +4048,19 @@ function SettingsPanel({
           {spotifyConnected ? (
             <>
               <p className="hint">Connected. Playlists are available under the Playlists tab, and you can push tracks to a Spotify playlist from Library/Discover.</p>
-              {prewarmStatus && prewarmStatus.status !== 'idle' && (
+              {trackMatcherStatus && trackMatcherStatus.status !== 'idle' && (
                 <p className="hint">
-                  Pre-warming library matches: {prewarmStatus.status === 'done'
-                    ? `done — ${(prewarmStatus.matched || 0).toLocaleString()} matched of ${(prewarmStatus.processed || 0).toLocaleString()} checked`
-                    : prewarmStatus.status === 'waiting_active_use'
+                  Matching library tracks to Spotify: {trackMatcherStatus.status === 'done'
+                    ? `done — ${(trackMatcherStatus.matched || 0).toLocaleString()} matched of ${(trackMatcherStatus.processed || 0).toLocaleString()} checked`
+                    : trackMatcherStatus.status === 'waiting_active_use'
                       ? 'paused while the app is in use'
-                      : prewarmStatus.status === 'waiting_radio_active'
+                      : trackMatcherStatus.status === 'waiting_radio_active'
                         ? 'paused while Radio is playing on Spotify'
-                        : prewarmStatus.status === 'waiting_not_connected'
+                        : trackMatcherStatus.status === 'waiting_not_connected'
                           ? 'paused (not connected)'
-                          : prewarmStatus.status === 'error'
-                            ? `error: ${prewarmStatus.error}`
-                          : `running — ${(prewarmStatus.matched || 0).toLocaleString()} matched of ${(prewarmStatus.processed || 0).toLocaleString()} checked so far`}
+                          : trackMatcherStatus.status === 'error'
+                            ? `error: ${trackMatcherStatus.error}`
+                          : `running — ${(trackMatcherStatus.matched || 0).toLocaleString()} matched of ${(trackMatcherStatus.processed || 0).toLocaleString()} checked so far`}
                 </p>
               )}
               <button type="button" className="scan-btn" onClick={onSpotifyDisconnect}>Disconnect Spotify</button>
@@ -4112,7 +4080,6 @@ function SettingsPanel({
             apiBase={apiBase}
             onConnected={onYtMusicConnected}
             onDisconnect={onYtMusicDisconnect}
-            matchPrewarmStatus={matchPrewarmStatus}
           />
         </div>
 
@@ -4800,7 +4767,7 @@ function RadioTab({
   // Radio tab is open, not just during an active session, so it's visible
   // before starting one too. /api/spotify/search-budget is excluded from
   // main.py's idle-activity tracking, so this poll doesn't itself keep
-  // spotify_prewarm from ever seeing an idle window.
+  // spotify_track_matcher from ever seeing an idle window.
   useEffect(() => {
     let cancelled = false;
     const poll = () => {
@@ -5219,9 +5186,9 @@ function CleanupTab({ apiBase, activeTab, nowPlaying, isPlaying, onTrackPlayClic
   const [tagCleanupFixedTotal, setTagCleanupFixedTotal] = useState(0);
   const tagCleanupPollRef = useRef(null);
 
-  const [spotifyPrewarmStatus, setSpotifyPrewarmStatus] = useState(null);
-  const [spotifyPrewarmStats, setSpotifyPrewarmStats] = useState(null);
-  const spotifyPrewarmPollRef = useRef(null);
+  const [spotifyTrackMatcherStatus, setSpotifyTrackMatcherStatus] = useState(null);
+  const [spotifyTrackMatcherStats, setSpotifyTrackMatcherStats] = useState(null);
+  const spotifyTrackMatcherPollRef = useRef(null);
 
   const [trackIdStats, setTrackIdStats] = useState(null);
   const [trackIdTracks, setTrackIdTracks] = useState([]);
@@ -5388,40 +5355,40 @@ function CleanupTab({ apiBase, activeTab, nowPlaying, isPlaying, onTrackPlayClic
     }
   };
 
-  const fetchSpotifyPrewarmInfo = async () => {
+  const fetchSpotifyTrackMatcherInfo = async () => {
     try {
       const [statusResponse, statsResponse] = await Promise.all([
-        axios.get(`${apiBase}/spotify/prewarm/status`),
-        axios.get(`${apiBase}/spotify/prewarm/stats`),
+        axios.get(`${apiBase}/spotify/track-matcher/status`),
+        axios.get(`${apiBase}/spotify/track-matcher/stats`),
       ]);
-      setSpotifyPrewarmStatus(statusResponse.data);
-      setSpotifyPrewarmStats(statsResponse.data);
+      setSpotifyTrackMatcherStatus(statusResponse.data);
+      setSpotifyTrackMatcherStats(statsResponse.data);
     } catch (err) {
-      console.error('Error fetching Spotify pre-warm info:', err);
+      console.error('Error fetching Spotify track matcher info:', err);
     }
   };
 
-  const pollSpotifyPrewarm = () => {
-    if (spotifyPrewarmPollRef.current) clearInterval(spotifyPrewarmPollRef.current);
-    spotifyPrewarmPollRef.current = setInterval(fetchSpotifyPrewarmInfo, 5000);
+  const pollSpotifyTrackMatcher = () => {
+    if (spotifyTrackMatcherPollRef.current) clearInterval(spotifyTrackMatcherPollRef.current);
+    spotifyTrackMatcherPollRef.current = setInterval(fetchSpotifyTrackMatcherInfo, 5000);
   };
 
-  // Manual override for both spotify_prewarm.py and playlist_match_prewarm.py
-  // (they share one switch - see database.is_prewarm_paused) - separate from
-  // and in addition to their existing "only while idle, not during Radio"
-  // auto-pausing, for whenever that isn't reason enough on its own to stop
-  // consuming search budget right now. Optimistic local update so the
-  // switch flips instantly rather than waiting on the next 5s poll.
-  const togglePrewarmPaused = async () => {
-    const next = !(spotifyPrewarmStatus?.paused);
-    setSpotifyPrewarmStatus((s) => (s ? { ...s, paused: next } : s));
+  // Manual override for spotify_track_matcher.py (see
+  // database.is_track_matcher_paused) - separate from and in addition to its
+  // existing "only while idle" auto-pausing, for whenever that isn't reason
+  // enough on its own to stop consuming search budget right now. Optimistic
+  // local update so the switch flips instantly rather than waiting on the
+  // next 5s poll.
+  const toggleTrackMatcherPaused = async () => {
+    const next = !(spotifyTrackMatcherStatus?.paused);
+    setSpotifyTrackMatcherStatus((s) => (s ? { ...s, paused: next } : s));
     try {
-      await axios.post(`${apiBase}/spotify/prewarm/pause`, { paused: next });
+      await axios.post(`${apiBase}/spotify/track-matcher/pause`, { paused: next });
     } catch (err) {
       console.error('Error toggling Spotify matching pause state:', err);
-      setSpotifyPrewarmStatus((s) => (s ? { ...s, paused: !next } : s));
+      setSpotifyTrackMatcherStatus((s) => (s ? { ...s, paused: !next } : s));
     }
-    fetchSpotifyPrewarmInfo();
+    fetchSpotifyTrackMatcherInfo();
   };
 
   const fetchTrackIdTracks = async (offset) => {
@@ -5492,15 +5459,15 @@ function CleanupTab({ apiBase, activeTab, nowPlaying, isPlaying, onTrackPlayClic
       }).catch((err) => console.error('Error checking tag cleanup status:', err));
     }
     if (subTab === 'spotify-matching') {
-      fetchSpotifyPrewarmInfo();
-      pollSpotifyPrewarm();
-    } else if (spotifyPrewarmPollRef.current) {
+      fetchSpotifyTrackMatcherInfo();
+      pollSpotifyTrackMatcher();
+    } else if (spotifyTrackMatcherPollRef.current) {
       // Only worth polling while this subtab is actually visible - unlike
       // the other jobs here, the pre-warm job runs continuously in the
       // background regardless, so there's no "done" state to stop polling
       // for on its own.
-      clearInterval(spotifyPrewarmPollRef.current);
-      spotifyPrewarmPollRef.current = null;
+      clearInterval(spotifyTrackMatcherPollRef.current);
+      spotifyTrackMatcherPollRef.current = null;
     }
     if (subTab === 'track-id') {
       // Same "runs continuously regardless" shape as spotify-matching above -
@@ -5521,7 +5488,7 @@ function CleanupTab({ apiBase, activeTab, nowPlaying, isPlaying, onTrackPlayClic
     if (artworkPollRef.current) clearInterval(artworkPollRef.current);
     if (externalArtworkPollRef.current) clearInterval(externalArtworkPollRef.current);
     if (tagCleanupPollRef.current) clearInterval(tagCleanupPollRef.current);
-    if (spotifyPrewarmPollRef.current) clearInterval(spotifyPrewarmPollRef.current);
+    if (spotifyTrackMatcherPollRef.current) clearInterval(spotifyTrackMatcherPollRef.current);
     if (trackIdPollRef.current) clearInterval(trackIdPollRef.current);
   }, []);
 
@@ -5850,48 +5817,48 @@ function CleanupTab({ apiBase, activeTab, nowPlaying, isPlaying, onTrackPlayClic
             override for whenever you want it stopped regardless. See the "Available on Spotify"
             filter in the Library tab to browse what's matched so far.
           </p>
-          <div className="prewarm-pause-row">
-            <span className="prewarm-pause-label">
-              Spotify matching {spotifyPrewarmStatus?.paused ? 'paused' : 'active'}
+          <div className="track-matcher-pause-row">
+            <span className="track-matcher-pause-label">
+              Spotify matching {spotifyTrackMatcherStatus?.paused ? 'paused' : 'active'}
             </span>
             <button
               type="button"
               role="switch"
-              aria-checked={!spotifyPrewarmStatus?.paused}
+              aria-checked={!spotifyTrackMatcherStatus?.paused}
               aria-label="Toggle Spotify matching background job"
-              className={`toggle-switch${!spotifyPrewarmStatus?.paused ? ' on' : ''}`}
-              onClick={togglePrewarmPaused}
+              className={`toggle-switch${!spotifyTrackMatcherStatus?.paused ? ' on' : ''}`}
+              onClick={toggleTrackMatcherPaused}
             >
               <span className="toggle-switch-knob" />
             </button>
           </div>
-          {spotifyPrewarmStats && (
+          {spotifyTrackMatcherStats && (
             <p className="scan-summary">
-              {(spotifyPrewarmStats.matched || 0).toLocaleString()} matched &middot;{' '}
-              {(spotifyPrewarmStats.checked || 0).toLocaleString()} of {(spotifyPrewarmStats.total || 0).toLocaleString()} checked
-              {spotifyPrewarmStats.total > 0
-                ? ` (${Math.round((spotifyPrewarmStats.checked / spotifyPrewarmStats.total) * 100)}%)`
+              {(spotifyTrackMatcherStats.matched || 0).toLocaleString()} matched &middot;{' '}
+              {(spotifyTrackMatcherStats.checked || 0).toLocaleString()} of {(spotifyTrackMatcherStats.total || 0).toLocaleString()} checked
+              {spotifyTrackMatcherStats.total > 0
+                ? ` (${Math.round((spotifyTrackMatcherStats.checked / spotifyTrackMatcherStats.total) * 100)}%)`
                 : ''}
             </p>
           )}
-          {spotifyPrewarmStatus && (
+          {spotifyTrackMatcherStatus && (
             <p className="hint">
               Status:{' '}
-              {spotifyPrewarmStatus.status === 'paused_manually'
+              {spotifyTrackMatcherStatus.status === 'paused_manually'
                 ? 'paused (switched off above)'
-                : spotifyPrewarmStatus.status === 'running'
+                : spotifyTrackMatcherStatus.status === 'running'
                 ? 'running'
-                : spotifyPrewarmStatus.status === 'waiting_active_use'
+                : spotifyTrackMatcherStatus.status === 'waiting_active_use'
                   ? 'paused while the app is in use'
-                  : spotifyPrewarmStatus.status === 'waiting_radio_active'
+                  : spotifyTrackMatcherStatus.status === 'waiting_radio_active'
                     ? 'paused while Radio is playing on Spotify'
-                    : spotifyPrewarmStatus.status === 'waiting_not_connected'
+                    : spotifyTrackMatcherStatus.status === 'waiting_not_connected'
                       ? 'paused (Spotify not connected)'
-                      : spotifyPrewarmStatus.status === 'done'
+                      : spotifyTrackMatcherStatus.status === 'done'
                       ? 'done — whole library checked'
-                      : spotifyPrewarmStatus.status === 'error'
-                        ? `error: ${spotifyPrewarmStatus.error}`
-                        : spotifyPrewarmStatus.status}
+                      : spotifyTrackMatcherStatus.status === 'error'
+                        ? `error: ${spotifyTrackMatcherStatus.error}`
+                        : spotifyTrackMatcherStatus.status}
             </p>
           )}
         </div>

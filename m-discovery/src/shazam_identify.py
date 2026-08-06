@@ -2,7 +2,7 @@ import time
 
 from . import external_artwork, spotify_connect
 
-# Unlike spotify_prewarm.py, this job makes zero Spotify API calls (see
+# Unlike spotify_track_matcher.py, this job makes zero Spotify API calls (see
 # spotify_connect.identify_via_shazam) - it can't compete with interactive
 # Spotify use for Spotify's rate limit, so it isn't gated on app idleness at
 # all. Still paced, though: Shazam Core's own RapidAPI free-tier quota is
@@ -20,7 +20,7 @@ def run(get_connection, progress):
 
     Deliberately not scoped to spotify_checked IS NOT TRUE - a track already
     confirmed to have no direct/YouTube-Music-bridged Spotify match (a real,
-    common outcome - see spotify_prewarm.py) never gets revisited by that
+    common outcome - see spotify_track_matcher.py) never gets revisited by that
     job, but Shazam identification is still worth attempting for it; only
     isrc IS NULL matters here."""
     progress.update(status='running', processed=0, identified=0, artwork_found=0, error=None)

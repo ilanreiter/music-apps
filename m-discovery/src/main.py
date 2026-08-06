@@ -17,7 +17,7 @@ from .database import (
     set_radio_session_generation_status, append_radio_playlist_items, set_radio_session_playlist,
     set_radio_session_ytmusic_job, stop_radio_session, append_tracks_to_ytmusic_push_job,
     count_searches_since_last_reset, get_spotify_quota_state,
-    set_prewarm_paused, is_prewarm_paused, upsert_radio_discovered_track,
+    set_track_matcher_paused, is_track_matcher_paused, upsert_radio_discovered_track,
     get_radio_cooldown_days, set_radio_cooldown_days, get_radio_tuning, set_radio_tuning,
     get_active_generated_radio_session_id,
 )
@@ -35,7 +35,7 @@ from . import spotify_connect
 from . import ytmusic_connect
 from . import ytmusic_push_job
 from . import external_artwork
-from . import spotify_prewarm
+from . import spotify_track_matcher
 from . import tag_cleanup
 from . import playback_advancer
 from . import shazam_identify
@@ -131,8 +131,8 @@ artwork_check_progress = {"status": "idle"}
 external_artwork_lock = threading.Lock()
 external_artwork_progress = {"status": "idle"}
 
-spotify_prewarm_lock = threading.Lock()
-spotify_prewarm_progress = {"status": "idle"}
+spotify_track_matcher_lock = threading.Lock()
+spotify_track_matcher_progress = {"status": "idle"}
 
 # Guards the two /playlists/all-tracks routes' refresh path (fetch-live then
 # replace_playlist_track_cache) - confirmed live this is a real risk, not
@@ -160,12 +160,12 @@ playback_advancer_progress = {"status": "idle"}
 
 # Same "runs continuously, nothing to start on demand" shape as
 # playback_advancer above - see shazam_identify.run for why this one isn't
-# gated on app idleness the way spotify_prewarm is.
+# gated on app idleness the way spotify_track_matcher is.
 shazam_identify_progress = {"status": "idle"}
 
-# Timestamp of the last non-polling request, used by the Spotify pre-warm
-# background job to tell "actively using the app" apart from "idle" so it
-# only spends search requests when nothing else needs them.
+# Timestamp of the last non-polling request, used by the Spotify track
+# matcher background job to tell "actively using the app" apart from "idle"
+# so it only spends search requests when nothing else needs them.
 IDLE_THRESHOLD_SECONDS = 120
 _last_activity_at = 0.0
 
@@ -184,7 +184,7 @@ async def track_activity(request, call_next):
     # also polls device-picker lists and library group counts every ~90-100s
     # regardless of whether the user is actively doing anything - confirmed
     # live: this alone kept resetting the idle clock just under the 120s
-    # threshold, so the prewarm job's idle window almost never opened
+    # threshold, so the track matcher job's idle window almost never opened
     # (11 hours uptime, 1 track processed). Excluded the same way.
     global _last_activity_at
     path = request.url.path
@@ -217,7 +217,7 @@ class Track(BaseModel):
     artwork_source_url: Optional[str] = None
     is_favorite: Optional[bool] = False
     last_played: Optional[str] = None # Will be datetime string
-    # Cached cross-service matches (see spotify_prewarm.py / ytmusic_push_job.py)
+    # Cached cross-service matches (see spotify_track_matcher.py / ytmusic_push_job.py)
     # - drives the Spotify/YT Music availability badges on library track cards,
     # the same way matched_spotify_uri/matched_ytmusic_video_id drive them on
     # playlist track cards.
@@ -345,12 +345,12 @@ class ExternalArtworkStatus(BaseModel):
     resume_at: Optional[float] = None  # unix timestamp; set only while status == 'waiting'
     error: Optional[str] = None
 
-class SpotifyPrewarmStatus(BaseModel):
+class SpotifyTrackMatcherStatus(BaseModel):
     status: str  # idle | running | waiting_active_use | waiting_radio_active | waiting_not_connected | paused_manually | done | error
     processed: Optional[int] = None
     matched: Optional[int] = None
     error: Optional[str] = None
-    # The manual override's current persisted state (see database.is_prewarm_paused) -
+    # The manual override's current persisted state (see database.is_track_matcher_paused) -
     # included here (rather than a separate endpoint) so the existing status
     # poll already picks it up for free.
     paused: bool = False
@@ -527,12 +527,12 @@ async def startup_event():
             print(f"Resuming external artwork backfill in the background ({remaining} tracks not yet checked).")
             _start_external_artwork_background()
 
-    # spotify_prewarm.py is no longer auto-started at boot - Spotify Connect
-    # playback is gone, so this job's only remaining purpose is pre-populating
-    # known_tracks.spotify_track_id for the Push-to-Playlist feature, which
-    # isn't worth spending search budget on unattended. Paused by default
-    # (database.is_prewarm_paused); toggle it on manually via
-    # POST /api/spotify/prewarm/pause if you want it running.
+    # spotify_track_matcher.py is no longer auto-started at boot - Spotify
+    # Connect playback is gone, so this job's only remaining purpose is
+    # pre-populating known_tracks.spotify_track_id for the Push-to-Playlist
+    # feature, which isn't worth spending search budget on unattended. Paused
+    # by default (database.is_track_matcher_paused); toggle it on manually
+    # via POST /api/spotify/track-matcher/pause if you want it running.
 
     # Same auto-resume principle for the paced YouTube Music push queue (see
     # ytmusic_push_job.py) - each job's progress lives entirely in its own
@@ -561,7 +561,7 @@ async def startup_event():
     ).start()
 
     # Also unconditional - makes zero Spotify calls (see
-    # spotify_connect.identify_via_shazam), so unlike spotify_prewarm it
+    # spotify_connect.identify_via_shazam), so unlike spotify_track_matcher it
     # doesn't need to wait for app idleness to avoid competing with
     # interactive Spotify use for Spotify's rate limit.
     print("Starting Shazam track identification in the background.")
@@ -1829,8 +1829,8 @@ def match_discovered_track_to_spotify(params: DiscoverTrackMatchRequest):
             return {"matched": True, "uri": match['uri'], "artwork_url": match.get('artwork_url'), "radio_track_id": radio_track_id}
     if params.ytmusic_video_id:
         # A settled "no match" is still worth recording - so the background
-        # prewarm job (which treats matched_at IS NULL as "not tried yet")
-        # doesn't redundantly re-search this same track later.
+        # track matcher job (which treats matched_at IS NULL as "not tried
+        # yet") doesn't redundantly re-search this same track later.
         backfill_ytmusic_cache_match(params.ytmusic_video_id, None)
     return {"matched": False, "reason": "no_match"}
 
@@ -1873,44 +1873,51 @@ def get_discover_track_artwork(track_name: str, artist_name: str):
     fetch."""
     return {"artwork_url": lastfm.track_artwork(artist_name, track_name)}
 
-def _start_spotify_prewarm_background():
-    """Kicks off the background Spotify pre-warm job if one isn't already
-    running. Returns False (no-op, no error) if one is already in flight -
-    same pattern as _start_external_artwork_background, for the same reason
-    (a run interrupted by a container rebuild needs to auto-resume, since the
-    in-memory progress/lock don't survive the process exiting)."""
-    if not spotify_prewarm_lock.acquire(blocking=False):
+def _start_spotify_track_matcher_background():
+    """Kicks off the background Spotify track matcher job if one isn't
+    already running. Returns False (no-op, no error) if one is already in
+    flight - same pattern as _start_external_artwork_background, for the
+    same reason (a run interrupted by a container rebuild needs to
+    auto-resume, since the in-memory progress/lock don't survive the process
+    exiting)."""
+    if not spotify_track_matcher_lock.acquire(blocking=False):
         return False
     try:
-        spotify_prewarm_progress.clear()
-        spotify_prewarm_progress.update(status="running")
+        spotify_track_matcher_progress.clear()
+        spotify_track_matcher_progress.update(status="running")
 
         def _run():
             try:
-                spotify_prewarm.run(get_db_connection, spotify_prewarm_progress, _is_idle)
+                spotify_track_matcher.run(get_db_connection, spotify_track_matcher_progress, _is_idle)
             finally:
-                spotify_prewarm_lock.release()
+                spotify_track_matcher_lock.release()
 
         threading.Thread(target=_run, daemon=True).start()
         return True
     except Exception:
-        spotify_prewarm_lock.release()
+        spotify_track_matcher_lock.release()
         raise
 
-@app.get("/api/spotify/prewarm/status", response_model=SpotifyPrewarmStatus)
-async def get_spotify_prewarm_status():
-    return {**spotify_prewarm_progress, "paused": is_prewarm_paused()}
+@app.get("/api/spotify/track-matcher/status", response_model=SpotifyTrackMatcherStatus)
+async def get_spotify_track_matcher_status():
+    return {**spotify_track_matcher_progress, "paused": is_track_matcher_paused()}
 
-class PrewarmPauseRequest(BaseModel):
+class TrackMatcherPauseRequest(BaseModel):
     paused: bool
 
-@app.post("/api/spotify/prewarm/pause")
-async def set_spotify_prewarm_paused(params: PrewarmPauseRequest):
+@app.post("/api/spotify/track-matcher/pause")
+async def set_spotify_track_matcher_paused(params: TrackMatcherPauseRequest):
     """Manual, explicit override for the background search-consuming
-    spotify_prewarm.py job. Checked ahead of its existing is_idle gating, for
-    whenever that isn't reason enough on its own to stop consuming budget
-    right now."""
-    set_prewarm_paused(params.paused)
+    spotify_track_matcher.py job. Checked ahead of its existing is_idle
+    gating, for whenever that isn't reason enough on its own to stop
+    consuming budget right now.
+
+    The job no longer auto-starts at boot (see startup_event), so flipping
+    this to unpaused has to actually start the thread itself, not just clear
+    the flag - otherwise there's no running loop left to ever read it back."""
+    set_track_matcher_paused(params.paused)
+    if not params.paused:
+        _start_spotify_track_matcher_background()
     return {"paused": params.paused}
 
 @app.get("/api/radio/cooldown-days")
@@ -2015,9 +2022,9 @@ async def get_play_log(limit: int = 2000, db: psycopg2.extensions.connection = D
         for known_track_id, track_name, artist_name, last_played_at, source, artwork_url, reason, engine in rows
     ]
 
-@app.get("/api/spotify/prewarm/stats")
-async def get_spotify_prewarm_stats(db: psycopg2.extensions.connection = Depends(get_db)):
-    # spotify_prewarm_progress only tracks *this run's* processed/matched
+@app.get("/api/spotify/track-matcher/stats")
+async def get_spotify_track_matcher_stats(db: psycopg2.extensions.connection = Depends(get_db)):
+    # spotify_track_matcher_progress only tracks *this run's* processed/matched
     # counts (reset each time the job (re)starts) - these are cumulative
     # totals across the whole library, for a meaningful "X of Y checked"
     # readout regardless of how many times the background job has restarted.
@@ -2053,8 +2060,8 @@ async def get_spotify_search_budget():
     NOT a calendar-day boundary - so it keeps climbing across midnight and
     across days until Spotify actually pushes back. Polled by the Radio
     tab's traffic-light meter and shown alongside the Cleanup tab's
-    prewarm status, since every Spotify-search consumer in the app
-    (Discover, Radio, library matching, both prewarm jobs) shares all of
+    track matcher status, since every Spotify-search consumer in the app
+    (Discover, Radio, library matching, the track matcher job) shares all of
     this."""
     used = count_searches_since_last_reset()
     blocked_seconds = spotify_connect.search_block_remaining_seconds()
@@ -2069,7 +2076,7 @@ async def get_spotify_search_budget():
 
 def _start_ytmusic_push_job_background():
     """Kicks off the background YouTube Music push job if one isn't already
-    running - same non-blocking-lock pattern as _start_spotify_prewarm_background,
+    running - same non-blocking-lock pattern as _start_spotify_track_matcher_background,
     for the same reason (a run interrupted by a container rebuild needs to
     auto-resume, since the in-memory lock doesn't survive the process exiting;
     the job's actual progress lives in the ytmusic_push_job row instead)."""

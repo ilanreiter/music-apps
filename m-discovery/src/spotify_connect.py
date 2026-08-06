@@ -151,7 +151,7 @@ def disconnect():
 # omit Retry-After entirely - falling back to "assume 1 second" in that case
 # (as if Spotify meant "barely rate-limited at all") would defeat the whole
 # point of persisting a cooldown at all: the always-on background pre-warm
-# job (spotify_prewarm.py, one attempt every 5 minutes) would just try again
+# job (spotify_track_matcher.py, one attempt every 5 minutes) would just try again
 # almost immediately, re-poking an endpoint that's already rate-limiting the
 # account and plausibly extending the penalty rather than ever letting it
 # cool down. When the header's missing, assume a real block is in effect and
@@ -664,7 +664,7 @@ def _search_and_score(track_name, artist_name):
     independent of known_tracks, which only covers this user's own library)
     and returns straight from it with no budget check or live call at all
     on a hit - this is the one choke point every text search (Radio,
-    Discover, both prewarm jobs, interactive matches) already funnels
+    Discover, the track matcher job, interactive matches) already funnels
     through, so caching here covers every source at once. Confirmed live
     this was a real gap: a Radio "fresh discovery" suggestion not in the
     user's library had nowhere to persist its match, so the same track
@@ -984,7 +984,7 @@ def identify_via_shazam(track_name, artist_name, file_path=None):
     own schedule, completely decoupled from Spotify's rate limit and this
     app's idle-detection (which exists purely to avoid the *Spotify-facing*
     background job competing with interactive Spotify use for the same
-    quota - see spotify_prewarm.py's is_idle gate. A job that never touches
+    quota - see spotify_track_matcher.py's is_idle gate. A job that never touches
     Spotify at all can't compete with it, so gating this one the same way
     would just be needless delay).
 

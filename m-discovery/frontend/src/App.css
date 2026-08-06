@@ -1303,14 +1303,14 @@ main.with-player {
   margin-top: 8px;
 }
 
-.prewarm-pause-row {
+.track-matcher-pause-row {
   display: flex;
   align-items: center;
   gap: 10px;
   margin: 10px 0;
 }
 
-.prewarm-pause-label {
+.track-matcher-pause-label {
   font-size: 0.85rem;
   color: var(--text-main);
 }

@@ -46,7 +46,7 @@ def run(get_connection, progress, is_idle, is_radio_active=lambda: False):
     progress.update(status='running', processed=0, matched=0, error=None)
 
     while True:
-        if database.is_prewarm_paused():
+        if database.is_track_matcher_paused():
             # A manual, explicit override - checked first, ahead of the
             # is_radio_active/is_idle gating below, since this exists
             # specifically for whenever those two aren't reason enough on

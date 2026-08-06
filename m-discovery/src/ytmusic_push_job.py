@@ -5,7 +5,7 @@ from . import database, ytmusic_connect
 
 # YouTube Data API's default daily quota is 10,000 units (search costs 100,
 # a playlist insert costs 50) - a hard, fixed-per-day budget, unlike
-# Spotify's soft per-second rate limit that spotify_prewarm.py paces around.
+# Spotify's soft per-second rate limit that spotify_track_matcher.py paces around.
 # This job reserves well under the full quota for itself, leaving headroom
 # for the user's own interactive Discover/library pushes on the same shared
 # daily pool - it self-throttles to this number rather than only reacting
@@ -41,7 +41,7 @@ def _cached_match(conn, known_track_id):
 
 def _write_cache(conn, known_track_id, video_id):
     """Opportunistically remembers a fresh match (or confirmed non-match,
-    video_id=None) against known_tracks, same as spotify_prewarm.py does for
+    video_id=None) against known_tracks, same as spotify_track_matcher.py does for
     Spotify - benefits any future push, not just this job. No-op for
     Discover-sourced tracks (known_track_id is None)."""
     if known_track_id is None:
@@ -86,7 +86,7 @@ def run(get_connection):
     Resumes correctly after a restart with no separate cursor: each job row's
     own `processed` flags and `units_spent_today`/`quota_day` ARE the resume
     state, same principle as known_tracks.spotify_checked for
-    spotify_prewarm.py. Started fresh each time by main.py's startup
+    spotify_track_matcher.py. Started fresh each time by main.py's startup
     auto-resume block if any job is left queued/running/waiting_quota."""
     while True:
         job = _get_job_to_work_on()
@@ -198,7 +198,7 @@ def run(get_connection):
                 units_spent_delta=units_spent, tracks_processed_delta=1,
             )
         except Exception as e:
-            # Same lesson as spotify_prewarm.py: an uncaught exception here
+            # Same lesson as spotify_track_matcher.py: an uncaught exception here
             # would silently kill this background thread forever with no
             # recorded error - a sibling job (shazam_identify) hit exactly
             # this once with a transient Postgres disconnect.

@@ -147,7 +147,7 @@ def _advance_chromecast(save_session, destination_id, now_playing, queue, pushed
 def run(get_session, save_session, progress):
     """Runs forever on a background thread, started unconditionally at app
     startup (src/main.py's startup_event) - unlike the other background jobs
-    in this app (external_artwork, spotify_prewarm, tag_cleanup), this isn't
+    in this app (external_artwork, spotify_track_matcher, tag_cleanup), this isn't
     a one-shot backfill with a start/status route; it's a supervisor that's
     normally idle-polling with nothing to do, and only becomes active once a
     remote destination's queue is synced via POST /api/playback-session.

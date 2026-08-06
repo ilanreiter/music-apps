@@ -349,8 +349,9 @@ def create_tables():
 
             # One row per real (non-short-circuited) Spotify /search call -
             # every consumer of spotify_connect.search_track shares this same
-            # rate limit (Discover, Radio, library matching, and the two
-            # always-on prewarm jobs), and Spotify publishes no quota number
+            # rate limit (Discover, Radio, library matching, and the
+            # background spotify_track_matcher.py job), and Spotify publishes
+            # no quota number
             # to pace against the way YouTube's Data API does - this is what
             # lets spotify_connect.py's own self-imposed budget (see
             # SEARCH_BUDGET_PER_WINDOW) count real recent usage instead of
@@ -408,14 +409,31 @@ def create_tables():
             print("Table 'spotify_quota_estimate' checked/created successfully.")
 
             # A manual, explicit "stop consuming search budget" switch for
-            # the background spotify_prewarm.py job - separate from and in
-            # addition to its existing is_idle gating, for whenever that
+            # the background spotify_track_matcher.py job - separate from and
+            # in addition to its existing is_idle gating, for whenever that
             # isn't enough on its own.
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS background_job_control (
                     id INTEGER PRIMARY KEY DEFAULT 1,
-                    prewarm_paused BOOLEAN NOT NULL DEFAULT FALSE
+                    track_matcher_paused BOOLEAN NOT NULL DEFAULT FALSE
                 );
+            """)
+            # Renamed from prewarm_paused (spotify_prewarm.py's old name) -
+            # idempotent so this is safe to run on every startup, including
+            # a fresh install that never had the old column at all.
+            cur.execute("""
+                DO $$
+                BEGIN
+                    IF EXISTS (
+                        SELECT 1 FROM information_schema.columns
+                        WHERE table_name = 'background_job_control' AND column_name = 'prewarm_paused'
+                    ) AND NOT EXISTS (
+                        SELECT 1 FROM information_schema.columns
+                        WHERE table_name = 'background_job_control' AND column_name = 'track_matcher_paused'
+                    ) THEN
+                        ALTER TABLE background_job_control RENAME COLUMN prewarm_paused TO track_matcher_paused;
+                    END IF;
+                END $$;
             """)
             print("Table 'background_job_control' checked/created successfully.")
 
@@ -431,7 +449,7 @@ def create_tables():
             # single time. Keyed by spotify_connect._search_and_score's own
             # normalized "track|||artist" text (same shape as
             # radio_engine.radio_track_key), the one choke point every text
-            # search (Radio, Discover, both prewarm jobs, interactive
+            # search (Radio, Discover, the track matcher job, interactive
             # matches) already funnels through - caching there covers every
             # source at once rather than one feature at a time. A confirmed
             # no-match is cached too (matched=FALSE, no uri) - same
@@ -890,7 +908,7 @@ def count_queued_ytmusic_push_jobs():
 def has_pending_ytmusic_push_work():
     """True if any job is queued, running, or paused on quota - used at app
     startup to decide whether to restart the background worker (its
-    in-memory thread/lock don't survive a restart, same as spotify_prewarm's)."""
+    in-memory thread/lock don't survive a restart, same as spotify_track_matcher's)."""
     conn = None
     try:
         conn = get_db_connection()
@@ -2132,38 +2150,38 @@ def set_spotify_search_blocked_until(blocked_until):
             conn.close()
 
 
-def is_prewarm_paused():
-    """The manual override checked by spotify_prewarm.py alongside its
+def is_track_matcher_paused():
+    """The manual override checked by spotify_track_matcher.py alongside its
     existing is_idle gating - see background_job_control's own comment."""
     conn = None
     try:
         conn = get_db_connection()
         cur = conn.cursor()
-        cur.execute("SELECT prewarm_paused FROM background_job_control WHERE id = 1")
+        cur.execute("SELECT track_matcher_paused FROM background_job_control WHERE id = 1")
         row = cur.fetchone()
         return bool(row[0]) if row else False
     except Error as e:
-        print(f"Error reading prewarm pause state: {e}")
+        print(f"Error reading track matcher pause state: {e}")
         return False
     finally:
         if conn:
             conn.close()
 
 
-def set_prewarm_paused(paused):
+def set_track_matcher_paused(paused):
     conn = None
     try:
         conn = get_db_connection()
         cur = conn.cursor()
         cur.execute("""
-            INSERT INTO background_job_control (id, prewarm_paused)
+            INSERT INTO background_job_control (id, track_matcher_paused)
             VALUES (1, %s)
-            ON CONFLICT (id) DO UPDATE SET prewarm_paused = EXCLUDED.prewarm_paused
+            ON CONFLICT (id) DO UPDATE SET track_matcher_paused = EXCLUDED.track_matcher_paused
         """, (paused,))
         conn.commit()
         cur.close()
     except Error as e:
-        print(f"Error setting prewarm pause state: {e}")
+        print(f"Error setting track matcher pause state: {e}")
     finally:
         if conn:
             conn.close()
@@ -2499,7 +2517,7 @@ def find_known_track_external_match(ytmusic_video_id=None, spotify_track_id=None
     """Exact-id lookup into known_tracks - the safe (never fuzzy) half of the
     cross-reference this app now does before any live search: if a local
     library track has already been matched to this exact Spotify/YouTube id
-    by a *different* code path (spotify_prewarm.py, ytmusic_push_job.py, the
+    by a *different* code path (spotify_track_matcher.py, ytmusic_push_job.py, the
     reverse direction of this same cross-reference), reuse that instead of
     searching again. Exactly one of the two kwargs should be given. Returns
     {'id', 'spotify_track_id', 'ytmusic_video_id'} or None."""
