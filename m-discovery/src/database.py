@@ -80,7 +80,9 @@ def create_tables():
                     ADD COLUMN IF NOT EXISTS ytmusic_checked BOOLEAN DEFAULT FALSE,
                     ADD COLUMN IF NOT EXISTS last_played_at TIMESTAMP,
                     ADD COLUMN IF NOT EXISTS last_played_reason TEXT,
-                    ADD COLUMN IF NOT EXISTS last_played_engine TEXT;
+                    ADD COLUMN IF NOT EXISTS last_played_engine TEXT,
+                    ADD COLUMN IF NOT EXISTS mood TEXT,
+                    ADD COLUMN IF NOT EXISTS mood_checked BOOLEAN DEFAULT FALSE;
             """)
             cur.execute("""
                 ALTER TABLE known_tracks

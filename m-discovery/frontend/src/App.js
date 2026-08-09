@@ -4,10 +4,10 @@ import './App.css';
 
 const LIBRARY_PAGE_SIZE = 100;
 const GROUP_QUEUE_LIMIT = 500;
-const VIEW_MODES = ['all', 'album', 'genre', 'decade', 'quality', 'format', 'favorite', 'length'];
+const VIEW_MODES = ['all', 'album', 'genre', 'decade', 'quality', 'format', 'favorite', 'length', 'mood'];
 const BACK_LABELS = {
   album: 'Albums', genre: 'Genres', decade: 'Decades',
-  quality: 'Quality Tiers', format: 'Formats', favorite: 'Favorites', length: 'Lengths',
+  quality: 'Quality Tiers', format: 'Formats', favorite: 'Favorites', length: 'Lengths', mood: 'Moods',
   playlist: 'Playlists', 'ytmusic-playlist': 'YouTube Music Playlists',
 };
 
@@ -227,6 +227,7 @@ function paramsForGroupKey(by, key) {
   if (by === 'format') return { format: key };
   if (by === 'length') return { length: key };
   if (by === 'favorite') return { favorite: key === 'Favorites' };
+  if (by === 'mood') return { mood: key };
   return {};
 }
 
@@ -745,6 +746,23 @@ function App() {
   // Discover run actually produces results.
   const [showDiscoverPanel, setShowDiscoverPanel] = useState(false);
 
+  // Past Discover runs (see GET /api/history) - a write-only log until now,
+  // fetched lazily only when the modal actually opens rather than on every
+  // Discover tab visit, since it's a diagnostic/browsing view, not something
+  // that needs to stay live.
+  const [showDiscoveryHistory, setShowDiscoveryHistory] = useState(false);
+  const [discoveryHistory, setDiscoveryHistory] = useState(null);
+  const [discoveryHistoryError, setDiscoveryHistoryError] = useState(null);
+  const [expandedHistoryId, setExpandedHistoryId] = useState(null);
+
+  const openDiscoveryHistory = () => {
+    setShowDiscoveryHistory(true);
+    setDiscoveryHistoryError(null);
+    axios.get(`${API_BASE_URL}/history`)
+      .then((r) => setDiscoveryHistory(r.data))
+      .catch((err) => setDiscoveryHistoryError(err.response?.data?.detail || 'Failed to load Discover history.'));
+  };
+
   const [activeTab, setActiveTab] = useState(() => {
     const saved = loadLibraryView();
     // Spotify/YT Music playlist browsing used to live as two library-mode
@@ -833,6 +851,9 @@ function App() {
   // /api/tracks/known.
   const [filterQuality, setFilterQuality] = useState(() => loadLibraryView()?.filterQuality ?? 'best');
   const [filterFormat, setFilterFormat] = useState(() => loadLibraryView()?.filterFormat ?? '');
+  // Derived from genre via a keyword heuristic (see MOOD_SQL in main.py) -
+  // not a measured property of the track.
+  const [filterMood, setFilterMood] = useState(() => loadLibraryView()?.filterMood ?? '');
   // Restricts to tracks that already have a cached Spotify match, so Shuffle
   // All/Play All can be tested without any live search - isolates playback
   // bugs from the currently-active Spotify search rate limit.
@@ -846,6 +867,7 @@ function App() {
   const [decadeOptions, setDecadeOptions] = useState([]);
   const [qualityOptions, setQualityOptions] = useState([]);
   const [formatOptions, setFormatOptions] = useState([]);
+  const [moodOptions, setMoodOptions] = useState([]);
   const [groups, setGroups] = useState([]);
   const [groupsLoading, setGroupsLoading] = useState(false);
   const [libraryTracks, setLibraryTracks] = useState([]);
@@ -1269,11 +1291,12 @@ function App() {
       filterDecade,
       filterQuality,
       filterFormat,
+      filterMood,
       filterSpotifyAvailable,
       filterTrackLimit,
       libraryShuffleMode,
     });
-  }, [activeTab, libraryMode, drill, search, filterGenre, filterDecade, filterQuality, filterFormat, filterSpotifyAvailable, filterTrackLimit, libraryShuffleMode]);
+  }, [activeTab, libraryMode, drill, search, filterGenre, filterDecade, filterQuality, filterFormat, filterMood, filterSpotifyAvailable, filterTrackLimit, libraryShuffleMode]);
 
   // Persist the playback session (queue/history capped, so a mutation never
   // costs a multi-MB localStorage write) so a reload or reopened tab returns
@@ -1383,7 +1406,7 @@ function App() {
     // reshuffled the list while playback stayed on the original order).
     // Skip the refetch when only activeTab changed - re-entering the tab
     // should show whatever was already there, not roll a new order.
-    const key = JSON.stringify([libraryMode, drill, search, filterGenre, filterDecade, filterQuality, filterFormat, filterSpotifyAvailable, filterTrackLimit]);
+    const key = JSON.stringify([libraryMode, drill, search, filterGenre, filterDecade, filterQuality, filterFormat, filterMood, filterSpotifyAvailable, filterTrackLimit]);
     if (key === libraryFetchKeyRef.current) return;
     libraryFetchKeyRef.current = key;
     // A filter change invalidates any Discover results seeded from the old
@@ -1426,7 +1449,7 @@ function App() {
       fetchGroups();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeTab, libraryMode, drill, search, filterGenre, filterDecade, filterQuality, filterFormat, filterSpotifyAvailable, filterTrackLimit]);
+  }, [activeTab, libraryMode, drill, search, filterGenre, filterDecade, filterQuality, filterFormat, filterMood, filterSpotifyAvailable, filterTrackLimit]);
 
   // Playlists tab's "All Tracks" mode - independent of the dispatch above
   // (which only ever drives "By Playlist" groups/drill), refetches whenever
@@ -1459,8 +1482,11 @@ function App() {
     axios.get(`${API_BASE_URL}/library/groups`, { params: { by: 'format', ...withSearch(buildAmbientFilterParams('format')) } })
       .then((r) => setFormatOptions(r.data))
       .catch((err) => console.error('Error fetching formats:', err));
+    axios.get(`${API_BASE_URL}/library/groups`, { params: { by: 'mood', ...withSearch(buildAmbientFilterParams('mood')) } })
+      .then((r) => setMoodOptions(r.data))
+      .catch((err) => console.error('Error fetching moods:', err));
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeTab, search, filterGenre, filterDecade, filterQuality, filterFormat, filterSpotifyAvailable]);
+  }, [activeTab, search, filterGenre, filterDecade, filterQuality, filterFormat, filterMood, filterSpotifyAvailable]);
 
   // The genre/decade/quality/format filters stay active no matter which
   // browse-by view or drill-down you're in; a drill-down's own dimension
@@ -1476,6 +1502,7 @@ function App() {
     if (filterDecade && omit !== 'decade') params.decade = Number(filterDecade);
     if (filterQuality && omit !== 'quality') params.quality = filterQuality;
     if (filterFormat && omit !== 'format') params.format = filterFormat;
+    if (filterMood && omit !== 'mood') params.mood = filterMood;
     if (filterSpotifyAvailable) params.spotify_available = true;
     return params;
   };
@@ -1485,6 +1512,7 @@ function App() {
     setFilterDecade('');
     setFilterQuality('best');
     setFilterFormat('');
+    setFilterMood('');
     setFilterSpotifyAvailable(false);
     setFilterTrackLimit('');
     setSearchInput('');
@@ -3286,6 +3314,10 @@ function App() {
                   <option value="">All Formats</option>
                   {formatOptions.map((f) => <option key={f.key} value={f.key}>{f.label} ({f.count})</option>)}
                 </select>
+                <select value={filterMood} onChange={(e) => setFilterMood(e.target.value)} title="Derived from genre - a rough guess, not a measured property">
+                  <option value="">All Moods</option>
+                  {moodOptions.map((m) => <option key={m.key} value={m.key}>{m.label} ({m.count})</option>)}
+                </select>
                 <label className="filter-checkbox-label" title="Only tracks with an already-cached Spotify match - no live search needed to play them">
                   <input
                     type="checkbox"
@@ -3334,6 +3366,14 @@ function App() {
                   title="Find tracks similar to whatever's currently filtered"
                 >
                   {discovering ? 'Discovering…' : 'Discover similar tracks'}
+                </button>
+                <button
+                  type="button"
+                  className="discover-filter-btn"
+                  onClick={openDiscoveryHistory}
+                  title="Browse past Discover runs and what they suggested"
+                >
+                  🕓 History
                 </button>
                 {discoverError && <p className="error-message">{discoverError}</p>}
               </div>
@@ -3815,6 +3855,16 @@ function App() {
         />
       )}
 
+      {showDiscoveryHistory && (
+        <DiscoveryHistoryModal
+          onClose={() => setShowDiscoveryHistory(false)}
+          history={discoveryHistory}
+          error={discoveryHistoryError}
+          expandedId={expandedHistoryId}
+          onToggleExpand={setExpandedHistoryId}
+        />
+      )}
+
       <PlayerBar
         track={nowPlaying}
         queue={queue}
@@ -3933,6 +3983,50 @@ function YtMusicSettingsSection({ ytMusicConnected, apiBase, onConnected, onDisc
       {error && <p className="error-message">{error}</p>}
       <button type="button" className="scan-btn" onClick={startConnect}>Connect YouTube Music</button>
     </>
+  );
+}
+
+function DiscoveryHistoryModal({ onClose, history, error, expandedId, onToggleExpand }) {
+  return (
+    <div className="settings-overlay" onClick={onClose}>
+      <div className="settings-modal" onClick={(e) => e.stopPropagation()}>
+        <div className="settings-header">
+          <h2>Discover History</h2>
+          <button className="settings-close" onClick={onClose} aria-label="Close">&times;</button>
+        </div>
+        {error && <p className="error-message">{error}</p>}
+        {!error && history === null && <p className="hint">Loading…</p>}
+        {!error && history && history.length === 0 && <p className="hint">No Discover runs recorded yet.</p>}
+        {!error && history && history.length > 0 && (
+          <div className="device-list">
+            {history.map((entry) => {
+              const expanded = expandedId === entry.id;
+              return (
+                <div className="device-row" key={entry.id} style={{ flexDirection: 'column', alignItems: 'stretch' }}>
+                  <div
+                    style={{ display: 'flex', alignItems: 'center', gap: '10px', cursor: 'pointer' }}
+                    onClick={() => onToggleExpand(expanded ? null : entry.id)}
+                  >
+                    <span className="device-row-name">
+                      {entry.generated_at ? new Date(entry.generated_at).toLocaleString() : 'Unknown time'}
+                    </span>
+                    <span className="hint" style={{ flex: 1 }}>{entry.prompt_used}</span>
+                    <span className="hint">{entry.track_list.length} track{entry.track_list.length === 1 ? '' : 's'}</span>
+                  </div>
+                  {expanded && (
+                    <ul style={{ margin: '8px 0 0', paddingLeft: '20px' }}>
+                      {entry.track_list.map((t, i) => (
+                        <li key={i} className="hint">{t.track_name} — {t.artist_name}</li>
+                      ))}
+                    </ul>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+    </div>
   );
 }
 

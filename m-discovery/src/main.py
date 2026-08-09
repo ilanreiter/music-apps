@@ -2,6 +2,7 @@ from fastapi import FastAPI, Depends, HTTPException, Query, status
 from fastapi.responses import FileResponse, RedirectResponse
 from pydantic import BaseModel
 from typing import List, Optional, Any, Dict
+from datetime import datetime
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from .database import (
@@ -37,6 +38,7 @@ from . import spotify_track_matcher
 from . import tag_cleanup
 from . import playback_advancer
 from . import shazam_identify
+from . import mood_detector
 from . import lastfm
 from . import radio_engine
 import logging
@@ -111,6 +113,16 @@ LENGTH_TIER_RANK_SQL = f"""
         ELSE 3
     END
 """
+# Mood is measured, not guessed: known_tracks.mood is populated by
+# mood_detector.py running Essentia's pretrained audio classifiers
+# (happy/sad/aggressive/relaxed/party) directly on each file's waveform, not
+# derived from its genre tag - a genre-keyword heuristic was tried first and
+# dropped once "Rock" (a third of this library) turned out to imply no mood
+# at all. A row's mood is NULL until that background job actually analyzes
+# it, at which point it's either a real bucket name or NULL again (analyzed,
+# but no bucket scored confidently) - either way NULL reads as 'Unspecified'
+# here rather than as a guess.
+MOOD_SQL = "COALESCE(mood, 'Unspecified')"
 FAVORITE_LABEL_SQL = "CASE WHEN is_favorite THEN 'Favorites' ELSE 'Not Favorited' END"
 # One representative track per group, for a grid-view tile's artwork - prefers
 # a track that actually has artwork, falling back to any track in the group.
@@ -125,6 +137,9 @@ scan_progress = {"status": "idle"}
 
 artwork_check_lock = threading.Lock()
 artwork_check_progress = {"status": "idle"}
+
+mood_detector_lock = threading.Lock()
+mood_detector_progress = {"status": "idle"}
 
 external_artwork_lock = threading.Lock()
 external_artwork_progress = {"status": "idle"}
@@ -211,6 +226,10 @@ class Track(BaseModel):
     channels: Optional[int] = None
     file_size_bytes: Optional[int] = None
     file_format: Optional[str] = None
+    # From audio analysis (see mood_detector.py), not a text-tag guess -
+    # 'Unspecified' until the background backfill actually reaches this
+    # track (see MOOD_SQL's own comment).
+    mood: Optional[str] = None
     artwork_source_url: Optional[str] = None
     is_favorite: Optional[bool] = False
     last_played: Optional[str] = None # Will be datetime string
@@ -234,9 +253,9 @@ class Track(BaseModel):
 
 class DiscoveryHistoryEntry(BaseModel):
     id: Optional[int] = None
-    generated_at: Optional[str] = None # Will be datetime string
+    generated_at: Optional[datetime] = None
     prompt_used: str
-    track_list: List[Track] # Assuming track_list is a JSONB array of tracks
+    track_list: List[Track]
 
 class DiscoveryParameters(BaseModel):
     # Comma-separated artist names (built by the frontend from whatever's
@@ -499,6 +518,23 @@ async def startup_event():
             print(f"Resuming external artwork backfill in the background ({remaining} tracks not yet checked).")
             _start_external_artwork_background()
 
+    # Same auto-resume-if-work-remains principle as the external artwork
+    # backfill above - mood_detector.py makes no external calls at all (pure
+    # local audio analysis), so unlike spotify_track_matcher there's no
+    # reason to leave this off by default.
+    conn = get_db_connection()
+    if conn:
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT COUNT(*) FROM known_tracks WHERE mood_checked IS NOT TRUE AND file_path IS NOT NULL")
+            remaining = cur.fetchone()[0]
+            cur.close()
+        finally:
+            conn.close()
+        if remaining > 0:
+            print(f"Resuming mood analysis backfill in the background ({remaining} tracks not yet analyzed).")
+            _start_mood_detector_background()
+
     # spotify_track_matcher.py is no longer auto-started at boot - Spotify
     # Connect playback is gone, so this job's only remaining purpose is
     # pre-populating known_tracks.spotify_track_id for the Push-to-Playlist
@@ -559,6 +595,7 @@ async def get_known_tracks(
     format: Optional[str] = None,
     favorite: Optional[bool] = None,
     length: Optional[str] = None,
+    mood: Optional[str] = None,
     external_artwork_found: Optional[bool] = None,
     spotify_available: Optional[bool] = None,
     shuffle: bool = False,
@@ -601,6 +638,9 @@ async def get_known_tracks(
         if length:
             where_clauses.append(f"({LENGTH_TIER_SQL}) = %(length)s")
             params['length'] = length
+        if mood:
+            where_clauses.append(f"({MOOD_SQL}) = %(mood)s")
+            params['mood'] = mood
         if external_artwork_found is not None:
             # external_artwork_checked is only ever set on rows the external-artwork
             # job actually processed (has_artwork was FALSE going in), so this
@@ -626,7 +666,7 @@ async def get_known_tracks(
                 (SELECT DISTINCT ON ({DEDUP_NORM_TITLE_SQL}, {DEDUP_NORM_ARTIST_SQL}, {DEDUP_NORM_ALBUM_SQL})
                         id, track_name, artist_name, album_name, genre, year, duration_seconds,
                         bitrate, sample_rate, channels, file_size_bytes, file_path, artwork_source_url, is_favorite, last_played,
-                        spotify_track_id, ytmusic_video_id
+                        spotify_track_id, ytmusic_video_id, mood
                  FROM known_tracks {where_sql}
                  ORDER BY {DEDUP_NORM_TITLE_SQL}, {DEDUP_NORM_ARTIST_SQL}, {DEDUP_NORM_ALBUM_SQL},
                           {QUALITY_TIER_RANK_SQL} ASC, bitrate DESC NULLS LAST, id ASC
@@ -660,7 +700,7 @@ async def get_known_tracks(
         cur.execute(f"""
             SELECT id, track_name, artist_name, album_name, genre, year, duration_seconds,
                    bitrate, sample_rate, channels, file_size_bytes, file_path, artwork_source_url, is_favorite, last_played,
-                   spotify_track_id, ytmusic_video_id
+                   spotify_track_id, ytmusic_video_id, {MOOD_SQL} AS mood
             FROM {from_sql}
             {order_sql}
             LIMIT %(limit)s OFFSET %(offset)s
@@ -693,10 +733,10 @@ async def get_tracks_by_ids(params: TrackIdsRequest, db: psycopg2.extensions.con
     if not id_list:
         return []
     cur = db.cursor(cursor_factory=RealDictCursor)
-    cur.execute("""
+    cur.execute(f"""
         SELECT id, track_name, artist_name, album_name, genre, year, duration_seconds,
                bitrate, sample_rate, channels, file_size_bytes, file_path, artwork_source_url, is_favorite, last_played,
-               spotify_track_id, ytmusic_video_id
+               spotify_track_id, ytmusic_video_id, {MOOD_SQL} AS mood
         FROM known_tracks WHERE id = ANY(%s)
     """, (id_list,))
     rows_by_id = {row['id']: row for row in cur.fetchall()}
@@ -715,10 +755,11 @@ async def get_library_groups(
     decade: Optional[int] = None,
     quality: Optional[str] = None,
     format: Optional[str] = None,
+    mood: Optional[str] = None,
     spotify_available: Optional[bool] = None,
     db: psycopg2.extensions.connection = Depends(get_db),
 ):
-    valid_by = ("album", "genre", "decade", "quality", "format", "favorite", "length")
+    valid_by = ("album", "genre", "decade", "quality", "format", "favorite", "length", "mood")
     if by not in valid_by:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"by must be one of: {', '.join(valid_by)}")
     try:
@@ -742,6 +783,9 @@ async def get_library_groups(
         if format:
             extra_clauses.append(f"({FORMAT_SQL}) = %(format)s")
             params['format'] = format.upper()
+        if mood:
+            extra_clauses.append(f"({MOOD_SQL}) = %(mood)s")
+            params['mood'] = mood
         if spotify_available is not None:
             extra_clauses.append("(spotify_track_id IS NOT NULL) = %(spotify_available)s")
             params['spotify_available'] = spotify_available
@@ -789,6 +833,13 @@ async def get_library_groups(
                 SELECT {LENGTH_TIER_SQL} AS tier, COUNT(*), {SAMPLE_TRACK_SQL} FROM known_tracks
                 WHERE 1=1 {extra_sql}
                 GROUP BY tier ORDER BY MIN({LENGTH_TIER_RANK_SQL})
+            """, params)
+            groups = [{"key": row[0], "label": row[0], "count": row[1], "sample_track_id": row[2]} for row in cur.fetchall()]
+        elif by == "mood":
+            cur.execute(f"""
+                SELECT {MOOD_SQL} AS bucket, COUNT(*), {SAMPLE_TRACK_SQL} FROM known_tracks
+                WHERE 1=1 {extra_sql}
+                GROUP BY bucket ORDER BY COUNT(*) DESC
             """, params)
             groups = [{"key": row[0], "label": row[0], "count": row[1], "sample_track_id": row[2]} for row in cur.fetchall()]
         else:
@@ -2428,6 +2479,32 @@ async def start_artwork_check():
 @app.get("/api/library/check-artwork/status", response_model=ArtworkCheckStatus)
 async def get_artwork_check_status():
     return artwork_check_progress
+
+def _start_mood_detector_background():
+    """Kicks off the background mood-analysis backfill (see mood_detector.py)
+    if one isn't already running. Returns False (no-op, no error) if one is
+    already in flight - same pattern as the other library background jobs."""
+    if not mood_detector_lock.acquire(blocking=False):
+        return False
+    try:
+        mood_detector_progress.clear()
+        mood_detector_progress.update(status="running")
+
+        def _run():
+            try:
+                mood_detector.run(get_db_connection, mood_detector_progress, _is_idle)
+            finally:
+                mood_detector_lock.release()
+
+        threading.Thread(target=_run, daemon=True).start()
+        return True
+    except Exception:
+        mood_detector_lock.release()
+        raise
+
+@app.get("/api/library/mood-detector/status")
+async def get_mood_detector_status():
+    return mood_detector_progress
 
 def _start_tag_cleanup_background():
     """Kicks off a background tag-cleanup pass if one isn't already running.

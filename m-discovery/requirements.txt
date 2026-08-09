@@ -7,3 +7,4 @@ Pillow
 requests
 PyChromecast>=13.0.0,<14
 ytmusicapi==1.10.3
+essentia-tensorflow
