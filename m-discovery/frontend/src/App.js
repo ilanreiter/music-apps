@@ -824,6 +824,13 @@ function App() {
   // When the cache backing this view was last built (server timestamp) - null
   // until the first fetch resolves.
   const [flatPlaylistRefreshedAt, setFlatPlaylistRefreshedAt] = useState(null);
+  // All Tracks view filter, by local_id match (see mapSpotifyTrack/
+  // mapYtMusicTrack's local_id, backed by bulk_backfill_local_track_ids):
+  // 'all' | 'in_library' (local_id set - already a file on disk) |
+  // 'missing' (local_id unset - only exists in this playlist cache).
+  // Defaults to 'all' so the view still reads as "everything" until
+  // explicitly narrowed.
+  const [flatPlaylistLocalFilter, setFlatPlaylistLocalFilter] = useState('all');
   // id of a track currently being resolved for preview playback (drives a
   // loading indicator on its play button) - null when nothing's in flight.
   const [matchingTrackId, setMatchingTrackId] = useState(null);
@@ -3123,10 +3130,15 @@ function App() {
     ? libraryTracks.filter((t) => t.track_name.toLowerCase().includes(playlistSearchLower)
       || (t.artist_name || '').toLowerCase().includes(playlistSearchLower))
     : libraryTracks;
+  const flatPlaylistTracksScoped = flatPlaylistLocalFilter === 'in_library'
+    ? flatPlaylistTracks.filter((t) => t.local_id)
+    : flatPlaylistLocalFilter === 'missing'
+      ? flatPlaylistTracks.filter((t) => !t.local_id)
+      : flatPlaylistTracks;
   const filteredFlatPlaylistTracks = playlistSearchLower
-    ? flatPlaylistTracks.filter((t) => t.track_name.toLowerCase().includes(playlistSearchLower)
+    ? flatPlaylistTracksScoped.filter((t) => t.track_name.toLowerCase().includes(playlistSearchLower)
       || (t.artist_name || '').toLowerCase().includes(playlistSearchLower))
-    : flatPlaylistTracks;
+    : flatPlaylistTracksScoped;
 
   // Only meaningful when discoveredGroupedByArtist is true - discoveredTracks
   // already has same-artist tracks landing consecutively (lastfm.py builds
@@ -3653,6 +3665,29 @@ function App() {
                       ? `Last updated ${new Date(flatPlaylistRefreshedAt).toLocaleString()}`
                       : flatPlaylistTracksLoading ? 'Loading…' : ''}
                   </span>
+                  <div className="view-tabs local-filter-tabs">
+                    <button
+                      type="button"
+                      className={flatPlaylistLocalFilter === 'all' ? 'active' : ''}
+                      onClick={() => setFlatPlaylistLocalFilter('all')}
+                    >
+                      All
+                    </button>
+                    <button
+                      type="button"
+                      className={flatPlaylistLocalFilter === 'in_library' ? 'active' : ''}
+                      onClick={() => setFlatPlaylistLocalFilter('in_library')}
+                    >
+                      In Library
+                    </button>
+                    <button
+                      type="button"
+                      className={flatPlaylistLocalFilter === 'missing' ? 'active' : ''}
+                      onClick={() => setFlatPlaylistLocalFilter('missing')}
+                    >
+                      Missing
+                    </button>
+                  </div>
                   <button
                     type="button"
                     className="load-more-btn"
@@ -3671,7 +3706,13 @@ function App() {
                   <p className="empty-state">Loading…</p>
                 ) : filteredFlatPlaylistTracks.length === 0 ? (
                   <p className="empty-state">
-                    {playlistSearchLower ? `No tracks match "${playlistSearchInput}".` : 'No tracks found.'}
+                    {playlistSearchLower
+                      ? `No tracks match "${playlistSearchInput}".`
+                      : flatPlaylistLocalFilter === 'missing'
+                        ? 'Every cached track here is already in your library.'
+                        : flatPlaylistLocalFilter === 'in_library'
+                          ? 'None of these cached tracks are in your library yet.'
+                          : 'No tracks found.'}
                   </p>
                 ) : (
                   <div className={`tracks-grid${trackViewStyle === 'grid' ? ' grid-view' : ''}`}>

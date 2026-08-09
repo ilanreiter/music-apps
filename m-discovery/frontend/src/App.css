@@ -1060,6 +1060,18 @@ main.with-player {
   font-size: 0.85rem;
 }
 
+/* Reuses .view-tabs' pill styling at a smaller size to fit inline in the
+   All Tracks status row alongside the last-updated timestamp and Refresh
+   button. */
+.local-filter-tabs {
+  padding: 2px;
+  flex: 0 0 auto;
+}
+
+.local-filter-tabs button {
+  padding: 5px 10px;
+}
+
 .filter-row {
   display: flex;
   flex-wrap: wrap;

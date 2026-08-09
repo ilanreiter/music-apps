@@ -47,6 +47,7 @@ import json
 import re
 import threading
 import time
+import traceback
 
 # Without this, module-level loggers (e.g. chromecast.py's) have no handler
 # and INFO/WARNING records are silently dropped - only bare exceptions would
@@ -157,6 +158,33 @@ spotify_track_matcher_progress = {"status": "idle"}
 # well below the real track count with no error anywhere. Serializing the
 # whole fetch+replace per platform behind this lock closes that window.
 _playlist_cache_refresh_locks = {'spotify': threading.Lock(), 'ytmusic': threading.Lock()}
+
+# How often the "All Tracks" cache is refreshed unattended, so persisted
+# track ids don't silently go stale between manual visits to the All Tracks
+# tab (see _playlist_track_cache_refresh_loop below). 6h keeps the cache
+# reasonably current without competing much for either platform's rate limit.
+PLAYLIST_TRACK_CACHE_REFRESH_INTERVAL_SECONDS = 6 * 60 * 60
+
+def _playlist_track_cache_refresh_loop():
+    """Background supervisor that keeps playlist_track_cache current for
+    both platforms without requiring a manual All Tracks tab visit or
+    refresh=true call. Runs forever, sleeping between passes; each platform
+    is refreshed independently and a failure on one (network blip, expired
+    auth) doesn't take down the loop or block the other platform's turn.
+    Skips a platform entirely for that pass if it's not connected, rather
+    than erroring - it'll just pick it up once connected on a later pass."""
+    while True:
+        time.sleep(PLAYLIST_TRACK_CACHE_REFRESH_INTERVAL_SECONDS)
+        for platform, connect_module in (('spotify', spotify_connect), ('ytmusic', ytmusic_connect)):
+            if not connect_module.is_connected():
+                continue
+            try:
+                with _playlist_cache_refresh_locks[platform]:
+                    tracks, skipped = connect_module.get_all_playlist_tracks()
+                    replace_playlist_track_cache(platform, tracks, skipped)
+                print(f"Refreshed {platform} playlist_track_cache in the background ({len(tracks)} tracks, {skipped} playlists skipped).")
+            except Exception:
+                traceback.print_exc()
 
 # No in-memory progress dict for this one, unlike the jobs above - its state
 # (status/counters) lives entirely in the ytmusic_push_job Postgres row (see
@@ -578,6 +606,13 @@ async def startup_event():
         args=(get_db_connection, shazam_identify_progress),
         daemon=True,
     ).start()
+
+    # Keeps playlist_track_cache from going stale between manual All Tracks
+    # tab visits - see _playlist_track_cache_refresh_loop. Unconditional like
+    # the two threads above: it no-ops per platform until that platform is
+    # connected, so it's safe to start even before either auth flow is done.
+    print("Starting playlist track cache refresh loop in the background.")
+    threading.Thread(target=_playlist_track_cache_refresh_loop, daemon=True).start()
 
 @app.get("/")
 async def read_root():
