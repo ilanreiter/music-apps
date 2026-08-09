@@ -899,6 +899,9 @@ function App() {
   // below actually fetched for, so it can tell "a filter genuinely changed"
   // apart from "activeTab just flipped back to library" - see that effect.
   const libraryFetchKeyRef = useRef(null);
+  // Sentinel element observed to auto-load the next page of library tracks
+  // as the user scrolls near the bottom, instead of requiring a manual click.
+  const libraryLoadMoreRef = useRef(null);
   // True only when libraryShuffleMode was restored from a prior session (not
   // a fresh toggle click) - the very first fetch after a reload should show
   // the deterministic list, not roll a brand-new random order that's
@@ -1457,6 +1460,22 @@ function App() {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeTab, libraryMode, drill, search, filterGenre, filterDecade, filterQuality, filterFormat, filterMood, filterSpotifyAvailable, filterTrackLimit]);
+
+  // Auto-loads the next page of library tracks as the user scrolls near the
+  // bottom of the grid, instead of requiring a manual "Load more" click.
+  useEffect(() => {
+    if (activeTab !== 'library' || drill) return;
+    const sentinel = libraryLoadMoreRef.current;
+    if (!sentinel) return;
+    const observer = new IntersectionObserver((entries) => {
+      if (entries[0].isIntersecting && !libraryLoading && libraryTracks.length < libraryTotal) {
+        fetchLibraryTracks(libraryTracks.length);
+      }
+    }, { rootMargin: '600px' });
+    observer.observe(sentinel);
+    return () => observer.disconnect();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeTab, drill, libraryTracks.length, libraryTotal, libraryLoading]);
 
   // Playlists tab's "All Tracks" mode - independent of the dispatch above
   // (which only ever drives "By Playlist" groups/drill), refetches whenever
@@ -3490,13 +3509,9 @@ function App() {
                   </div>
                 )}
                 {libraryTracks.length < libraryTotal && (
-                  <button
-                    className="load-more-btn"
-                    disabled={libraryLoading}
-                    onClick={() => fetchLibraryTracks(libraryTracks.length)}
-                  >
-                    {libraryLoading ? 'Loading…' : `Load more (${libraryTracks.length.toLocaleString()} of ${libraryTotal.toLocaleString()})`}
-                  </button>
+                  <div ref={libraryLoadMoreRef} className="load-more-sentinel">
+                    {libraryLoading && `Loading… (${libraryTracks.length.toLocaleString()} of ${libraryTotal.toLocaleString()})`}
+                  </div>
                 )}
               </>
             ) : (

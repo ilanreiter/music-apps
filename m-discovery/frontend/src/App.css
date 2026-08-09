@@ -1754,6 +1754,14 @@ main.with-player {
   cursor: not-allowed;
 }
 
+.load-more-sentinel {
+  height: 40px;
+  margin-top: 16px;
+  text-align: center;
+  color: var(--text-muted);
+  font-size: 0.85rem;
+}
+
 .player-root {
   position: fixed;
   left: 0;
