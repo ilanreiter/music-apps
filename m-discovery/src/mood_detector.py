@@ -1,3 +1,4 @@
+import multiprocessing as mp
 import os
 import time
 import urllib.request
@@ -129,6 +130,79 @@ def classify_track(file_path):
     return best_mood if best_score >= CONFIDENCE_THRESHOLD else None
 
 
+def _classify_worker(task_q, result_q):
+    """Runs in its own process so a crash inside essentia's native code stays
+    contained here instead of taking down the whole app - confirmed live:
+    an isolated-strings edit of a Beatles track (known_tracks id 7473)
+    reliably segfaults _essentia.so, and since that happens before the row
+    is ever marked mood_checked, it took the whole API down on every restart
+    forever (same track is always first back up in the unordered LIMIT 1
+    query)."""
+    while True:
+        file_path = task_q.get()
+        if file_path is None:
+            return
+        try:
+            result_q.put(('ok', classify_track(file_path)))
+        except Exception as e:
+            result_q.put(('error', str(e)))
+
+
+class _IsolatedClassifier:
+    """Keeps one persistent worker subprocess alive across calls (models are
+    loaded once, not per track) and transparently respawns it if it dies -
+    e.g. a segfault on a bad file. classify() then raises a normal Python
+    exception for that one track instead of the whole process disappearing,
+    which run()'s existing per-track except already turns into a skipped
+    row rather than a retry loop."""
+
+    def __init__(self):
+        self._ctx = mp.get_context('spawn')
+        self._proc = None
+        self._task_q = None
+        self._result_q = None
+
+    def _ensure_started(self):
+        if self._proc is not None and self._proc.is_alive():
+            return
+        self._task_q = self._ctx.Queue()
+        self._result_q = self._ctx.Queue()
+        self._proc = self._ctx.Process(
+            target=_classify_worker, args=(self._task_q, self._result_q), daemon=True)
+        self._proc.start()
+
+    def _restart(self):
+        if self._proc is not None:
+            try:
+                self._proc.kill()
+                self._proc.join(timeout=5)
+            except Exception:
+                pass
+        self._proc = None
+
+    def classify(self, file_path, timeout=60):
+        self._ensure_started()
+        self._task_q.put(file_path)
+        while True:
+            try:
+                status, payload = self._result_q.get(timeout=1)
+                break
+            except Exception:
+                if not self._proc.is_alive():
+                    self._restart()
+                    raise RuntimeError(f'mood classifier worker crashed on {file_path}')
+                timeout -= 1
+                if timeout <= 0:
+                    self._restart()
+                    raise RuntimeError(f'mood classifier worker timed out on {file_path}')
+        if status == 'error':
+            raise RuntimeError(payload)
+        return payload
+
+
+_classifier = _IsolatedClassifier()
+
+
 def run(get_connection, progress, is_idle):
     """Slowly works through known_tracks where mood_checked IS NOT TRUE,
     BATCH_SIZE rows per cycle, only while the app is idle (no recent
@@ -169,7 +243,7 @@ def run(get_connection, progress, is_idle):
                 track_id, file_path = row
                 cur = conn.cursor()
                 try:
-                    mood = classify_track(file_path)
+                    mood = _classifier.classify(file_path)
                     cur.execute("UPDATE known_tracks SET mood = %s, mood_checked = TRUE WHERE id = %s", (mood, track_id))
                     if mood:
                         progress['tagged'] += 1
