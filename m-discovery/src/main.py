@@ -36,6 +36,7 @@ from . import ytmusic_push_job
 from . import external_artwork
 from . import spotify_track_matcher
 from . import tag_cleanup
+from . import genre_cleanup
 from . import playback_advancer
 from . import shazam_identify
 from . import mood_detector
@@ -194,6 +195,12 @@ ytmusic_push_job_lock = threading.Lock()
 
 tag_cleanup_lock = threading.Lock()
 tag_cleanup_progress = {"status": "idle"}
+
+genre_cleanup_lock = threading.Lock()
+genre_cleanup_progress = {"status": "idle"}
+
+genre_song_consolidation_lock = threading.Lock()
+genre_song_consolidation_progress = {"status": "idle"}
 
 # Not a one-shot backfill like the jobs above (no lock/trigger-route needed -
 # there's nothing to "start" on demand) - see playback_advancer.run for why.
@@ -2402,6 +2409,11 @@ async def scan_library(params: LibraryScanRequest):
                 # to remember to click "Check Artwork" themselves.
                 if scan_progress.get('status') == 'done':
                     _start_artwork_check_background()
+                    # Same reasoning - newly-scanned tracks carry whatever raw
+                    # genre tag was in the file, un-normalized (see
+                    # genre_cleanup.py), so a scan is exactly the event that
+                    # creates new genre_cleanup backlog too.
+                    _start_genre_cleanup_background()
             finally:
                 scan_lock.release()
 
@@ -2599,6 +2611,82 @@ async def get_tag_cleanup_fixed(
     tracks = cur.fetchall()
     cur.close()
     return {"total": total, "tracks": tracks}
+
+def _start_genre_cleanup_background():
+    """Kicks off a background genre-cleanup pass if one isn't already
+    running. Returns False (no-op, no error) if one is already in flight -
+    same pattern as tag_cleanup above."""
+    if not genre_cleanup_lock.acquire(blocking=False):
+        return False
+    try:
+        genre_cleanup_progress.clear()
+        genre_cleanup_progress.update(status="running")
+
+        def _run():
+            try:
+                genre_cleanup.clean_genres(get_db_connection, genre_cleanup_progress)
+                # Chained, not fired independently - song consolidation needs
+                # tag cleanup's normalized values (e.g. 'Rock/Pop' -> 'Pop
+                # Rock') already in place to compare genres across a song's
+                # copies meaningfully, and running both from two independent
+                # background threads would race on the same rows.
+                if genre_cleanup_progress.get('status') == 'done':
+                    _start_genre_song_consolidation_background()
+            finally:
+                genre_cleanup_lock.release()
+
+        threading.Thread(target=_run, daemon=True).start()
+        return True
+    except Exception:
+        genre_cleanup_lock.release()
+        raise
+
+@app.post("/api/library/genre-cleanup", status_code=status.HTTP_202_ACCEPTED)
+async def start_genre_cleanup():
+    if not _start_genre_cleanup_background():
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="A genre cleanup is already running.")
+    return genre_cleanup_progress
+
+@app.get("/api/library/genre-cleanup/status")
+async def get_genre_cleanup_status():
+    return genre_cleanup_progress
+
+def _start_genre_song_consolidation_background():
+    """Kicks off a background song-level genre consolidation pass (see
+    genre_cleanup.consolidate_song_genres) if one isn't already running.
+    Returns False (no-op, no error) if one is already in flight - same
+    pattern as genre_cleanup above. Deliberately separate from
+    _start_genre_cleanup_background rather than folded into the same job -
+    this operates on genre *groups* (same song across multiple rows), not a
+    per-row checked flag, so it has its own progress shape and is meant to
+    run again after genre_cleanup, not instead of it."""
+    if not genre_song_consolidation_lock.acquire(blocking=False):
+        return False
+    try:
+        genre_song_consolidation_progress.clear()
+        genre_song_consolidation_progress.update(status="running")
+
+        def _run():
+            try:
+                genre_cleanup.consolidate_song_genres(get_db_connection, genre_song_consolidation_progress)
+            finally:
+                genre_song_consolidation_lock.release()
+
+        threading.Thread(target=_run, daemon=True).start()
+        return True
+    except Exception:
+        genre_song_consolidation_lock.release()
+        raise
+
+@app.post("/api/library/genre-song-consolidation", status_code=status.HTTP_202_ACCEPTED)
+async def start_genre_song_consolidation():
+    if not _start_genre_song_consolidation_background():
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="A genre song-consolidation is already running.")
+    return genre_song_consolidation_progress
+
+@app.get("/api/library/genre-song-consolidation/status")
+async def get_genre_song_consolidation_status():
+    return genre_song_consolidation_progress
 
 def _start_external_artwork_background():
     """Kicks off a background external-artwork backfill if one isn't already
