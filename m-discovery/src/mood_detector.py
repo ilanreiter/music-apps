@@ -33,6 +33,16 @@ MOOD_HEADS = {
 # single calibrated multi-class model, so "highest of five, no matter how
 # low" isn't a meaningful pick the way an argmax over one softmax would be.
 CONFIDENCE_THRESHOLD = 0.5
+# The threshold above isn't enough on its own - confirmed live against the
+# first ~11k tracks analyzed: 'Relaxed' alone came out to 45% of the library
+# (vs. 3-27% for the other four), wildly disproportionate for a library
+# that's a third Rock-family content. These 5 heads are independently
+# calibrated (different training runs, different datasets), so a 0.5 cutoff
+# doesn't mean the same thing across them - 'Relaxed' evidently fires
+# "medium-confident" on far more audio than the others do. Requiring the
+# winner to clear the runner-up by a real margin, not just the absolute
+# bar, discounts a head that's just generally more trigger-happy.
+MARGIN_THRESHOLD = 0.15
 
 MODEL_DIR = os.environ.get('MOOD_MODEL_DIR', '/app/mood_model_cache')
 
@@ -111,23 +121,27 @@ def _load_models():
 
 def classify_track(file_path):
     """Real per-track mood from the audio itself - returns the highest-
-    scoring mood bucket name if it clears CONFIDENCE_THRESHOLD, else None
-    (no bucket confidently applies). Raises on a file that can't be loaded
-    (missing, corrupt, unreadable format) - the caller decides how to record
-    that."""
+    scoring mood bucket name if it clears CONFIDENCE_THRESHOLD AND beats the
+    runner-up by MARGIN_THRESHOLD, else None (no bucket confidently and
+    distinctly applies). Raises on a file that can't be loaded (missing,
+    corrupt, unreadable format) - the caller decides how to record that."""
     _load_models()
     import essentia.standard as es
 
     audio = es.MonoLoader(filename=file_path, sampleRate=16000)()
     embeddings = _embed_model(audio)
 
-    best_mood, best_score = None, 0.0
+    scores = {}
     for mood, (_rel_path, class_idx) in MOOD_HEADS.items():
         preds = _head_models[mood](embeddings)
-        score = float(np.mean(preds, axis=0)[class_idx])
-        if score > best_score:
-            best_mood, best_score = mood, score
-    return best_mood if best_score >= CONFIDENCE_THRESHOLD else None
+        scores[mood] = float(np.mean(preds, axis=0)[class_idx])
+
+    ranked = sorted(scores.values(), reverse=True)
+    best_mood = max(scores, key=scores.get)
+    best_score, runner_up_score = ranked[0], ranked[1]
+    if best_score >= CONFIDENCE_THRESHOLD and (best_score - runner_up_score) >= MARGIN_THRESHOLD:
+        return best_mood
+    return None
 
 
 def _classify_worker(task_q, result_q):
@@ -223,8 +237,14 @@ def run(get_connection, progress, is_idle):
 
         conn = get_connection()
         if conn is None:
-            progress.update(status='error', error='Could not connect to the database')
-            return
+            # A transient DB hiccup (confirmed live: this killed the whole
+            # background thread permanently, with nothing left to restart
+            # it) shouldn't be treated as fatal the way a genuinely
+            # unrecoverable condition would be - back off and keep retrying
+            # rather than giving up on the rest of the ~12-hour backfill.
+            progress.update(status='waiting_db_error', error='Could not connect to the database - retrying')
+            time.sleep(IDLE_POLL_INTERVAL_SECONDS)
+            continue
         done = False
         try:
             for _ in range(BATCH_SIZE):
