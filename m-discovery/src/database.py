@@ -81,10 +81,15 @@ def create_tables():
                     ADD COLUMN IF NOT EXISTS last_played_at TIMESTAMP,
                     ADD COLUMN IF NOT EXISTS last_played_reason TEXT,
                     ADD COLUMN IF NOT EXISTS last_played_engine TEXT,
-                    ADD COLUMN IF NOT EXISTS mood TEXT,
                     ADD COLUMN IF NOT EXISTS mood_checked BOOLEAN DEFAULT FALSE,
                     ADD COLUMN IF NOT EXISTS original_genre TEXT,
-                    ADD COLUMN IF NOT EXISTS genre_cleanup_checked BOOLEAN DEFAULT FALSE;
+                    ADD COLUMN IF NOT EXISTS genre_cleanup_checked BOOLEAN DEFAULT FALSE,
+                    ADD COLUMN IF NOT EXISTS mood_happy_score REAL,
+                    ADD COLUMN IF NOT EXISTS mood_sad_score REAL,
+                    ADD COLUMN IF NOT EXISTS mood_aggressive_score REAL,
+                    ADD COLUMN IF NOT EXISTS mood_relaxed_score REAL,
+                    ADD COLUMN IF NOT EXISTS mood_party_score REAL,
+                    DROP COLUMN IF EXISTS mood;
             """)
             cur.execute("""
                 ALTER TABLE known_tracks

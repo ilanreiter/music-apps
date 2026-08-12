@@ -10,10 +10,13 @@ import numpy as np
 # shouldn't be redistributed). One shared embedding extractor
 # (discogs-effnet) feeds five small classification heads, each a binary
 # "is this mood or not" model trained independently on its own small in-house
-# dataset - they don't calibrate against each other, so this is a best-effort
-# signal, not a lab-grade measurement. Confirmed live against real library
-# tracks before wiring this up: a Sex Pistols punk track scored high on
-# aggressive/party and low on relaxed/sad, as expected.
+# dataset - they don't calibrate against each other, so raw scores are
+# persisted per mood rather than collapsed into one winner (see
+# MOOD_SCORE_COLUMNS below) - the app decides per-mood thresholds at query
+# time instead of this module guessing a single "the" mood per track.
+# Confirmed live against real library tracks before wiring this up: a Sex
+# Pistols punk track scored high on aggressive/party and low on
+# relaxed/sad, as expected.
 MODEL_BASE_URL = "https://essentia.upf.edu/models"
 EMBEDDING_MODEL = "feature-extractors/discogs-effnet/discogs-effnet-bs64-1.pb"
 # (classification-head path, output class index for "this mood applies") -
@@ -27,22 +30,26 @@ MOOD_HEADS = {
     'Relaxed': ("classification-heads/mood_relaxed/mood_relaxed-discogs-effnet-1.pb", 1),
     'Party': ("classification-heads/mood_party/mood_party-discogs-effnet-1.pb", 1),
 }
-# A track only gets a mood bucket if some head is confidently over this bar;
-# otherwise it's left NULL ('Unspecified') rather than forcing a weak
-# guess - these heads are independently-trained binary classifiers, not a
-# single calibrated multi-class model, so "highest of five, no matter how
-# low" isn't a meaningful pick the way an argmax over one softmax would be.
-CONFIDENCE_THRESHOLD = 0.5
-# The threshold above isn't enough on its own - confirmed live against the
-# first ~11k tracks analyzed: 'Relaxed' alone came out to 45% of the library
-# (vs. 3-27% for the other four), wildly disproportionate for a library
-# that's a third Rock-family content. These 5 heads are independently
-# calibrated (different training runs, different datasets), so a 0.5 cutoff
-# doesn't mean the same thing across them - 'Relaxed' evidently fires
-# "medium-confident" on far more audio than the others do. Requiring the
-# winner to clear the runner-up by a real margin, not just the absolute
-# bar, discounts a head that's just generally more trigger-happy.
-MARGIN_THRESHOLD = 0.15
+
+# Single source of truth for how each mood's raw score is stored/queried -
+# shared with main.py so a mood name from a request always maps to the same
+# column there as it does when this module writes it.
+MOOD_SCORE_COLUMNS = {
+    'Happy': 'mood_happy_score',
+    'Sad': 'mood_sad_score',
+    'Aggressive': 'mood_aggressive_score',
+    'Relaxed': 'mood_relaxed_score',
+    'Party': 'mood_party_score',
+}
+
+# Starting point only - these 5 heads are independently calibrated (confirmed
+# live: with a single flat 0.5 "pick the winner" cutoff, 'Relaxed' alone hit
+# 45% of the library, wildly disproportionate to the other four), so a flat
+# 0.5 threshold here is not expected to produce comparable hit rates across
+# moods. Callers can override per-request (see main.py's mood_threshold
+# param) - once the whole library has real persisted scores, actual
+# per-mood distributions can inform better defaults than this guess.
+DEFAULT_MOOD_THRESHOLDS = {mood: 0.5 for mood in MOOD_HEADS}
 
 MODEL_DIR = os.environ.get('MOOD_MODEL_DIR', '/app/mood_model_cache')
 
@@ -120,11 +127,11 @@ def _load_models():
 
 
 def classify_track(file_path):
-    """Real per-track mood from the audio itself - returns the highest-
-    scoring mood bucket name if it clears CONFIDENCE_THRESHOLD AND beats the
-    runner-up by MARGIN_THRESHOLD, else None (no bucket confidently and
-    distinctly applies). Raises on a file that can't be loaded (missing,
-    corrupt, unreadable format) - the caller decides how to record that."""
+    """Real per-track mood scores from the audio itself - returns
+    {mood_name: score} for all 5 heads, unfiltered. No winner-picking here;
+    the caller (run(), then main.py's query filters) decides what counts as
+    a match. Raises on a file that can't be loaded (missing, corrupt,
+    unreadable format) - the caller decides how to record that."""
     _load_models()
     import essentia.standard as es
 
@@ -135,13 +142,7 @@ def classify_track(file_path):
     for mood, (_rel_path, class_idx) in MOOD_HEADS.items():
         preds = _head_models[mood](embeddings)
         scores[mood] = float(np.mean(preds, axis=0)[class_idx])
-
-    ranked = sorted(scores.values(), reverse=True)
-    best_mood = max(scores, key=scores.get)
-    best_score, runner_up_score = ranked[0], ranked[1]
-    if best_score >= CONFIDENCE_THRESHOLD and (best_score - runner_up_score) >= MARGIN_THRESHOLD:
-        return best_mood
-    return None
+    return scores
 
 
 def _classify_worker(task_q, result_q):
@@ -227,7 +228,7 @@ def run(get_connection, progress, is_idle):
     limit, so the pacing here is much less conservative. Runs in a
     background thread (started once at app startup if there's work to do)
     until the whole library is checked."""
-    progress.update(status='running', processed=0, tagged=0, error=None)
+    progress.update(status='running', processed=0, scored=0, error=None)
 
     while True:
         if not is_idle():
@@ -263,14 +264,19 @@ def run(get_connection, progress, is_idle):
                 track_id, file_path = row
                 cur = conn.cursor()
                 try:
-                    mood = _classifier.classify(file_path)
-                    cur.execute("UPDATE known_tracks SET mood = %s, mood_checked = TRUE WHERE id = %s", (mood, track_id))
-                    if mood:
-                        progress['tagged'] += 1
+                    scores = _classifier.classify(file_path)
+                    columns = [MOOD_SCORE_COLUMNS[m] for m in MOOD_HEADS]
+                    set_clause = ", ".join(f"{col} = %s" for col in columns)
+                    cur.execute(
+                        f"UPDATE known_tracks SET {set_clause}, mood_checked = TRUE WHERE id = %s",
+                        [scores[m] for m in MOOD_HEADS] + [track_id],
+                    )
+                    progress['scored'] += 1
                 except Exception as e:
                     # A file that can't be loaded (missing/corrupt/unsupported
                     # codec) would otherwise block this row forever - mark it
-                    # checked with no mood rather than retrying it every cycle.
+                    # checked with all scores left NULL rather than retrying
+                    # it every cycle.
                     print(f"mood_detector: skipping track {track_id} ({file_path}): {e}")
                     cur.execute("UPDATE known_tracks SET mood_checked = TRUE WHERE id = %s", (track_id,))
                 conn.commit()

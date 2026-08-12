@@ -40,6 +40,7 @@ from . import genre_cleanup
 from . import playback_advancer
 from . import shazam_identify
 from . import mood_detector
+from .mood_detector import MOOD_SCORE_COLUMNS, DEFAULT_MOOD_THRESHOLDS
 from . import lastfm
 from . import radio_engine
 import logging
@@ -115,20 +116,63 @@ LENGTH_TIER_RANK_SQL = f"""
         ELSE 3
     END
 """
-# Mood is measured, not guessed: known_tracks.mood is populated by
-# mood_detector.py running Essentia's pretrained audio classifiers
+# Mood is measured, not guessed: known_tracks.mood_<name>_score is populated
+# by mood_detector.py running Essentia's pretrained audio classifiers
 # (happy/sad/aggressive/relaxed/party) directly on each file's waveform, not
 # derived from its genre tag - a genre-keyword heuristic was tried first and
 # dropped once "Rock" (a third of this library) turned out to imply no mood
-# at all. A row's mood is NULL until that background job actually analyzes
-# it, at which point it's either a real bucket name or NULL again (analyzed,
-# but no bucket scored confidently) - either way NULL reads as 'Unspecified'
-# here rather than as a guess.
-MOOD_SQL = "COALESCE(mood, 'Unspecified')"
+# at all. Deliberately NOT a single "the mood" column - confirmed live the 5
+# heads aren't mutually exclusive (a slow ballad can legitimately score high
+# on both Sad and Relaxed at once), so each mood's raw score is stored and a
+# track matches a mood filter whenever its score for that mood clears a
+# threshold - see MOOD_SCORE_COLUMNS/DEFAULT_MOOD_THRESHOLDS in
+# mood_detector.py. A track can match zero, one, or several mood filters.
 FAVORITE_LABEL_SQL = "CASE WHEN is_favorite THEN 'Favorites' ELSE 'Not Favorited' END"
 # One representative track per group, for a grid-view tile's artwork - prefers
 # a track that actually has artwork, falling back to any track in the group.
 SAMPLE_TRACK_SQL = "COALESCE(MIN(CASE WHEN has_artwork THEN id END), MIN(id))"
+
+MOOD_SCORE_SELECT_SQL = ", ".join(MOOD_SCORE_COLUMNS.values())
+
+# Not a real 6th classifier - confirmed live that ~5% of genuinely-analyzed
+# tracks (e.g. Red Hot Chili Peppers' "Under the Bridge") don't clear any of
+# the 5 real moods' thresholds, all scoring in a mediocre middle zone rather
+# than any one being a confident "yes". "Mixed" surfaces that population as
+# its own filterable option instead of leaving it invisible as
+# indistinguishable-from-not-yet-analyzed NULLs.
+MIXED_MOOD_LABEL = "Mixed"
+ALL_MOOD_FILTER_OPTIONS = list(MOOD_SCORE_COLUMNS) + [MIXED_MOOD_LABEL]
+
+def _mood_filter_sql(mood, mood_threshold, params, param_prefix='mood'):
+    """WHERE-clause fragment for a mood filter/group - mutates params with
+    whatever threshold value(s) it needs, keyed off param_prefix so this can
+    be called more than once in the same query (see the by=mood loop) without
+    its params colliding. Real moods: track's own score clears the
+    threshold. MIXED_MOOD_LABEL: track was actually analyzed (excludes both
+    "not yet analyzed" and "decode failed" - both leave every score NULL,
+    indistinguishable from each other without this check) and every real
+    mood's score fell short of its own threshold."""
+    if mood == MIXED_MOOD_LABEL:
+        clauses = [f"{column} IS NOT NULL" for column in MOOD_SCORE_COLUMNS.values()]
+        for name, column in MOOD_SCORE_COLUMNS.items():
+            key = f'{param_prefix}_threshold_{name}'
+            params[key] = mood_threshold if mood_threshold is not None else DEFAULT_MOOD_THRESHOLDS[name]
+            clauses.append(f"{column} < %({key})s")
+        return "mood_checked IS TRUE AND " + " AND ".join(clauses)
+    column = _mood_score_column(mood)
+    key = f'{param_prefix}_threshold'
+    params[key] = mood_threshold if mood_threshold is not None else DEFAULT_MOOD_THRESHOLDS[mood]
+    return f"{column} >= %({key})s"
+
+def _mood_score_column(mood):
+    """Resolves a request's mood name to its fixed column name, never the
+    raw request string itself - MOOD_SCORE_COLUMNS is a closed whitelist, so
+    this is what keeps a mood filter from being a SQL-injection vector via
+    an f-string column reference."""
+    column = MOOD_SCORE_COLUMNS.get(mood)
+    if column is None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"mood must be one of: {', '.join(ALL_MOOD_FILTER_OPTIONS)}")
+    return column
 
 app = FastAPI()
 
@@ -261,10 +305,16 @@ class Track(BaseModel):
     channels: Optional[int] = None
     file_size_bytes: Optional[int] = None
     file_format: Optional[str] = None
-    # From audio analysis (see mood_detector.py), not a text-tag guess -
-    # 'Unspecified' until the background backfill actually reaches this
-    # track (see MOOD_SQL's own comment).
-    mood: Optional[str] = None
+    # Raw per-mood scores from audio analysis (see mood_detector.py), not a
+    # single "the mood" guess - all None until the background backfill
+    # reaches this track. Whether a mood "applies" is a threshold decision
+    # made at query time (see MOOD_SCORE_COLUMNS/DEFAULT_MOOD_THRESHOLDS),
+    # not baked into the stored value.
+    mood_happy_score: Optional[float] = None
+    mood_sad_score: Optional[float] = None
+    mood_aggressive_score: Optional[float] = None
+    mood_relaxed_score: Optional[float] = None
+    mood_party_score: Optional[float] = None
     artwork_source_url: Optional[str] = None
     is_favorite: Optional[bool] = False
     last_played: Optional[str] = None # Will be datetime string
@@ -638,6 +688,7 @@ async def get_known_tracks(
     favorite: Optional[bool] = None,
     length: Optional[str] = None,
     mood: Optional[str] = None,
+    mood_threshold: Optional[float] = None,
     external_artwork_found: Optional[bool] = None,
     spotify_available: Optional[bool] = None,
     shuffle: bool = False,
@@ -681,8 +732,7 @@ async def get_known_tracks(
             where_clauses.append(f"({LENGTH_TIER_SQL}) = %(length)s")
             params['length'] = length
         if mood:
-            where_clauses.append(f"({MOOD_SQL}) = %(mood)s")
-            params['mood'] = mood
+            where_clauses.append(_mood_filter_sql(mood, mood_threshold, params))
         if external_artwork_found is not None:
             # external_artwork_checked is only ever set on rows the external-artwork
             # job actually processed (has_artwork was FALSE going in), so this
@@ -708,7 +758,7 @@ async def get_known_tracks(
                 (SELECT DISTINCT ON ({DEDUP_NORM_TITLE_SQL}, {DEDUP_NORM_ARTIST_SQL}, {DEDUP_NORM_ALBUM_SQL})
                         id, track_name, artist_name, album_name, genre, year, duration_seconds,
                         bitrate, sample_rate, channels, file_size_bytes, file_path, artwork_source_url, is_favorite, last_played,
-                        spotify_track_id, ytmusic_video_id, mood
+                        spotify_track_id, ytmusic_video_id, {MOOD_SCORE_SELECT_SQL}
                  FROM known_tracks {where_sql}
                  ORDER BY {DEDUP_NORM_TITLE_SQL}, {DEDUP_NORM_ARTIST_SQL}, {DEDUP_NORM_ALBUM_SQL},
                           {QUALITY_TIER_RANK_SQL} ASC, bitrate DESC NULLS LAST, id ASC
@@ -742,7 +792,7 @@ async def get_known_tracks(
         cur.execute(f"""
             SELECT id, track_name, artist_name, album_name, genre, year, duration_seconds,
                    bitrate, sample_rate, channels, file_size_bytes, file_path, artwork_source_url, is_favorite, last_played,
-                   spotify_track_id, ytmusic_video_id, {MOOD_SQL} AS mood
+                   spotify_track_id, ytmusic_video_id, {MOOD_SCORE_SELECT_SQL}
             FROM {from_sql}
             {order_sql}
             LIMIT %(limit)s OFFSET %(offset)s
@@ -778,7 +828,7 @@ async def get_tracks_by_ids(params: TrackIdsRequest, db: psycopg2.extensions.con
     cur.execute(f"""
         SELECT id, track_name, artist_name, album_name, genre, year, duration_seconds,
                bitrate, sample_rate, channels, file_size_bytes, file_path, artwork_source_url, is_favorite, last_played,
-               spotify_track_id, ytmusic_video_id, {MOOD_SQL} AS mood
+               spotify_track_id, ytmusic_video_id, {MOOD_SCORE_SELECT_SQL}
         FROM known_tracks WHERE id = ANY(%s)
     """, (id_list,))
     rows_by_id = {row['id']: row for row in cur.fetchall()}
@@ -798,6 +848,7 @@ async def get_library_groups(
     quality: Optional[str] = None,
     format: Optional[str] = None,
     mood: Optional[str] = None,
+    mood_threshold: Optional[float] = None,
     spotify_available: Optional[bool] = None,
     db: psycopg2.extensions.connection = Depends(get_db),
 ):
@@ -826,8 +877,7 @@ async def get_library_groups(
             extra_clauses.append(f"({FORMAT_SQL}) = %(format)s")
             params['format'] = format.upper()
         if mood:
-            extra_clauses.append(f"({MOOD_SQL}) = %(mood)s")
-            params['mood'] = mood
+            extra_clauses.append(_mood_filter_sql(mood, mood_threshold, params))
         if spotify_available is not None:
             extra_clauses.append("(spotify_track_id IS NOT NULL) = %(spotify_available)s")
             params['spotify_available'] = spotify_available
@@ -878,12 +928,24 @@ async def get_library_groups(
             """, params)
             groups = [{"key": row[0], "label": row[0], "count": row[1], "sample_track_id": row[2]} for row in cur.fetchall()]
         elif by == "mood":
-            cur.execute(f"""
-                SELECT {MOOD_SQL} AS bucket, COUNT(*), {SAMPLE_TRACK_SQL} FROM known_tracks
-                WHERE 1=1 {extra_sql}
-                GROUP BY bucket ORDER BY COUNT(*) DESC
-            """, params)
-            groups = [{"key": row[0], "label": row[0], "count": row[1], "sample_track_id": row[2]} for row in cur.fetchall()]
+            # Not a GROUP BY - a track can clear more than one mood's
+            # threshold at once (see MOOD_SCORE_COLUMNS's own comment), so
+            # this is 6 independent "how many tracks match this option"
+            # counts (5 real moods + MIXED_MOOD_LABEL) rather than a
+            # partition. Counts can sum to more than the library total;
+            # that's correct, not a bug.
+            groups = []
+            for mood_name in ALL_MOOD_FILTER_OPTIONS:
+                group_params = dict(params)
+                clause = _mood_filter_sql(mood_name, mood_threshold, group_params, param_prefix=f'group_{mood_name}')
+                cur.execute(f"""
+                    SELECT COUNT(*), {SAMPLE_TRACK_SQL} FROM known_tracks
+                    WHERE {clause} {extra_sql}
+                """, group_params)
+                count, sample_id = cur.fetchone()
+                if count:
+                    groups.append({"key": mood_name, "label": mood_name, "count": count, "sample_track_id": sample_id})
+            groups.sort(key=lambda g: -g["count"])
         else:
             # Grouping by (album_name, artist_name) fragments any album where
             # tracks carry different per-track artist tags - which is exactly
@@ -2548,6 +2610,18 @@ def _start_mood_detector_background():
     except Exception:
         mood_detector_lock.release()
         raise
+
+@app.post("/api/library/mood-detector", status_code=status.HTTP_202_ACCEPTED)
+async def start_mood_detector():
+    # Auto-resume-at-boot only fires when there's remaining work at the
+    # moment the process starts - confirmed live this leaves no way to
+    # restart the job for backlog created *after* boot (e.g. an explicit
+    # mood_checked reset for a reprocessing pass, or recovering from a
+    # stalled run) short of restarting the whole container. This closes
+    # that gap the same way tag_cleanup/genre_cleanup already have one.
+    if not _start_mood_detector_background():
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="A mood detector run is already in progress.")
+    return mood_detector_progress
 
 @app.get("/api/library/mood-detector/status")
 async def get_mood_detector_status():
