@@ -782,6 +782,9 @@ function App() {
   const [scanError, setScanError] = useState(null);
   const [stats, setStats] = useState(null);
   const [statsLoading, setStatsLoading] = useState(false);
+  const [tasteSubTab, setTasteSubTab] = useState('overview');
+  const [moodStats, setMoodStats] = useState(null);
+  const [moodStatsLoading, setMoodStatsLoading] = useState(false);
   const pollRef = useRef(null);
 
   // Library browsing: flat search/filter or grouped-by-album/genre/decade/... with drill-down
@@ -1366,6 +1369,16 @@ function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeTab]);
 
+  // Lazy per-subtab fetch, same convention as CleanupTab's subtabs - only
+  // hit the (separate, heavier) mood-stats endpoint once the Genre x Mood
+  // subtab is actually opened, not on every Taste tab visit.
+  useEffect(() => {
+    if (activeTab === 'taste' && tasteSubTab === 'genre-mood' && !moodStats) {
+      fetchMoodStats();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeTab, tasteSubTab]);
+
   // Debounce free-text search so we're not hitting the API on every keystroke.
   useEffect(() => {
     const t = setTimeout(() => setSearch(searchInput.trim()), 400);
@@ -1841,6 +1854,18 @@ function App() {
       console.error('Error fetching library stats:', err);
     } finally {
       setStatsLoading(false);
+    }
+  };
+
+  const fetchMoodStats = async () => {
+    setMoodStatsLoading(true);
+    try {
+      const response = await axios.get(`${API_BASE_URL}/library/stats/mood`);
+      setMoodStats(response.data);
+    } catch (err) {
+      console.error('Error fetching mood stats:', err);
+    } finally {
+      setMoodStatsLoading(false);
     }
   };
 
@@ -3828,35 +3853,55 @@ function App() {
           </section>
         ) : activeTab === 'taste' ? (
           <section className="taste-section">
-            {statsLoading && !stats ? (
-              <p className="empty-state">Loading taste profile...</p>
-            ) : !stats || stats.total_tracks === 0 ? (
-              <p className="empty-state">Scan your library to build a taste profile.</p>
-            ) : (
-              <>
-                <div className="stat-tiles">
-                  <div className="stat-tile">
-                    <span className="stat-value">{stats.total_tracks.toLocaleString()}</span>
-                    <span className="stat-label">Tracks</span>
-                  </div>
-                  <div className="stat-tile">
-                    <span className="stat-value">{stats.top_genres.length}</span>
-                    <span className="stat-label">Genres</span>
-                  </div>
-                  <div className="stat-tile">
-                    <span className="stat-value">{stats.top_artists.length}</span>
-                    <span className="stat-label">Top artists</span>
-                  </div>
-                  <div className="stat-tile">
-                    <span className="stat-value">{stats.tracks_by_decade.length}</span>
-                    <span className="stat-label">Decades spanned</span>
-                  </div>
-                </div>
+            <div className="view-tabs taste-subtabs">
+              <button className={tasteSubTab === 'overview' ? 'active' : ''} onClick={() => setTasteSubTab('overview')}>Overview</button>
+              <button className={tasteSubTab === 'genre-mood' ? 'active' : ''} onClick={() => setTasteSubTab('genre-mood')}>Genre × Mood</button>
+            </div>
 
-                <BarChart title="Top Genres" entries={stats.top_genres} />
-                <BarChart title="Top Artists" entries={stats.top_artists} />
-                <BarChart title="Tracks by Decade" entries={stats.tracks_by_decade} />
-              </>
+            {tasteSubTab === 'overview' && (
+              statsLoading && !stats ? (
+                <p className="empty-state">Loading taste profile...</p>
+              ) : !stats || stats.total_tracks === 0 ? (
+                <p className="empty-state">Scan your library to build a taste profile.</p>
+              ) : (
+                <>
+                  <div className="stat-tiles">
+                    <div className="stat-tile">
+                      <span className="stat-value">{stats.total_tracks.toLocaleString()}</span>
+                      <span className="stat-label">Tracks</span>
+                    </div>
+                    <div className="stat-tile">
+                      <span className="stat-value">{stats.top_genres.length}</span>
+                      <span className="stat-label">Genres</span>
+                    </div>
+                    <div className="stat-tile">
+                      <span className="stat-value">{stats.top_artists.length}</span>
+                      <span className="stat-label">Top artists</span>
+                    </div>
+                    <div className="stat-tile">
+                      <span className="stat-value">{stats.tracks_by_decade.length}</span>
+                      <span className="stat-label">Decades spanned</span>
+                    </div>
+                  </div>
+
+                  <BarChart title="Top Genres" entries={stats.top_genres} />
+                  <BarChart title="Top Artists" entries={stats.top_artists} />
+                  <BarChart title="Tracks by Decade" entries={stats.tracks_by_decade} />
+                </>
+              )
+            )}
+
+            {tasteSubTab === 'genre-mood' && (
+              moodStatsLoading && !moodStats ? (
+                <p className="empty-state">Loading mood breakdown...</p>
+              ) : !moodStats || moodStats.summary.total_tracks === 0 ? (
+                <p className="empty-state">Scan your library to build a mood breakdown.</p>
+              ) : (
+                <>
+                  <MoodSummaryTiles summary={moodStats.summary} />
+                  <GenreMoodHeatmap breakdown={moodStats.genre_breakdown} summary={moodStats.summary} />
+                </>
+              )
             )}
           </section>
         ) : activeTab === 'radio' ? (
@@ -4804,6 +4849,131 @@ function BarChart({ title, entries }) {
             <span className="bar-count">{entry.count.toLocaleString()}</span>
           </div>
         ))}
+      </div>
+    </div>
+  );
+}
+
+const MOOD_COLUMNS = [
+  { key: 'happy', label: 'Happy' },
+  { key: 'sad', label: 'Sad' },
+  { key: 'aggressive', label: 'Aggressive' },
+  { key: 'relaxed', label: 'Relaxed' },
+  { key: 'party', label: 'Party' },
+];
+
+function MoodSummaryTiles({ summary }) {
+  return (
+    <div className="stat-tiles">
+      <div className="stat-tile">
+        <span className="stat-value">{summary.analyzed.toLocaleString()} / {summary.total_tracks.toLocaleString()}</span>
+        <span className="stat-label">Tracks analyzed</span>
+      </div>
+      {MOOD_COLUMNS.map(({ key, label }) => (
+        <div className="stat-tile" key={key}>
+          <span className="stat-value">{summary[key].toLocaleString()}</span>
+          <span className="stat-label">{label} ({(100 * summary[key] / summary.total_tracks).toFixed(1)}%)</span>
+        </div>
+      ))}
+      <div className="stat-tile">
+        <span className="stat-value">{summary.mixed.toLocaleString()}</span>
+        <span className="stat-label">Mixed ({(100 * summary.mixed / summary.total_tracks).toFixed(1)}%)</span>
+      </div>
+    </div>
+  );
+}
+
+// Sequential ramp reusing the dataviz skill's already-validated blue steps
+// (this app already pulls --series-1/--series-2 from that same palette, see
+// App.css) - ordered dark-> light since the app is dark-surface-only, so
+// the step closest to the card background's own darkness reads as "near
+// zero" and recedes into it, same principle as the skill's light-surface
+// guidance just pointed the other direction.
+const MOOD_HEATMAP_RAMP = [
+  '#0d366b', '#104281', '#184f95', '#1c5cab', '#256abf', '#2a78d6', '#3987e5',
+  '#5598e7', '#6da7ec', '#86b6ef', '#9ec5f4', '#b7d3f6', '#cde2fb',
+];
+function moodHeatColor(pct) {
+  const idx = Math.max(0, Math.min(MOOD_HEATMAP_RAMP.length - 1, Math.round((pct / 100) * (MOOD_HEATMAP_RAMP.length - 1))));
+  return { bg: MOOD_HEATMAP_RAMP[idx], text: idx <= 7 ? '#f5f5f7' : '#0b0b0f' };
+}
+
+function GenreMoodHeatmap({ breakdown, summary }) {
+  const [viewMode, setViewMode] = useState('genre'); // 'genre': % of this genre that's this mood (rows). 'mood': % of this mood's tracks that come from this genre (columns).
+
+  // Column totals for 'mood' mode - denominator is the sum across the shown
+  // (>=20-track) genres only, not the whole library, so the displayed
+  // shares actually sum to 100% rather than silently falling short by
+  // whatever's in excluded small genres.
+  const columnTotals = {};
+  MOOD_COLUMNS.forEach(({ key }) => {
+    columnTotals[key] = breakdown.reduce((sum, row) => sum + row[`${key}_count`], 0);
+  });
+
+  const totalRow = viewMode === 'genre'
+    ? {
+        genre: 'All genres', total: summary.total_tracks,
+        happy: 100 * summary.happy / summary.total_tracks,
+        sad: 100 * summary.sad / summary.total_tracks,
+        aggressive: 100 * summary.aggressive / summary.total_tracks,
+        relaxed: 100 * summary.relaxed / summary.total_tracks,
+        party: 100 * summary.party / summary.total_tracks,
+      }
+    : null; // 'mood' mode shows the column totals in the header instead - see below.
+
+  const rows = totalRow ? [totalRow, ...breakdown] : breakdown;
+
+  return (
+    <div className="bar-chart mood-heatmap-wrap">
+      <h2>Genre × Mood</h2>
+      <div className="view-tabs local-filter-tabs mood-heatmap-mode-toggle">
+        <button className={viewMode === 'genre' ? 'active' : ''} onClick={() => setViewMode('genre')}>% of genre</button>
+        <button className={viewMode === 'mood' ? 'active' : ''} onClick={() => setViewMode('mood')}>% of mood</button>
+      </div>
+      <p className="mood-heatmap-note">
+        {viewMode === 'genre'
+          ? "% of each genre's analyzed tracks clearing each mood's score threshold. A track can clear more than one mood, so rows don't sum to 100%."
+          : "Of the tracks (among genres shown) that clear a given mood's threshold, % coming from each genre - each column sums to 100%."}
+        {' '}Genres with fewer than 20 analyzed tracks aren't shown.
+      </p>
+      <div className="mood-heatmap-scroll">
+      <table className="mood-heatmap">
+        <thead>
+          <tr>
+            <th className="mood-heatmap-genre-head">Genre</th>
+            {MOOD_COLUMNS.map(({ key, label }) => <th key={key}>{label}</th>)}
+            <th>Total</th>
+          </tr>
+          {viewMode === 'mood' && (
+            <tr className="mood-heatmap-coltotal-row">
+              <th className="mood-heatmap-genre-head">Total tracks (this mood)</th>
+              {MOOD_COLUMNS.map(({ key }) => <th key={key}>{columnTotals[key].toLocaleString()}</th>)}
+              <th></th>
+            </tr>
+          )}
+        </thead>
+        <tbody>
+          {rows.map((row) => (
+            <tr key={row.genre} className={row.genre === 'All genres' ? 'mood-heatmap-total-row' : ''}>
+              <td className="mood-heatmap-genre-cell">{row.genre}</td>
+              {MOOD_COLUMNS.map(({ key }) => {
+                const count = viewMode === 'genre' ? Math.round(row.total * row[key] / 100) : row[`${key}_count`];
+                const pct = viewMode === 'genre' ? row[key] : (columnTotals[key] ? 100 * count / columnTotals[key] : 0);
+                const { bg, text } = moodHeatColor(pct);
+                const tooltip = viewMode === 'genre'
+                  ? `${row.genre} - ${key}: ${pct.toFixed(1)}% (${count.toLocaleString()} of ${row.total.toLocaleString()} ${row.genre} tracks)`
+                  : `${row.genre} - ${key}: ${pct.toFixed(1)}% (${count.toLocaleString()} of ${columnTotals[key].toLocaleString()} total ${key} tracks)`;
+                return (
+                  <td key={key} className="mood-heatmap-cell" style={{ background: bg, color: text }} title={tooltip}>
+                    {pct.toFixed(1)}
+                  </td>
+                );
+              })}
+              <td className="mood-heatmap-count-cell">{row.total.toLocaleString()}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
       </div>
     </div>
   );

@@ -2527,6 +2527,99 @@ main.with-player {
   margin-bottom: 20px;
 }
 
+.taste-subtabs {
+  margin-bottom: 20px;
+}
+
+.mood-heatmap-mode-toggle {
+  display: inline-flex;
+  margin-bottom: 10px;
+}
+
+.mood-heatmap-note {
+  font-size: 0.8rem;
+  color: var(--text-muted);
+  margin-bottom: 14px;
+  line-height: 1.5;
+}
+
+.mood-heatmap-coltotal-row th {
+  color: var(--text-muted);
+  font-size: 0.7rem;
+  font-weight: 500;
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--border);
+}
+
+.mood-heatmap-wrap {
+  /* main.with-player's 108px padding-bottom was tuned for this app's
+     typically-shorter tab content - a 20-genre-row table is taller than
+     that accounts for, so the fixed player bar visibly covered its last
+     couple rows. Extra margin here (not a bigger global padding, which
+     every other tab would inherit unnecessarily) gives this specific
+     block enough headroom regardless of exact player-bar height math. */
+  margin-bottom: 80px;
+}
+
+.mood-heatmap-scroll {
+  overflow-x: auto;
+}
+
+.mood-heatmap {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: 0.82rem;
+}
+
+.mood-heatmap th {
+  text-align: center;
+  color: var(--text-muted);
+  font-size: 0.75rem;
+  font-weight: 600;
+  padding: 0 6px 8px;
+  white-space: nowrap;
+}
+
+.mood-heatmap-genre-head {
+  text-align: left !important;
+}
+
+.mood-heatmap-genre-cell {
+  color: var(--text-main);
+  padding-right: 10px;
+  white-space: nowrap;
+}
+
+.mood-heatmap-cell {
+  width: 72px;
+  height: 32px;
+  text-align: center;
+  vertical-align: middle;
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+  border: 2px solid var(--bg-card);
+  border-radius: 4px;
+}
+
+.mood-heatmap-count-cell {
+  text-align: right;
+  color: var(--text-muted);
+  font-size: 0.75rem;
+  padding-left: 10px;
+  white-space: nowrap;
+}
+
+.mood-heatmap-total-row td {
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+  padding-top: 6px;
+  padding-bottom: 6px;
+}
+
+.mood-heatmap-total-row .mood-heatmap-genre-cell {
+  font-weight: 700;
+}
+
 .cleanup-panel {
   display: flex;
   flex-direction: column;

@@ -449,6 +449,38 @@ class LibraryStats(BaseModel):
     top_artists: List[CountEntry]
     tracks_by_decade: List[CountEntry]
 
+class GenreMoodEntry(BaseModel):
+    genre: str
+    total: int
+    happy: float
+    sad: float
+    aggressive: float
+    relaxed: float
+    party: float
+    # Raw counts alongside the rounded percentages above - the frontend's
+    # "share of this mood, by genre" view needs exact counts to divide by a
+    # column total; recomputing from the rounded percentages would compound
+    # rounding error across 20 rows.
+    happy_count: int
+    sad_count: int
+    aggressive_count: int
+    relaxed_count: int
+    party_count: int
+
+class MoodSummary(BaseModel):
+    total_tracks: int
+    analyzed: int
+    happy: int
+    sad: int
+    aggressive: int
+    relaxed: int
+    party: int
+    mixed: int
+
+class MoodStats(BaseModel):
+    genre_breakdown: List[GenreMoodEntry]
+    summary: MoodSummary
+
 class TrackListResponse(BaseModel):
     total: int
     album_count: int
@@ -2524,6 +2556,71 @@ async def get_library_stats(db: psycopg2.extensions.connection = Depends(get_db)
             "top_artists": top_artists,
             "tracks_by_decade": tracks_by_decade,
         }
+    except Exception as e:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+# Same >=20-track cutoff used when this breakdown was first prototyped as a
+# standalone visualization - small genres produce noisy 0%/100% cells that
+# aren't statistically meaningful.
+MIN_GENRE_TRACKS_FOR_MOOD_STATS = 20
+
+@app.get("/api/library/stats/mood", response_model=MoodStats)
+async def get_mood_stats(db: psycopg2.extensions.connection = Depends(get_db)):
+    # Thresholds are DEFAULT_MOOD_THRESHOLDS (server-side constants, not
+    # request input) interpolated directly - safe unlike a request-supplied
+    # value, and lets this stay one FILTER-based query per breakdown instead
+    # of five round-trips.
+    mood_percent_exprs = ", ".join(
+        f"ROUND(100.0 * COUNT(*) FILTER (WHERE {column} >= {DEFAULT_MOOD_THRESHOLDS[name]}) / COUNT(*), 1) AS {name.lower()}"
+        for name, column in MOOD_SCORE_COLUMNS.items()
+    )
+    mood_count_exprs = ", ".join(
+        f"COUNT(*) FILTER (WHERE {column} >= {DEFAULT_MOOD_THRESHOLDS[name]}) AS {name.lower()}"
+        for name, column in MOOD_SCORE_COLUMNS.items()
+    )
+    mood_count_exprs_suffixed = ", ".join(
+        f"COUNT(*) FILTER (WHERE {column} >= {DEFAULT_MOOD_THRESHOLDS[name]}) AS {name.lower()}_count"
+        for name, column in MOOD_SCORE_COLUMNS.items()
+    )
+    mixed_clause = "mood_checked IS TRUE AND " + " AND ".join(
+        f"{column} IS NOT NULL AND {column} < {DEFAULT_MOOD_THRESHOLDS[name]}"
+        for name, column in MOOD_SCORE_COLUMNS.items()
+    )
+    try:
+        cur = db.cursor()
+
+        cur.execute(f"""
+            SELECT genre, COUNT(*) AS total, {mood_percent_exprs}, {mood_count_exprs_suffixed}
+            FROM known_tracks
+            WHERE genre IS NOT NULL AND genre <> ''
+            GROUP BY genre
+            HAVING COUNT(*) >= %(min_tracks)s
+            ORDER BY COUNT(*) DESC
+        """, {'min_tracks': MIN_GENRE_TRACKS_FOR_MOOD_STATS})
+        genre_breakdown = [
+            {"genre": row[0], "total": row[1], "happy": row[2], "sad": row[3],
+             "aggressive": row[4], "relaxed": row[5], "party": row[6],
+             "happy_count": row[7], "sad_count": row[8], "aggressive_count": row[9],
+             "relaxed_count": row[10], "party_count": row[11]}
+            for row in cur.fetchall()
+        ]
+
+        cur.execute(f"""
+            SELECT COUNT(*) AS total_tracks,
+                   COUNT(*) FILTER (WHERE mood_checked IS TRUE) AS analyzed,
+                   {mood_count_exprs},
+                   COUNT(*) FILTER (WHERE {mixed_clause}) AS mixed
+            FROM known_tracks
+        """)
+        row = cur.fetchone()
+        summary = {
+            "total_tracks": row[0], "analyzed": row[1],
+            "happy": row[2], "sad": row[3], "aggressive": row[4], "relaxed": row[5], "party": row[6],
+            "mixed": row[7],
+        }
+
+        cur.close()
+        return {"genre_breakdown": genre_breakdown, "summary": summary}
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
 
