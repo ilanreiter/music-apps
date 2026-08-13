@@ -1143,6 +1143,57 @@ main.with-player {
   cursor: pointer;
 }
 
+/* Groups the mood <select> and its threshold slider into one visual unit -
+   two adjacent-but-separate pill controls read as unrelated filters, and
+   the slider (with no label of its own beyond a title tooltip) was easy to
+   miss as belonging to the mood picker rather than being some other,
+   unrelated control. */
+.mood-filter-group {
+  display: flex;
+  align-items: center;
+  flex: 1 1 220px;
+  min-width: 0;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.mood-filter-group select {
+  flex: 1 1 130px;
+  min-width: 0;
+  border: none;
+  background: transparent;
+  border-radius: 0;
+}
+
+.mood-threshold-control {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+  padding: 0 10px 0 8px;
+  border-left: 1px solid var(--border);
+  cursor: default;
+  white-space: nowrap;
+}
+
+.mood-threshold-control input[type="range"] {
+  accent-color: var(--accent);
+  width: 80px;
+}
+
+.mood-threshold-control:has(input:disabled) {
+  opacity: 0.5;
+}
+
+.mood-threshold-value {
+  font-variant-numeric: tabular-nums;
+  min-width: 2.6em;
+  color: var(--text-muted);
+  font-size: 0.85rem;
+}
+
 .clear-filters-btn {
   flex-shrink: 0;
   padding: 9px 14px;

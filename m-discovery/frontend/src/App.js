@@ -861,9 +861,11 @@ function App() {
   // /api/tracks/known.
   const [filterQuality, setFilterQuality] = useState(() => loadLibraryView()?.filterQuality ?? 'best');
   const [filterFormat, setFilterFormat] = useState(() => loadLibraryView()?.filterFormat ?? '');
-  // Derived from genre via a keyword heuristic (see MOOD_SQL in main.py) -
-  // not a measured property of the track.
+  // From audio analysis (see mood_detector.py) - a track matches when its
+  // score for this mood clears filterMoodThreshold, so it's meaningless
+  // until a mood is actually selected (see the slider's disabled state below).
   const [filterMood, setFilterMood] = useState(() => loadLibraryView()?.filterMood ?? '');
+  const [filterMoodThreshold, setFilterMoodThreshold] = useState(() => loadLibraryView()?.filterMoodThreshold ?? 0.5);
   // Restricts to tracks that already have a cached Spotify match, so Shuffle
   // All/Play All can be tested without any live search - isolates playback
   // bugs from the currently-active Spotify search rate limit.
@@ -1305,11 +1307,12 @@ function App() {
       filterQuality,
       filterFormat,
       filterMood,
+      filterMoodThreshold,
       filterSpotifyAvailable,
       filterTrackLimit,
       libraryShuffleMode,
     });
-  }, [activeTab, libraryMode, drill, search, filterGenre, filterDecade, filterQuality, filterFormat, filterMood, filterSpotifyAvailable, filterTrackLimit, libraryShuffleMode]);
+  }, [activeTab, libraryMode, drill, search, filterGenre, filterDecade, filterQuality, filterFormat, filterMood, filterMoodThreshold, filterSpotifyAvailable, filterTrackLimit, libraryShuffleMode]);
 
   // Persist the playback session (queue/history capped, so a mutation never
   // costs a multi-MB localStorage write) so a reload or reopened tab returns
@@ -1429,7 +1432,7 @@ function App() {
     // reshuffled the list while playback stayed on the original order).
     // Skip the refetch when only activeTab changed - re-entering the tab
     // should show whatever was already there, not roll a new order.
-    const key = JSON.stringify([libraryMode, drill, search, filterGenre, filterDecade, filterQuality, filterFormat, filterMood, filterSpotifyAvailable, filterTrackLimit]);
+    const key = JSON.stringify([libraryMode, drill, search, filterGenre, filterDecade, filterQuality, filterFormat, filterMood, filterMoodThreshold, filterSpotifyAvailable, filterTrackLimit]);
     if (key === libraryFetchKeyRef.current) return;
     libraryFetchKeyRef.current = key;
     // A filter change invalidates any Discover results seeded from the old
@@ -1472,7 +1475,7 @@ function App() {
       fetchGroups();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeTab, libraryMode, drill, search, filterGenre, filterDecade, filterQuality, filterFormat, filterMood, filterSpotifyAvailable, filterTrackLimit]);
+  }, [activeTab, libraryMode, drill, search, filterGenre, filterDecade, filterQuality, filterFormat, filterMood, filterMoodThreshold, filterSpotifyAvailable, filterTrackLimit]);
 
   // Auto-loads the next page of library tracks as the user scrolls near the
   // bottom of the grid, instead of requiring a manual "Load more" click.
@@ -1525,7 +1528,7 @@ function App() {
       .then((r) => setMoodOptions(r.data))
       .catch((err) => console.error('Error fetching moods:', err));
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeTab, search, filterGenre, filterDecade, filterQuality, filterFormat, filterMood, filterSpotifyAvailable]);
+  }, [activeTab, search, filterGenre, filterDecade, filterQuality, filterFormat, filterMood, filterMoodThreshold, filterSpotifyAvailable]);
 
   // The genre/decade/quality/format filters stay active no matter which
   // browse-by view or drill-down you're in; a drill-down's own dimension
@@ -1542,6 +1545,13 @@ function App() {
     if (filterQuality && omit !== 'quality') params.quality = filterQuality;
     if (filterFormat && omit !== 'format') params.format = filterFormat;
     if (filterMood && omit !== 'mood') params.mood = filterMood;
+    // Unconditional (not gated by omit) - unlike the other filters, this
+    // isn't itself a restriction; it only takes effect where a mood filter
+    // is actually applied, which for the by=mood groups listing is true for
+    // all 5 mood counts shown even when the ambient mood filter is omitted
+    // to avoid collapsing that dropdown to one row (see /api/library/groups'
+    // by=mood handling in main.py).
+    if (filterMoodThreshold !== 0.5) params.mood_threshold = filterMoodThreshold;
     if (filterSpotifyAvailable) params.spotify_available = true;
     return params;
   };
@@ -1552,6 +1562,7 @@ function App() {
     setFilterQuality('best');
     setFilterFormat('');
     setFilterMood('');
+    setFilterMoodThreshold(0.5);
     setFilterSpotifyAvailable(false);
     setFilterTrackLimit('');
     setSearchInput('');
@@ -3370,10 +3381,27 @@ function App() {
                   <option value="">All Formats</option>
                   {formatOptions.map((f) => <option key={f.key} value={f.key}>{f.label} ({f.count})</option>)}
                 </select>
-                <select value={filterMood} onChange={(e) => setFilterMood(e.target.value)} title="Derived from genre - a rough guess, not a measured property">
-                  <option value="">All Moods</option>
-                  {moodOptions.map((m) => <option key={m.key} value={m.key}>{m.label} ({m.count})</option>)}
-                </select>
+                <div className="mood-filter-group">
+                  <select value={filterMood} onChange={(e) => setFilterMood(e.target.value)} title="From audio analysis - see Taste Profile > Genre x Mood">
+                    <option value="">All Moods</option>
+                    {moodOptions.map((m) => <option key={m.key} value={m.key}>{m.label} ({m.count})</option>)}
+                  </select>
+                  <label
+                    className="mood-threshold-control"
+                    title="Minimum score (0-1) a track must clear for the selected mood - only applies once a mood is chosen"
+                  >
+                    <input
+                      type="range"
+                      min="0"
+                      max="1"
+                      step="0.01"
+                      value={filterMoodThreshold}
+                      disabled={!filterMood}
+                      onChange={(e) => setFilterMoodThreshold(Number(e.target.value))}
+                    />
+                    <span className="mood-threshold-value">{filterMoodThreshold.toFixed(2)}</span>
+                  </label>
+                </div>
                 <label className="filter-checkbox-label" title="Only tracks with an already-cached Spotify match - no live search needed to play them">
                   <input
                     type="checkbox"
