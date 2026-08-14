@@ -89,10 +89,10 @@ def create_tables():
                     ADD COLUMN IF NOT EXISTS mood_aggressive_score REAL,
                     ADD COLUMN IF NOT EXISTS mood_relaxed_score REAL,
                     ADD COLUMN IF NOT EXISTS mood_party_score REAL,
-                    ADD COLUMN IF NOT EXISTS mood_valence_score REAL,
-                    ADD COLUMN IF NOT EXISTS mood_arousal_score REAL,
-                    ADD COLUMN IF NOT EXISTS mood_va_checked BOOLEAN DEFAULT FALSE,
-                    DROP COLUMN IF EXISTS mood;
+                    DROP COLUMN IF EXISTS mood,
+                    DROP COLUMN IF EXISTS mood_valence_score,
+                    DROP COLUMN IF EXISTS mood_arousal_score,
+                    DROP COLUMN IF EXISTS mood_va_checked;
             """)
             cur.execute("""
                 ALTER TABLE known_tracks
@@ -411,6 +411,10 @@ def create_tables():
                         ALTER TABLE background_job_control RENAME COLUMN prewarm_paused TO track_matcher_paused;
                     END IF;
                 END $$;
+            """)
+            cur.execute("""
+                ALTER TABLE background_job_control
+                    DROP COLUMN IF EXISTS mood_va_paused;
             """)
             print("Table 'background_job_control' checked/created successfully.")
 
