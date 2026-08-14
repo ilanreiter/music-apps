@@ -89,6 +89,9 @@ def create_tables():
                     ADD COLUMN IF NOT EXISTS mood_aggressive_score REAL,
                     ADD COLUMN IF NOT EXISTS mood_relaxed_score REAL,
                     ADD COLUMN IF NOT EXISTS mood_party_score REAL,
+                    ADD COLUMN IF NOT EXISTS mood_valence_score REAL,
+                    ADD COLUMN IF NOT EXISTS mood_arousal_score REAL,
+                    ADD COLUMN IF NOT EXISTS mood_va_checked BOOLEAN DEFAULT FALSE,
                     DROP COLUMN IF EXISTS mood;
             """)
             cur.execute("""

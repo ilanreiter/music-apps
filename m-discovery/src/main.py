@@ -40,7 +40,7 @@ from . import genre_cleanup
 from . import playback_advancer
 from . import shazam_identify
 from . import mood_detector
-from .mood_detector import MOOD_SCORE_COLUMNS, DEFAULT_MOOD_THRESHOLDS
+from .mood_detector import MOOD_SCORE_COLUMNS, DEFAULT_MOOD_THRESHOLDS, VA_SCORE_COLUMNS
 from . import lastfm
 from . import radio_engine
 import logging
@@ -133,6 +133,7 @@ FAVORITE_LABEL_SQL = "CASE WHEN is_favorite THEN 'Favorites' ELSE 'Not Favorited
 SAMPLE_TRACK_SQL = "COALESCE(MIN(CASE WHEN has_artwork THEN id END), MIN(id))"
 
 MOOD_SCORE_SELECT_SQL = ", ".join(MOOD_SCORE_COLUMNS.values())
+VA_SCORE_SELECT_SQL = ", ".join(VA_SCORE_COLUMNS.values())
 
 # Not a real 6th classifier - confirmed live that ~5% of genuinely-analyzed
 # tracks (e.g. Red Hot Chili Peppers' "Under the Bridge") don't clear any of
@@ -186,6 +187,9 @@ artwork_check_progress = {"status": "idle"}
 
 mood_detector_lock = threading.Lock()
 mood_detector_progress = {"status": "idle"}
+
+mood_va_detector_lock = threading.Lock()
+mood_va_detector_progress = {"status": "idle"}
 
 external_artwork_lock = threading.Lock()
 external_artwork_progress = {"status": "idle"}
@@ -315,6 +319,11 @@ class Track(BaseModel):
     mood_aggressive_score: Optional[float] = None
     mood_relaxed_score: Optional[float] = None
     mood_party_score: Optional[float] = None
+    # Continuous valence/arousal prototype (see mood_detector.py's VA_*
+    # constants) - evaluated alongside the 5 discrete scores above, not
+    # replacing them yet.
+    mood_valence_score: Optional[float] = None
+    mood_arousal_score: Optional[float] = None
     artwork_source_url: Optional[str] = None
     is_favorite: Optional[bool] = False
     last_played: Optional[str] = None # Will be datetime string
@@ -652,6 +661,22 @@ async def startup_event():
             print(f"Resuming mood analysis backfill in the background ({remaining} tracks not yet analyzed).")
             _start_mood_detector_background()
 
+    # Same auto-resume principle for the valence/arousal prototype backfill -
+    # its own mood_va_checked column, so it runs independently of (and
+    # doesn't force reprocessing) the 5 discrete mood scores above.
+    conn = get_db_connection()
+    if conn:
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT COUNT(*) FROM known_tracks WHERE mood_va_checked IS NOT TRUE AND file_path IS NOT NULL")
+            remaining = cur.fetchone()[0]
+            cur.close()
+        finally:
+            conn.close()
+        if remaining > 0:
+            print(f"Resuming valence/arousal analysis backfill in the background ({remaining} tracks not yet analyzed).")
+            _start_mood_va_detector_background()
+
     # spotify_track_matcher.py is no longer auto-started at boot - Spotify
     # Connect playback is gone, so this job's only remaining purpose is
     # pre-populating known_tracks.spotify_track_id for the Push-to-Playlist
@@ -721,6 +746,10 @@ async def get_known_tracks(
     length: Optional[str] = None,
     mood: Optional[str] = None,
     mood_threshold: Optional[float] = None,
+    valence_min: Optional[float] = None,
+    valence_max: Optional[float] = None,
+    arousal_min: Optional[float] = None,
+    arousal_max: Optional[float] = None,
     external_artwork_found: Optional[bool] = None,
     spotify_available: Optional[bool] = None,
     shuffle: bool = False,
@@ -765,6 +794,22 @@ async def get_known_tracks(
             params['length'] = length
         if mood:
             where_clauses.append(_mood_filter_sql(mood, mood_threshold, params))
+        # Raw continuous VA range filters (prototype, alongside the discrete
+        # mood filter above, not a replacement) - no default/threshold
+        # guessing here since the point is to see the raw distribution while
+        # evaluating whether this axis is worth keeping.
+        if valence_min is not None:
+            where_clauses.append("mood_valence_score >= %(valence_min)s")
+            params['valence_min'] = valence_min
+        if valence_max is not None:
+            where_clauses.append("mood_valence_score <= %(valence_max)s")
+            params['valence_max'] = valence_max
+        if arousal_min is not None:
+            where_clauses.append("mood_arousal_score >= %(arousal_min)s")
+            params['arousal_min'] = arousal_min
+        if arousal_max is not None:
+            where_clauses.append("mood_arousal_score <= %(arousal_max)s")
+            params['arousal_max'] = arousal_max
         if external_artwork_found is not None:
             # external_artwork_checked is only ever set on rows the external-artwork
             # job actually processed (has_artwork was FALSE going in), so this
@@ -790,7 +835,7 @@ async def get_known_tracks(
                 (SELECT DISTINCT ON ({DEDUP_NORM_TITLE_SQL}, {DEDUP_NORM_ARTIST_SQL}, {DEDUP_NORM_ALBUM_SQL})
                         id, track_name, artist_name, album_name, genre, year, duration_seconds,
                         bitrate, sample_rate, channels, file_size_bytes, file_path, artwork_source_url, is_favorite, last_played,
-                        spotify_track_id, ytmusic_video_id, {MOOD_SCORE_SELECT_SQL}
+                        spotify_track_id, ytmusic_video_id, {MOOD_SCORE_SELECT_SQL}, {VA_SCORE_SELECT_SQL}
                  FROM known_tracks {where_sql}
                  ORDER BY {DEDUP_NORM_TITLE_SQL}, {DEDUP_NORM_ARTIST_SQL}, {DEDUP_NORM_ALBUM_SQL},
                           {QUALITY_TIER_RANK_SQL} ASC, bitrate DESC NULLS LAST, id ASC
@@ -824,7 +869,7 @@ async def get_known_tracks(
         cur.execute(f"""
             SELECT id, track_name, artist_name, album_name, genre, year, duration_seconds,
                    bitrate, sample_rate, channels, file_size_bytes, file_path, artwork_source_url, is_favorite, last_played,
-                   spotify_track_id, ytmusic_video_id, {MOOD_SCORE_SELECT_SQL}
+                   spotify_track_id, ytmusic_video_id, {MOOD_SCORE_SELECT_SQL}, {VA_SCORE_SELECT_SQL}
             FROM {from_sql}
             {order_sql}
             LIMIT %(limit)s OFFSET %(offset)s
@@ -860,7 +905,7 @@ async def get_tracks_by_ids(params: TrackIdsRequest, db: psycopg2.extensions.con
     cur.execute(f"""
         SELECT id, track_name, artist_name, album_name, genre, year, duration_seconds,
                bitrate, sample_rate, channels, file_size_bytes, file_path, artwork_source_url, is_favorite, last_played,
-               spotify_track_id, ytmusic_video_id, {MOOD_SCORE_SELECT_SQL}
+               spotify_track_id, ytmusic_video_id, {MOOD_SCORE_SELECT_SQL}, {VA_SCORE_SELECT_SQL}
         FROM known_tracks WHERE id = ANY(%s)
     """, (id_list,))
     rows_by_id = {row['id']: row for row in cur.fetchall()}
@@ -2723,6 +2768,38 @@ async def start_mood_detector():
 @app.get("/api/library/mood-detector/status")
 async def get_mood_detector_status():
     return mood_detector_progress
+
+def _start_mood_va_detector_background():
+    """Same pattern as _start_mood_detector_background, for the continuous
+    valence/arousal prototype backfill (its own lock/progress/checked column
+    - see mood_detector.run_va)."""
+    if not mood_va_detector_lock.acquire(blocking=False):
+        return False
+    try:
+        mood_va_detector_progress.clear()
+        mood_va_detector_progress.update(status="running")
+
+        def _run():
+            try:
+                mood_detector.run_va(get_db_connection, mood_va_detector_progress, _is_idle)
+            finally:
+                mood_va_detector_lock.release()
+
+        threading.Thread(target=_run, daemon=True).start()
+        return True
+    except Exception:
+        mood_va_detector_lock.release()
+        raise
+
+@app.post("/api/library/mood-va-detector", status_code=status.HTTP_202_ACCEPTED)
+async def start_mood_va_detector():
+    if not _start_mood_va_detector_background():
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="A valence/arousal detector run is already in progress.")
+    return mood_va_detector_progress
+
+@app.get("/api/library/mood-va-detector/status")
+async def get_mood_va_detector_status():
+    return mood_va_detector_progress
 
 def _start_tag_cleanup_background():
     """Kicks off a background tag-cleanup pass if one isn't already running.

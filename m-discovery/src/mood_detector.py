@@ -42,6 +42,28 @@ MOOD_SCORE_COLUMNS = {
     'Party': 'mood_party_score',
 }
 
+# Continuous valence/arousal, evaluated alongside (not instead of) the 5
+# discrete heads above - a prototype for whether a 2D regression separates
+# cases like Sad-vs-Relaxed (both low arousal; the discrete heads only
+# distinguish them via two independently-calibrated binary classifiers)
+# better than binary thresholds do. Separate embedding model (musicnn, not
+# discogs-effnet) and its own emomusic-trained regression head, so this is
+# tracked as its own backfill (mood_va_checked) rather than piggybacking on
+# mood_checked - the two runs have nothing in common to reuse.
+VA_EMBEDDING_MODEL = "feature-extractors/musicnn/msd-musicnn-1.pb"
+VA_HEAD_MODEL = "classification-heads/emomusic/emomusic-msd-musicnn-2.pb"
+# emomusic/DEAM-family models score on a 1-9 annotation scale (not 0-1 like
+# the discrete heads' softmax outputs) - confirmed against Essentia's model
+# docs. Rescaled to 0-1 at classify time so valence/arousal sit on the same
+# scale as the other mood scores for UI sliders and storage.
+VA_RAW_SCORE_MIN = 1.0
+VA_RAW_SCORE_MAX = 9.0
+
+VA_SCORE_COLUMNS = {
+    'valence': 'mood_valence_score',
+    'arousal': 'mood_arousal_score',
+}
+
 # Starting point only - these 5 heads are independently calibrated (confirmed
 # live: with a single flat 0.5 "pick the winner" cutoff, 'Relaxed' alone hit
 # 45% of the library, wildly disproportionate to the other four), so a flat
@@ -64,6 +86,8 @@ IDLE_POLL_INTERVAL_SECONDS = 30
 
 _embed_model = None
 _head_models = None
+_va_embed_model = None
+_va_head_model = None
 
 
 MODEL_DOWNLOAD_TIMEOUT_SECONDS = 30
@@ -80,7 +104,7 @@ def _ensure_models():
     download is removed rather than left behind to be mistaken for a
     complete one on the next run."""
     os.makedirs(MODEL_DIR, exist_ok=True)
-    paths = {EMBEDDING_MODEL: None}
+    paths = {EMBEDDING_MODEL: None, VA_EMBEDDING_MODEL: None, VA_HEAD_MODEL: None}
     for mood, (rel_path, _idx) in MOOD_HEADS.items():
         paths[rel_path] = None
     for rel_path in paths:
@@ -104,7 +128,7 @@ def _ensure_models():
 
 
 def _load_models():
-    global _embed_model, _head_models
+    global _embed_model, _head_models, _va_embed_model, _va_head_model
     if _embed_model is not None:
         return
     import essentia
@@ -124,6 +148,13 @@ def _load_models():
         mood: es.TensorflowPredict2D(graphFilename=paths[rel_path], output='model/Softmax')
         for mood, (rel_path, _idx) in MOOD_HEADS.items()
     }
+    # musicnn's own embedding - the emomusic regression head was trained on
+    # it, not on discogs-effnet's, so the two embeddings aren't
+    # interchangeable despite both existing in this module.
+    _va_embed_model = es.TensorflowPredictMusiCNN(
+        graphFilename=paths[VA_EMBEDDING_MODEL], output='model/dense/BiasAdd')
+    _va_head_model = es.TensorflowPredict2D(
+        graphFilename=paths[VA_HEAD_MODEL], output='model/Identity')
 
 
 def classify_track(file_path):
@@ -145,6 +176,25 @@ def classify_track(file_path):
     return scores
 
 
+def classify_track_va(file_path):
+    """Continuous valence/arousal for one track, rescaled from the model's
+    native 1-9 scale to 0-1 so it sits on the same scale as the discrete
+    mood scores. Same raises-on-unloadable-file contract as classify_track."""
+    _load_models()
+    import essentia.standard as es
+
+    audio = es.MonoLoader(filename=file_path, sampleRate=16000)()
+    embeddings = _va_embed_model(audio)
+    preds = _va_head_model(embeddings)
+    raw_valence, raw_arousal = np.mean(preds, axis=0)[:2]
+
+    def _rescale(raw):
+        span = VA_RAW_SCORE_MAX - VA_RAW_SCORE_MIN
+        return float(np.clip((raw - VA_RAW_SCORE_MIN) / span, 0.0, 1.0))
+
+    return {'valence': _rescale(raw_valence), 'arousal': _rescale(raw_arousal)}
+
+
 def _classify_worker(task_q, result_q):
     """Runs in its own process so a crash inside essentia's native code stays
     contained here instead of taking down the whole app - confirmed live:
@@ -154,11 +204,13 @@ def _classify_worker(task_q, result_q):
     forever (same track is always first back up in the unordered LIMIT 1
     query)."""
     while True:
-        file_path = task_q.get()
-        if file_path is None:
+        task = task_q.get()
+        if task is None:
             return
+        kind, file_path = task
+        classify_fn = classify_track_va if kind == 'va' else classify_track
         try:
-            result_q.put(('ok', classify_track(file_path)))
+            result_q.put(('ok', classify_fn(file_path)))
         except Exception as e:
             result_q.put(('error', str(e)))
 
@@ -195,9 +247,9 @@ class _IsolatedClassifier:
                 pass
         self._proc = None
 
-    def classify(self, file_path, timeout=60):
+    def classify(self, file_path, timeout=60, kind='mood'):
         self._ensure_started()
-        self._task_q.put(file_path)
+        self._task_q.put((kind, file_path))
         while True:
             try:
                 status, payload = self._result_q.get(timeout=1)
@@ -218,14 +270,18 @@ class _IsolatedClassifier:
 _classifier = _IsolatedClassifier()
 
 
-def run(get_connection, progress, is_idle):
-    """Slowly works through known_tracks where mood_checked IS NOT TRUE,
-    BATCH_SIZE rows per cycle, only while the app is idle (no recent
-    requests - see main.py's activity-tracking middleware). Unlike
-    spotify_track_matcher, this makes no external calls at all - the only
-    reason to gate on idleness is to avoid competing with live requests for
-    CPU during the ~3s/track audio analysis, not to respect an API rate
-    limit, so the pacing here is much less conservative. Runs in a
+def _run_backfill(get_connection, progress, is_idle, checked_column, score_columns, classify):
+    """Shared polling/backfill loop behind both run() (5 discrete mood heads)
+    and run_va() (continuous valence/arousal) - same idle-gating, batching,
+    per-row error isolation and DB-hiccup retry logic, parameterized only by
+    which "checked" column marks a row done, which columns the scores land
+    in, and which classifier fills them. Slowly works through known_tracks
+    where checked_column IS NOT TRUE, BATCH_SIZE rows per cycle, only while
+    the app is idle (no recent requests - see main.py's activity-tracking
+    middleware). Unlike spotify_track_matcher, this makes no external calls
+    at all - the only reason to gate on idleness is to avoid competing with
+    live requests for CPU during the audio analysis, not to respect an API
+    rate limit, so the pacing here is much less conservative. Runs in a
     background thread (started once at app startup if there's work to do)
     until the whole library is checked."""
     progress.update(status='running', processed=0, scored=0, error=None)
@@ -250,9 +306,9 @@ def run(get_connection, progress, is_idle):
         try:
             for _ in range(BATCH_SIZE):
                 cur = conn.cursor()
-                cur.execute("""
+                cur.execute(f"""
                     SELECT id, file_path FROM known_tracks
-                    WHERE mood_checked IS NOT TRUE AND file_path IS NOT NULL
+                    WHERE {checked_column} IS NOT TRUE AND file_path IS NOT NULL
                     LIMIT 1
                 """)
                 row = cur.fetchone()
@@ -264,12 +320,11 @@ def run(get_connection, progress, is_idle):
                 track_id, file_path = row
                 cur = conn.cursor()
                 try:
-                    scores = _classifier.classify(file_path)
-                    columns = [MOOD_SCORE_COLUMNS[m] for m in MOOD_HEADS]
-                    set_clause = ", ".join(f"{col} = %s" for col in columns)
+                    scores = classify(file_path)
+                    set_clause = ", ".join(f"{col} = %s" for col in score_columns.values())
                     cur.execute(
-                        f"UPDATE known_tracks SET {set_clause}, mood_checked = TRUE WHERE id = %s",
-                        [scores[m] for m in MOOD_HEADS] + [track_id],
+                        f"UPDATE known_tracks SET {set_clause}, {checked_column} = TRUE WHERE id = %s",
+                        [scores[key] for key in score_columns] + [track_id],
                     )
                     progress['scored'] += 1
                 except Exception as e:
@@ -278,7 +333,7 @@ def run(get_connection, progress, is_idle):
                     # checked with all scores left NULL rather than retrying
                     # it every cycle.
                     print(f"mood_detector: skipping track {track_id} ({file_path}): {e}")
-                    cur.execute("UPDATE known_tracks SET mood_checked = TRUE WHERE id = %s", (track_id,))
+                    cur.execute(f"UPDATE known_tracks SET {checked_column} = TRUE WHERE id = %s", (track_id,))
                 conn.commit()
                 cur.close()
                 progress['processed'] += 1
@@ -293,3 +348,15 @@ def run(get_connection, progress, is_idle):
         if done:
             return
         time.sleep(CYCLE_SLEEP_SECONDS)
+
+
+def run(get_connection, progress, is_idle):
+    """Backfills the 5 discrete mood head scores. See _run_backfill."""
+    score_columns = {mood: MOOD_SCORE_COLUMNS[mood] for mood in MOOD_HEADS}
+    _run_backfill(get_connection, progress, is_idle, 'mood_checked', score_columns, _classifier.classify)
+
+
+def run_va(get_connection, progress, is_idle):
+    """Backfills the continuous valence/arousal scores. See _run_backfill."""
+    _run_backfill(get_connection, progress, is_idle, 'mood_va_checked', VA_SCORE_COLUMNS,
+                  lambda file_path: _classifier.classify(file_path, kind='va'))

@@ -1143,11 +1143,9 @@ main.with-player {
   cursor: pointer;
 }
 
-/* Groups the mood <select> and its threshold slider into one visual unit -
-   two adjacent-but-separate pill controls read as unrelated filters, and
-   the slider (with no label of its own beyond a title tooltip) was easy to
-   miss as belonging to the mood picker rather than being some other,
-   unrelated control. */
+/* Groups a set of related sliders (e.g. the valence/arousal prototype
+   filter's min/max pairs) into one visual pill instead of several
+   adjacent-but-separate controls that'd read as unrelated filters. */
 .mood-filter-group {
   display: flex;
   align-items: center;
@@ -1157,14 +1155,6 @@ main.with-player {
   border: 1px solid var(--border);
   border-radius: 8px;
   overflow: hidden;
-}
-
-.mood-filter-group select {
-  flex: 1 1 130px;
-  min-width: 0;
-  border: none;
-  background: transparent;
-  border-radius: 0;
 }
 
 .mood-threshold-control {
@@ -1192,6 +1182,30 @@ main.with-player {
   min-width: 2.6em;
   color: var(--text-muted);
   font-size: 0.85rem;
+}
+
+/* Prototype valence/arousal range pill (see the VA_* constants in
+   mood_detector.py) - two label rows (each a min+max slider pair) stacked
+   in one pill, unlike the single mood-threshold slider above. */
+.va-filter-group {
+  flex-direction: column;
+  align-items: stretch;
+  padding: 4px 8px;
+}
+
+.va-filter-group .mood-threshold-control {
+  border-left: none;
+  padding: 2px 0;
+}
+
+.va-filter-group .mood-threshold-control span:first-child {
+  color: var(--text-muted);
+  font-size: 0.8rem;
+  min-width: 3.6em;
+}
+
+.va-filter-group .mood-threshold-control input[type="range"] {
+  width: 60px;
 }
 
 .clear-filters-btn {
