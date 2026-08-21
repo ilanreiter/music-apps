@@ -1,0 +1,169 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum DestinationStatus {
+  IDEA
+  RESEARCHING
+  PLANNED
+  BOOKED
+  VISITED
+  ARCHIVED
+}
+
+enum TripStatus {
+  DRAFT
+  PLANNING
+  BOOKED
+  IN_PROGRESS
+  COMPLETED
+  CANCELLED
+}
+
+enum TripItemType {
+  TRANSPORT
+  STAY
+  POI
+  ACTIVITY
+  OTHER
+}
+
+enum BookingStatus {
+  IDEA
+  RESEARCHING
+  READY_TO_BOOK
+  BOOKED
+  CONFIRMED
+  CANCELLED
+}
+
+enum BudgetCategory {
+  TRANSPORT
+  LODGING
+  FOOD
+  ACTIVITIES
+  SHOPPING
+  INSURANCE
+  MISC
+}
+
+model User {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  name         String
+  passwordHash String
+  createdAt    DateTime @default(now())
+}
+
+model Destination {
+  id          String            @id @default(cuid())
+  name        String
+  country     String?
+  region      String?
+  notes       String?
+  status      DestinationStatus @default(IDEA)
+  priority    Int               @default(0)
+  tags        String[]          @default([])
+  imageUrl    String?
+  roughCostEstimate Float?
+  bestSeason  String?
+  createdAt   DateTime          @default(now())
+  updatedAt   DateTime          @updatedAt
+  trips       Trip[]
+  resources   Resource[]
+}
+
+model Trip {
+  id            String       @id @default(cuid())
+  title         String
+  destinationId String?
+  destination   Destination? @relation(fields: [destinationId], references: [id], onDelete: SetNull)
+  startDate     DateTime?
+  endDate       DateTime?
+  status        TripStatus   @default(DRAFT)
+  travelers     String[]     @default([])
+  notes         String?
+  createdAt     DateTime     @default(now())
+  updatedAt     DateTime     @updatedAt
+
+  items         TripItem[]
+  budgetLines   BudgetLine[]
+  resources     Resource[]
+  aiMessages    AiMessage[]
+}
+
+model TripItem {
+  id              String        @id @default(cuid())
+  tripId          String
+  trip            Trip          @relation(fields: [tripId], references: [id], onDelete: Cascade)
+  type            TripItemType
+  title           String
+  provider        String?
+  location        String?
+  lat             Float?
+  lng             Float?
+  startAt         DateTime?
+  endAt           DateTime?
+  cost            Float?
+  currency        String?       @default("USD")
+  bookingStatus   BookingStatus @default(IDEA)
+  confirmationNo  String?
+  bookingUrl      String?
+  bookingAgentId  String?
+  bookingAgent    BookingAgent? @relation(fields: [bookingAgentId], references: [id], onDelete: SetNull)
+  sortOrder       Int           @default(0)
+  notes           String?
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+}
+
+model BudgetLine {
+  id          String         @id @default(cuid())
+  tripId      String
+  trip        Trip           @relation(fields: [tripId], references: [id], onDelete: Cascade)
+  category    BudgetCategory
+  label       String
+  estimated   Float          @default(0)
+  actual      Float?
+  currency    String         @default("USD")
+  createdAt   DateTime       @default(now())
+  updatedAt   DateTime       @updatedAt
+}
+
+model BookingAgent {
+  id        String     @id @default(cuid())
+  name      String
+  type      String?
+  contact   String?
+  website   String?
+  notes     String?
+  createdAt DateTime   @default(now())
+  items     TripItem[]
+}
+
+model Resource {
+  id            String       @id @default(cuid())
+  title         String
+  url           String?
+  category      String?
+  notes         String?
+  destinationId String?
+  destination   Destination? @relation(fields: [destinationId], references: [id], onDelete: SetNull)
+  tripId        String?
+  trip          Trip?        @relation(fields: [tripId], references: [id], onDelete: SetNull)
+  createdAt     DateTime     @default(now())
+}
+
+model AiMessage {
+  id        String   @id @default(cuid())
+  tripId    String?
+  trip      Trip?    @relation(fields: [tripId], references: [id], onDelete: Cascade)
+  role      String
+  content   String
+  createdAt DateTime @default(now())
+}
