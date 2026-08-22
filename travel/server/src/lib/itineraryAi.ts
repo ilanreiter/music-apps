@@ -42,11 +42,47 @@ const ITEM_SHAPE_INSTRUCTIONS = `Respond ONLY with strict JSON (no markdown fenc
     }
   ]
 }
-"day" is 1-indexed relative to the first day of the trip. Use STAY once per lodging (checked in day, checked out on the departure day is fine to omit a duplicate). Use TRANSPORT for inter-city/inter-region movement and arrival/departure flights. Use POI for sights/landmarks, ACTIVITY for booked/planned activities (tours, classes, etc). Keep costs in USD unless told otherwise, and only estimate when you have a reasonable basis. Include "lat"/"lng" (decimal degrees) whenever you can identify a real, mappable place for the item (landmarks, hotels, neighborhoods, airports) — use your knowledge of the actual location, not a guess at the trip's general area. Leave both null for anything without a concrete single location (e.g. "free time", "travel day").`;
+"day" is 1-indexed relative to the first day of the trip. Use STAY once per lodging (checked in day, checked out on the departure day is fine to omit a duplicate). Use TRANSPORT for inter-city/inter-region movement and arrival/departure flights. Use POI for sights/landmarks, ACTIVITY for booked/planned activities (tours, classes, etc). Keep costs in USD unless told otherwise, and only estimate when you have a reasonable basis. Include "lat"/"lng" (decimal degrees) whenever you can identify a real, mappable place for the item (landmarks, hotels, neighborhoods, airports) — use your knowledge of the actual location, not a guess at the trip's general area. Leave both null for anything without a concrete single location (e.g. "free time", "travel day"). Critical: this output is parsed by a strict JSON parser. If any string value (title, location, notes, summary) itself contains a double-quote character — e.g. a nickname or quoted phrase like the "Golden Gate" — you MUST escape it as \\" so the JSON stays valid. Prefer rephrasing to avoid inner quotes entirely when possible. Do not include trailing commas.`;
+
+// Retries the AI call + parse a few times, since the model occasionally emits
+// a formatting slip (an unescaped inner quote, a trailing comma) that breaks
+// JSON.parse — a fresh sample from the same prompt reliably self-corrects.
+async function requestProposedItinerary(
+  client: NonNullable<ReturnType<typeof getAnthropicClient>>,
+  system: string,
+  prompt: string,
+  maxTokens: number,
+  attempts = 3
+): Promise<ProposedItinerary> {
+  let lastErr: unknown;
+  for (let i = 0; i < attempts; i++) {
+    const response = await client.messages.create({
+      model: AI_MODEL,
+      max_tokens: maxTokens,
+      system,
+      messages: [{ role: "user", content: prompt }],
+    });
+    const textBlock = response.content.find((b) => b.type === "text");
+    const text = textBlock && "text" in textBlock ? textBlock.text : "{}";
+    try {
+      return parseProposedItinerary(text);
+    } catch (err) {
+      lastErr = err;
+    }
+  }
+  throw lastErr;
+}
 
 export function parseProposedItinerary(text: string): ProposedItinerary {
   const cleaned = text.trim().replace(/^```json\s*|^```\s*|```$/g, "");
-  const json = JSON.parse(cleaned);
+  let json: unknown;
+  try {
+    json = JSON.parse(cleaned);
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.error("[itineraryAi] Failed to parse AI JSON response:\n", cleaned);
+    throw err;
+  }
   return proposedItinerarySchema.parse(json);
 }
 
@@ -134,16 +170,12 @@ ${formatHomeLocationsInstruction(input.travelerProfiles)}
 
 ${ITEM_SHAPE_INSTRUCTIONS}`;
 
-  const response = await client.messages.create({
-    model: AI_MODEL,
-    max_tokens: 4096,
-    system: "You are a meticulous travel planner. You produce only valid JSON when asked to.",
-    messages: [{ role: "user", content: prompt }],
-  });
-
-  const textBlock = response.content.find((b) => b.type === "text");
-  const text = textBlock && "text" in textBlock ? textBlock.text : "{}";
-  return parseProposedItinerary(text);
+  return requestProposedItinerary(
+    client,
+    "You are a meticulous travel planner. You produce only valid JSON when asked to.",
+    prompt,
+    16384
+  );
 }
 
 export interface ImportItineraryInput {
@@ -164,16 +196,12 @@ Text to parse:
 ${input.rawText.slice(0, 15000)}
 """`;
 
-  const response = await client.messages.create({
-    model: AI_MODEL,
-    max_tokens: 4096,
-    system: "You are precise at extracting structured travel data from messy text. You produce only valid JSON when asked to.",
-    messages: [{ role: "user", content: prompt }],
-  });
-
-  const textBlock = response.content.find((b) => b.type === "text");
-  const text = textBlock && "text" in textBlock ? textBlock.text : "{}";
-  return parseProposedItinerary(text);
+  return requestProposedItinerary(
+    client,
+    "You are precise at extracting structured travel data from messy text. You produce only valid JSON when asked to.",
+    prompt,
+    16384
+  );
 }
 
 export interface GeocodeInputItem {

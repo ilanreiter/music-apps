@@ -137,7 +137,17 @@ function TripBasics({ trip, reload }: { trip: Trip; reload: () => void }) {
   );
 }
 
-function BuildItinerary({ trip, reload, onDismiss }: { trip: Trip; reload: () => void; onDismiss: () => void }) {
+function BuildItinerary({
+  trip,
+  reload,
+  onDismiss,
+  isRegenerate = false,
+}: {
+  trip: Trip;
+  reload: () => void;
+  onDismiss: () => void;
+  isRegenerate?: boolean;
+}) {
   const [mode, setMode] = useState<"choose" | "import" | "propose">("choose");
   const [pastedText, setPastedText] = useState("");
   const [extraNotes, setExtraNotes] = useState("");
@@ -145,6 +155,29 @@ function BuildItinerary({ trip, reload, onDismiss }: { trip: Trip; reload: () =>
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const itemCount = trip.items.length;
+
+  async function clearExistingItems() {
+    await api.delete(`/trips/${trip.id}/items`);
+  }
+
+  function startFromScratch() {
+    if (isRegenerate) {
+      if (
+        !confirm(
+          `This will permanently delete all ${itemCount} existing item(s) on this trip so you can rebuild from scratch. This cannot be undone. Continue?`
+        )
+      ) {
+        return;
+      }
+      clearExistingItems().then(() => {
+        reload();
+        onDismiss();
+      });
+      return;
+    }
+    onDismiss();
+  }
 
   function onFileChosen(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0];
@@ -182,6 +215,16 @@ function BuildItinerary({ trip, reload, onDismiss }: { trip: Trip; reload: () =>
   }
 
   async function applyProposal(items: ProposedItem[]) {
+    if (isRegenerate && itemCount > 0) {
+      if (
+        !confirm(
+          `This will permanently delete all ${itemCount} existing item(s) on this trip and replace them with the ${items.length} item(s) below. This cannot be undone. Continue?`
+        )
+      ) {
+        return;
+      }
+      await clearExistingItems();
+    }
     await api.post(`/trips/${trip.id}/items/bulk`, { items });
     setProposal(null);
     setMode("choose");
@@ -194,25 +237,30 @@ function BuildItinerary({ trip, reload, onDismiss }: { trip: Trip; reload: () =>
         proposal={proposal}
         onApplied={applyProposal}
         onDiscard={() => setProposal(null)}
+        replaceCount={isRegenerate ? itemCount : 0}
       />
     );
   }
 
   return (
     <Card className="p-5 mb-6">
-      <h2 className="font-semibold mb-1">Build your itinerary</h2>
+      <h2 className="font-semibold mb-1">{isRegenerate ? "Regenerate itinerary" : "Build your itinerary"}</h2>
       <p className="text-sm text-slate-500 dark:text-slate-400 mb-4">
-        No itinerary items yet — start from scratch, bring in a plan you already have, or let Claude propose one.
+        {isRegenerate
+          ? `This trip has ${itemCount} existing item(s). Choose how to rebuild it — whichever option you pick, the existing items are only deleted once you confirm.`
+          : "No itinerary items yet — start from scratch, bring in a plan you already have, or let Claude propose one."}
       </p>
 
       {mode === "choose" && (
         <div className="grid grid-cols-3 gap-3">
           <button
-            onClick={onDismiss}
+            onClick={startFromScratch}
             className="text-left p-4 rounded-lg border border-slate-200 dark:border-slate-700 hover:border-brand-400 transition-colors"
           >
             <div className="font-medium mb-1 flex items-center gap-1.5"><PencilIcon className="h-4 w-4 text-brand-600 dark:text-brand-400" /> Start from scratch</div>
-            <div className="text-xs text-slate-500 dark:text-slate-400">Add transport, stays and POIs one at a time below.</div>
+            <div className="text-xs text-slate-500 dark:text-slate-400">
+              {isRegenerate ? "Delete existing items and add new ones one at a time below." : "Add transport, stays and POIs one at a time below."}
+            </div>
           </button>
           <button
             onClick={() => setMode("import")}
@@ -228,6 +276,12 @@ function BuildItinerary({ trip, reload, onDismiss }: { trip: Trip; reload: () =>
             <div className="font-medium mb-1 flex items-center gap-1.5"><SparklesIcon className="h-4 w-4 text-brand-600 dark:text-brand-400" /> Propose with AI</div>
             <div className="text-xs text-slate-500 dark:text-slate-400">Claude drafts a day-by-day plan from your trip goal and saved preferences.</div>
           </button>
+        </div>
+      )}
+
+      {mode === "choose" && isRegenerate && (
+        <div className="mt-3">
+          <Button variant="ghost" onClick={onDismiss}>Cancel</Button>
         </div>
       )}
 
@@ -268,10 +322,12 @@ function ProposalReviewWrapper({
   proposal,
   onApplied,
   onDiscard,
+  replaceCount = 0,
 }: {
   proposal: ProposedItinerary;
   onApplied: (items: ProposedItem[]) => void;
   onDiscard: () => void;
+  replaceCount?: number;
 }) {
   const [included, setIncluded] = useState<boolean[]>(proposal.items.map(() => true));
   const [busy, setBusy] = useState(false);
@@ -300,6 +356,11 @@ function ProposalReviewWrapper({
   return (
     <Card className="p-5 mb-6">
       <h2 className="font-semibold mb-2">Proposed itinerary</h2>
+      {replaceCount > 0 && (
+        <p className="text-sm text-amber-700 dark:text-amber-400 mb-3 bg-amber-50 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-900 rounded-md px-3 py-2">
+          Applying this will permanently delete the {replaceCount} existing item(s) on this trip and replace them with your selection below.
+        </p>
+      )}
       {proposal.summary && <p className="text-sm text-slate-600 dark:text-slate-300 mb-4">{proposal.summary}</p>}
       <div className="space-y-4 max-h-96 overflow-y-auto pr-1">
         {[...byDay.entries()].sort(([a], [b]) => a - b).map(([day, entries]) => (
@@ -325,7 +386,9 @@ function ProposalReviewWrapper({
         {proposal.items.length === 0 && <p className="text-sm text-slate-500">Nothing was extracted — try adding more detail.</p>}
       </div>
       <div className="flex gap-2 mt-4 pt-3 border-t border-slate-200 dark:border-slate-800">
-        <Button onClick={apply} disabled={busy || count === 0}>{busy ? "Adding…" : `Add ${count} item(s) to itinerary`}</Button>
+        <Button onClick={apply} disabled={busy || count === 0}>
+          {busy ? (replaceCount > 0 ? "Replacing…" : "Adding…") : replaceCount > 0 ? `Replace itinerary with ${count} item(s)` : `Add ${count} item(s) to itinerary`}
+        </Button>
         <Button variant="secondary" onClick={onDiscard}>Discard</Button>
       </div>
     </Card>
@@ -334,11 +397,35 @@ function ProposalReviewWrapper({
 
 export default function TripSetup({ trip, reload }: { trip: Trip; reload: () => void }) {
   const [dismissed, setDismissed] = useState(false);
+  const [regenerating, setRegenerating] = useState(false);
+
+  function startRegenerate() {
+    if (
+      !confirm(
+        `This trip has ${trip.items.length} existing item(s). Rebuilding the itinerary will delete them once you choose and confirm a new plan below. Continue?`
+      )
+    ) {
+      return;
+    }
+    setRegenerating(true);
+  }
+
   return (
     <div>
       <TripBasics trip={trip} reload={reload} />
       {trip.items.length === 0 && !dismissed && (
         <BuildItinerary trip={trip} reload={reload} onDismiss={() => setDismissed(true)} />
+      )}
+      {trip.items.length > 0 && !regenerating && (
+        <Card className="p-4 mb-6 flex items-center justify-between">
+          <div className="text-sm text-slate-500 dark:text-slate-400">
+            Traveler profiles or preferences changed? Rebuild this trip's itinerary from scratch.
+          </div>
+          <Button variant="secondary" onClick={startRegenerate}>Regenerate Itinerary</Button>
+        </Card>
+      )}
+      {trip.items.length > 0 && regenerating && (
+        <BuildItinerary trip={trip} reload={reload} onDismiss={() => setRegenerating(false)} isRegenerate />
       )}
     </div>
   );

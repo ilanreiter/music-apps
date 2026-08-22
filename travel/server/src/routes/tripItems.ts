@@ -65,6 +65,15 @@ router.delete("/:itemId", async (req, res) => {
   res.status(204).end();
 });
 
+// Clears every item on a trip in one shot — used by the "regenerate itinerary"
+// flow before applying a fresh AI proposal or a re-import. The client is
+// responsible for confirming this destructive action with the user first.
+router.delete("/", async (req, res) => {
+  const tripId = (req.params as Record<string, string>).tripId;
+  await prisma.tripItem.deleteMany({ where: { tripId } });
+  res.status(204).end();
+});
+
 const bulkItemSchema = z.object({
   day: z.number().int().min(1),
   type: z.enum(["TRANSPORT", "STAY", "POI", "ACTIVITY", "OTHER"]),

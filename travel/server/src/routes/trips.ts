@@ -127,7 +127,7 @@ router.post("/:id/propose-itinerary", async (req, res) => {
       nights,
       goal: trip.goal || "MIXED",
       goalDetail: trip.goalDetail || undefined,
-      travelers: trip.travelers.length || 2,
+      travelers: travelerProfiles.length || trip.travelers.length || 2,
       planningType: trip.planningType || "SELF_PLANNED",
       preferences,
       travelerProfiles,
