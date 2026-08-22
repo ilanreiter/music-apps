@@ -35,6 +35,17 @@ function startOfDay(iso: string) {
   return d.getTime();
 }
 
+function formatDuration(startAt?: string | null, endAt?: string | null): string | null {
+  if (!startAt || !endAt) return null;
+  const minutes = Math.round((new Date(endAt).getTime() - new Date(startAt).getTime()) / 60_000);
+  if (minutes <= 0) return null;
+  const h = Math.floor(minutes / 60);
+  const m = minutes % 60;
+  if (h === 0) return `${m}m`;
+  if (m === 0) return `${h}h`;
+  return `${h}h ${m}m`;
+}
+
 // Best-effort day number for the leftmost column. Prefers the trip's actual
 // start date; falls back to the earliest dated item in the trip (for trips
 // planned before exact dates are known); falls back to a "Day N" prefix left
@@ -230,13 +241,26 @@ function ItineraryTab({
   const [lng, setLng] = useState("");
   const [startAt, setStartAt] = useState("");
   const [endAt, setEndAt] = useState("");
+  const [durationHours, setDurationHours] = useState("");
   const [cost, setCost] = useState("");
   const [bookingStatus, setBookingStatus] = useState<BookingStatus>("IDEA");
   const [confirmationNo, setConfirmationNo] = useState("");
   const [bookingAgentId, setBookingAgentId] = useState("");
 
+  // If a duration was given but no explicit end time, derive one from start + duration.
+  function resolveEndAt(): string {
+    if (endAt) return new Date(endAt).toISOString();
+    if (startAt && durationHours) {
+      const end = new Date(startAt);
+      end.setMinutes(end.getMinutes() + Math.round(parseFloat(durationHours) * 60));
+      return end.toISOString();
+    }
+    return "";
+  }
+
   async function addItem(e: React.FormEvent) {
     e.preventDefault();
+    const resolvedEndAt = resolveEndAt();
     await api.post(`/trips/${trip.id}/items`, {
       type,
       title: itemTitle,
@@ -245,14 +269,14 @@ function ItineraryTab({
       lat: lat ? parseFloat(lat) : null,
       lng: lng ? parseFloat(lng) : null,
       startAt: startAt ? new Date(startAt).toISOString() : null,
-      endAt: endAt ? new Date(endAt).toISOString() : null,
+      endAt: resolvedEndAt || null,
       cost: cost ? parseFloat(cost) : null,
       bookingStatus,
       confirmationNo: confirmationNo || null,
       bookingAgentId: bookingAgentId || null,
     });
     setItemTitle(""); setProvider(""); setLocation(""); setLat(""); setLng("");
-    setStartAt(""); setEndAt(""); setCost(""); setConfirmationNo(""); setBookingAgentId("");
+    setStartAt(""); setEndAt(""); setDurationHours(""); setCost(""); setConfirmationNo(""); setBookingAgentId("");
     setBookingStatus("IDEA");
     setShowForm(false);
     reload();
@@ -327,6 +351,18 @@ function ItineraryTab({
               <Input type="datetime-local" value={endAt} onChange={(e) => setEndAt(e.target.value)} />
             </div>
             <div>
+              <Label>Or duration (hours)</Label>
+              <Input
+                type="number"
+                step="0.25"
+                min="0"
+                value={durationHours}
+                onChange={(e) => setDurationHours(e.target.value)}
+                placeholder="e.g. 1.5"
+                disabled={!!endAt}
+              />
+            </div>
+            <div>
               <Label>Confirmation #</Label>
               <Input value={confirmationNo} onChange={(e) => setConfirmationNo(e.target.value)} />
             </div>
@@ -347,6 +383,7 @@ function ItineraryTab({
       <div className="space-y-3">
         {trip.items.map((item) => {
           const day = dayNumberFor(trip, item);
+          const duration = formatDuration(item.startAt, item.endAt);
           return (
           <Card key={item.id} className="p-4 flex items-center gap-4">
             <div className="w-12 shrink-0 text-center text-xs font-semibold text-slate-400 dark:text-slate-500">
@@ -361,6 +398,9 @@ function ItineraryTab({
                 {item.startAt && new Date(item.startAt).toLocaleString()}
                 {item.endAt && ` → ${new Date(item.endAt).toLocaleString()}`}
               </div>
+              {duration && (
+                <div className="text-xs text-slate-400 mt-0.5">⏱ {duration} allocated</div>
+              )}
               {item.cost != null && <div className="text-xs text-slate-400">{item.currency || "USD"} {item.cost}</div>}
               {item.confirmationNo && <div className="text-xs text-slate-400">Confirmation: {item.confirmationNo}</div>}
               {item.bookingAgent && <div className="text-xs text-slate-400">Via {item.bookingAgent.name}</div>}
