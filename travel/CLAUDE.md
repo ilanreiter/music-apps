@@ -9,6 +9,14 @@ Stack: React/Vite/TS/Tailwind client, Express/TS/Prisma server, Postgres, all
 in Docker via `docker-compose.yml`. See `README.md` for the full feature map
 and data model.
 
+Postgres is **not** run locally in this stack — the server connects to a
+shared external Postgres server (`DATABASE_URL` in `.env`), using the
+`locations` database alongside unrelated tables from other apps (owned by
+`homedash`, see `/home/ilan/Dev2/homelab/homedash/config/config.json` →
+`db_connections` for host/credentials). Travel's own tables are all
+PascalCase (`User`, `Trip`, `TripItem`, etc., matching the Prisma model
+names) so they don't collide with the other apps' snake_case tables.
+
 ## Running changes — rebuild the containers
 
 This stack runs as **built** Docker images, not dev servers with hot reload.
@@ -25,16 +33,15 @@ the running container is still serving the old build. Always rebuild before
 telling the user a change is live at http://localhost:8080.
 
 If the change touches `server/prisma/schema.prisma`, generate and apply a
-migration against the running Postgres (port 5432 is published to
-`127.0.0.1` for exactly this) before rebuilding the server image:
+migration against the external Postgres before rebuilding the server image:
 
 ```bash
 cd server
-DATABASE_URL="postgresql://<user>:<password>@localhost:5432/<db>" npx prisma migrate dev --name <description> --skip-generate
+DATABASE_URL="$(grep DATABASE_URL ../.env | cut -d= -f2-)" npx prisma migrate dev --name <description> --skip-generate
 npx prisma generate
 ```
 
-(Credentials come from `.env` at the repo root.) The server's `CMD` also runs
+(Credentials come from `DATABASE_URL` in `.env` at the repo root.) The server's `CMD` also runs
 `prisma migrate deploy` on container start, so a committed migration applies
 itself in fresh environments — but during local iteration, generate it first
 the way above so it's applied immediately and the migration file exists to
