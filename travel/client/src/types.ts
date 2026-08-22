@@ -110,6 +110,20 @@ export interface Conflict {
   reason: string;
 }
 
+export interface Traveler {
+  id: string;
+  name: string;
+  age?: number | null;
+  homeLocation?: string | null;
+  avatarEmoji?: string | null;
+  photoUrl?: string | null;
+  travelPreferences?: string | null;
+  stayPreferences?: string | null;
+  transportPreferences?: string | null;
+  foodPreferences?: string | null;
+  notes?: string | null;
+}
+
 export interface Preferences {
   id: string;
   interests: string[];

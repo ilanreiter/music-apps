@@ -50,6 +50,58 @@ export function parseProposedItinerary(text: string): ProposedItinerary {
   return proposedItinerarySchema.parse(json);
 }
 
+export interface TravelerProfileInput {
+  name: string;
+  age?: number | null;
+  homeLocation?: string | null;
+  travelPreferences?: string | null;
+  stayPreferences?: string | null;
+  transportPreferences?: string | null;
+  foodPreferences?: string | null;
+  notes?: string | null;
+}
+
+export function formatTravelerProfilesBlock(travelers: TravelerProfileInput[] | null | undefined): string {
+  if (!travelers || travelers.length === 0) return "No traveler profiles saved.";
+  return `Traveler profiles:\n${travelers
+    .map((t) => {
+      const parts = [
+        t.age != null ? `age ${t.age}` : null,
+        t.homeLocation ? `home location: ${t.homeLocation}` : null,
+        t.travelPreferences ? `travel preferences: ${t.travelPreferences}` : null,
+        t.stayPreferences ? `hotel/stay preferences: ${t.stayPreferences}` : null,
+        t.transportPreferences ? `transport preferences: ${t.transportPreferences}` : null,
+        t.foodPreferences ? `food preferences: ${t.foodPreferences}` : null,
+        t.notes ? `other notes: ${t.notes}` : null,
+      ].filter(Boolean);
+      return `- ${t.name}${parts.length ? ` (${parts.join("; ")})` : ""}`;
+    })
+    .join("\n")}`;
+}
+
+// Distinct home locations across traveler profiles, in profile order — used
+// to anchor trip start/end points (outbound transport from home, return
+// transport back to home) in AI-generated itineraries.
+export function getHomeLocations(travelers: TravelerProfileInput[] | null | undefined): string[] {
+  if (!travelers) return [];
+  const seen = new Set<string>();
+  const locations: string[] = [];
+  for (const t of travelers) {
+    const loc = t.homeLocation?.trim();
+    if (loc && !seen.has(loc)) {
+      seen.add(loc);
+      locations.push(loc);
+    }
+  }
+  return locations;
+}
+
+export function formatHomeLocationsInstruction(travelers: TravelerProfileInput[] | null | undefined): string {
+  const homes = getHomeLocations(travelers);
+  if (homes.length === 0) return "";
+  return `The trip starts and ends at the travelers' home location(${homes.length > 1 ? "s" : ""}): ${homes.join(", ")}. Include the outbound TRANSPORT leg from home to the destination on day 1 and the return TRANSPORT leg from the destination back home on the last day, unless such legs are already covered elsewhere (e.g. a booked flight noted in extra context).`;
+}
+
 export interface ProposeItineraryInput {
   destinationName: string;
   nights: number;
@@ -58,6 +110,7 @@ export interface ProposeItineraryInput {
   travelers: number;
   planningType: string;
   preferences?: { interests: string[]; pace?: string | null; budgetStyle?: string | null; notes?: string | null } | null;
+  travelerProfiles?: TravelerProfileInput[] | null;
   extraNotes?: string;
 }
 
@@ -73,7 +126,11 @@ export async function proposeItinerary(input: ProposeItineraryInput): Promise<Pr
 Trip goal/style: ${input.goal}. Planning type: ${input.planningType}.
 ${input.goalDetail ? `Specifically, what the travelers want out of this trip: "${input.goalDetail}". Weight this heavily — it's more specific than the general goal/style category above.` : ""}
 ${prefsBlock}
+${formatTravelerProfilesBlock(input.travelerProfiles)}
 ${input.extraNotes ? `Additional context from the travelers: ${input.extraNotes}` : ""}
+
+Take the traveler profiles into account: their ages, stay/transport/food preferences, and any notes (dietary, mobility, etc) should shape which items you propose.
+${formatHomeLocationsInstruction(input.travelerProfiles)}
 
 ${ITEM_SHAPE_INSTRUCTIONS}`;
 

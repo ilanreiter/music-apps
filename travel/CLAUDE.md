@@ -48,6 +48,13 @@ commit.
 - For anything touching the API, verify with a real `curl` request (register
   a throwaway user, hit the endpoint, then delete that test user/data from
   the DB afterward — don't leave test data in the shared dataset).
+- For anything touching layout/styling, verify visually with Playwright
+  (already installed; Chromium is cached under `~/.cache/ms-playwright`, so
+  `npm install playwright --no-save` in a scratch dir + a small script using
+  `chromium.launch()` is enough — no browser download needed) before
+  reporting a visual fix as done. Register a throwaway user the same way as
+  the curl case, screenshot the relevant page/state, and delete that test
+  user afterward.
 
 ## Repo location note
 

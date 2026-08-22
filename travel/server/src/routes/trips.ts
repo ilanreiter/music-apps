@@ -119,6 +119,7 @@ router.post("/:id/propose-itinerary", async (req, res) => {
       : 5);
 
   const preferences = await prisma.preferences.findUnique({ where: { id: "default" } });
+  const travelerProfiles = await prisma.traveler.findMany({ orderBy: { createdAt: "asc" } });
 
   try {
     const proposal = await proposeItinerary({
@@ -129,6 +130,7 @@ router.post("/:id/propose-itinerary", async (req, res) => {
       travelers: trip.travelers.length || 2,
       planningType: trip.planningType || "SELF_PLANNED",
       preferences,
+      travelerProfiles,
       extraNotes: parsed.data.extraNotes,
     });
     res.json(proposal);

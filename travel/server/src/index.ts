@@ -10,6 +10,7 @@ import bookingAgentsRouter from "./routes/bookingAgents";
 import resourcesRouter from "./routes/resources";
 import aiRouter from "./routes/ai";
 import preferencesRouter from "./routes/preferences";
+import travelersRouter from "./routes/travelers";
 import { requireAuth } from "./middleware/auth";
 
 const app = express();
@@ -33,6 +34,7 @@ app.use("/api/booking-agents", requireAuth, bookingAgentsRouter);
 app.use("/api/resources", requireAuth, resourcesRouter);
 app.use("/api/ai", requireAuth, aiRouter);
 app.use("/api/preferences", requireAuth, preferencesRouter);
+app.use("/api/travelers", requireAuth, travelersRouter);
 
 app.use((err: any, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
   console.error(err);

@@ -180,6 +180,25 @@ model Resource {
   createdAt     DateTime     @default(now())
 }
 
+// One row per traveler — used to steer AI-proposed itineraries, cost
+// estimates, and to give booking agents the details they need (names, ages,
+// dietary/mobility notes, etc).
+model Traveler {
+  id                    String   @id @default(cuid())
+  name                  String
+  age                   Int?
+  homeLocation          String?
+  avatarEmoji           String?
+  photoUrl              String?  @db.Text
+  travelPreferences     String?
+  stayPreferences       String?
+  transportPreferences  String?
+  foodPreferences       String?
+  notes                 String?
+  createdAt             DateTime @default(now())
+  updatedAt             DateTime @updatedAt
+}
+
 // Singleton (id is always "default") — shared household travel preferences
 // used to steer AI-proposed itineraries and cost estimates.
 model Preferences {

@@ -80,10 +80,17 @@ const bulkItemSchema = z.object({
 
 const bulkSchema = z.object({ items: z.array(bulkItemSchema).min(1) });
 
+// Trips planned before exact dates are picked have no real anchor date, but
+// we still want to preserve the AI's time-of-day and duration for each item
+// (otherwise "10:00, 2h" is silently thrown away). This fixed, meaningless
+// date anchors day/time arithmetic in that case; the client knows to render
+// only the time portion (not this date) when trip.startDate is null.
+const UNDATED_TRIP_ANCHOR = new Date(Date.UTC(2000, 0, 1));
+
 // Applies a day-relative AI proposal (from /trips/:id/propose-itinerary or
-// /import-itinerary) to real TripItems. Resolves day+time into absolute
-// datetimes when the trip has a start date; otherwise stores the day number
-// in the notes so items still have a discoverable order.
+// /import-itinerary) to real TripItems, resolving day+time into datetimes
+// (real ones if the trip has a start date, otherwise anchored to a fixed
+// placeholder date so time-of-day and duration still round-trip).
 router.post("/bulk", async (req, res) => {
   const parsed = bulkSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
@@ -94,17 +101,13 @@ router.post("/bulk", async (req, res) => {
 
   const created = await prisma.$transaction(
     parsed.data.items.map((item, index) => {
-      let startAt: Date | undefined;
-      if (trip.startDate) {
-        const [h, m] = (item.time || "09:00").split(":").map((n) => parseInt(n, 10) || 0);
-        startAt = new Date(trip.startDate);
-        startAt.setDate(startAt.getDate() + (item.day - 1));
-        startAt.setHours(h, m, 0, 0);
-      }
-      const endAt = startAt && item.durationHours ? new Date(startAt.getTime() + item.durationHours * 3600_000) : undefined;
+      const [h, m] = (item.time || "09:00").split(":").map((n) => parseInt(n, 10) || 0);
+      const startAt = new Date(trip.startDate ?? UNDATED_TRIP_ANCHOR);
+      startAt.setDate(startAt.getDate() + (item.day - 1));
+      startAt.setHours(h, m, 0, 0);
+      const endAt = item.durationHours ? new Date(startAt.getTime() + item.durationHours * 3600_000) : undefined;
 
-      const dayLabel = `Day ${item.day}`;
-      const notes = trip.startDate ? item.notes ?? undefined : [dayLabel, item.notes].filter(Boolean).join(" — ");
+      const notes = item.notes ?? undefined;
 
       return prisma.tripItem.create({
         data: {

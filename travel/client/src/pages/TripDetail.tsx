@@ -35,6 +35,15 @@ function startOfDay(iso: string) {
   return d.getTime();
 }
 
+// When the trip has no real start date, item times are anchored to a fixed
+// placeholder date server-side (see tripItems.ts) purely to preserve
+// time-of-day and duration — that date itself is meaningless and must not
+// be shown to the user, only the clock time.
+function formatItemTime(trip: Trip, iso: string): string {
+  const d = new Date(iso);
+  return trip.startDate ? d.toLocaleString() : d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+}
+
 function formatDuration(startAt?: string | null, endAt?: string | null): string | null {
   if (!startAt || !endAt) return null;
   const minutes = Math.round((new Date(endAt).getTime() - new Date(startAt).getTime()) / 60_000);
@@ -395,8 +404,8 @@ function ItineraryTab({
               <div className="text-xs text-slate-500">
                 {item.provider && `${item.provider} · `}
                 {item.location && `${item.location} · `}
-                {item.startAt && new Date(item.startAt).toLocaleString()}
-                {item.endAt && ` → ${new Date(item.endAt).toLocaleString()}`}
+                {item.startAt && formatItemTime(trip, item.startAt)}
+                {item.endAt && ` → ${formatItemTime(trip, item.endAt)}`}
               </div>
               {duration && (
                 <div className="text-xs text-slate-400 mt-0.5">⏱ {duration} allocated</div>

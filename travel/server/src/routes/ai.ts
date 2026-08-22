@@ -2,6 +2,7 @@ import { Router } from "express";
 import { z } from "zod";
 import { prisma } from "../db";
 import { getAnthropicClient, AI_MODEL } from "../lib/anthropic";
+import { formatTravelerProfilesBlock, formatHomeLocationsInstruction, getHomeLocations } from "../lib/itineraryAi";
 
 const router = Router();
 
@@ -32,14 +33,15 @@ router.post("/chat", async (req, res) => {
     });
   }
 
-  let contextBlock = "";
+  const travelerProfiles = await prisma.traveler.findMany({ orderBy: { createdAt: "asc" } });
+  let contextBlock = `\n\n${formatTravelerProfilesBlock(travelerProfiles)}\n${formatHomeLocationsInstruction(travelerProfiles)}`;
   if (tripId) {
     const trip = await prisma.trip.findUnique({
       where: { id: tripId },
       include: { destination: true, items: true, budgetLines: true },
     });
     if (trip) {
-      contextBlock = `\n\nCurrent trip context (JSON):\n${JSON.stringify({
+      contextBlock += `\n\nCurrent trip context (JSON):\n${JSON.stringify({
         title: trip.title,
         destination: trip.destination?.name,
         startDate: trip.startDate,
@@ -102,8 +104,12 @@ router.post("/estimate-cost", async (req, res) => {
   }
 
   const { destinationName, travelers, nights, style, originCity } = parsed.data;
+  const travelerProfiles = await prisma.traveler.findMany({ orderBy: { createdAt: "asc" } });
+  const effectiveOriginCity = originCity || getHomeLocations(travelerProfiles)[0];
   const prompt = `Give a rough travel cost estimate for a trip to ${destinationName} for ${travelers} travelers,
-${nights} nights, ${style} style${originCity ? `, departing from ${originCity}` : ""}.
+${nights} nights, ${style} style${effectiveOriginCity ? `, departing from ${effectiveOriginCity} (the trip starts and ends there — include round-trip flights/transport from and back to this origin)` : ""}.
+${formatTravelerProfilesBlock(travelerProfiles)}
+Take stay, transport, and food preferences into account when estimating lodging/flights/food (e.g. a preference for direct flights, higher-end stays, or fine dining should push those line items up).
 Respond ONLY with strict JSON, no prose, in this shape:
 {"currency":"USD","flights":number,"lodging":number,"food":number,"activities":number,"localTransport":number,"misc":number,"total":number,"notes":"short caveat string"}`;
 

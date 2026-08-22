@@ -8,6 +8,7 @@ const navItems = [
   { to: "/", label: "Dashboard", end: true, emoji: "🏠" },
   { to: "/destinations", label: "Destinations", emoji: "🗺️" },
   { to: "/trips", label: "Trips", emoji: "🧳" },
+  { to: "/travelers", label: "Travelers", emoji: "🧑‍🤝‍🧑" },
   { to: "/finances", label: "Finances", emoji: "💰" },
   { to: "/booking-agents", label: "Booking Agents", emoji: "🤝" },
   { to: "/resources", label: "Resources", emoji: "📚" },
