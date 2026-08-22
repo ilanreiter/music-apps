@@ -2,7 +2,7 @@ import React, { useEffect, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { api } from "../lib/api";
 import { Destination, Trip, TripGoal, TripPlanningType } from "../types";
-import { Badge, Button, Card, Input, Label, PageHeader, Select, Textarea } from "../components/ui";
+import { Badge, Button, Card, Input, Label, PageHeader, Select, Skeleton, Textarea } from "../components/ui";
 
 const STATUS_TONE: Record<string, string> = {
   DRAFT: "slate",
@@ -32,6 +32,7 @@ const PLANNING_LABEL: Record<TripPlanningType, string> = {
 export default function Trips() {
   const [trips, setTrips] = useState<Trip[]>([]);
   const [destinations, setDestinations] = useState<Destination[]>([]);
+  const [loading, setLoading] = useState(true);
   const [showForm, setShowForm] = useState(false);
   const [title, setTitle] = useState("");
   const [destinationId, setDestinationId] = useState("");
@@ -46,7 +47,7 @@ export default function Trips() {
   const navigate = useNavigate();
 
   function load() {
-    api.get<Trip[]>("/trips").then(setTrips).catch(() => {});
+    api.get<Trip[]>("/trips").then(setTrips).catch(() => {}).finally(() => setLoading(false));
   }
 
   useEffect(() => {
@@ -172,7 +173,15 @@ export default function Trips() {
       )}
 
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-        {trips.map((t) => (
+        {loading &&
+          Array.from({ length: 4 }).map((_, i) => (
+            <Card key={i} className="p-4 space-y-2">
+              <Skeleton className="h-5 w-2/3" />
+              <Skeleton className="h-3 w-1/2" />
+              <Skeleton className="h-3 w-1/3" />
+            </Card>
+          ))}
+        {!loading && trips.map((t) => (
           <Link key={t.id} to={`/trips/${t.id}`}>
             <Card className="p-4 hover:border-brand-400 transition-colors">
               <div className="flex items-center justify-between mb-1">
@@ -196,7 +205,7 @@ export default function Trips() {
             </Card>
           </Link>
         ))}
-        {trips.length === 0 && <p className="text-sm text-slate-500">No trips yet.</p>}
+        {!loading && trips.length === 0 && <p className="text-sm text-slate-500">No trips yet.</p>}
       </div>
     </div>
   );

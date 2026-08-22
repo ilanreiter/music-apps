@@ -2,6 +2,7 @@ import React, { useRef, useState } from "react";
 import { api } from "../lib/api";
 import { ProposedItem, ProposedItinerary, Trip, TripGoal, TripItemType, TripPlanningType } from "../types";
 import { Badge, Button, Card, Input, Label, Select, Textarea } from "../components/ui";
+import { DownloadIcon, PencilIcon, SparklesIcon } from "../components/icons";
 
 const GOAL_LABEL: Record<TripGoal, string> = {
   NATURE: "Nature",
@@ -210,21 +211,21 @@ function BuildItinerary({ trip, reload, onDismiss }: { trip: Trip; reload: () =>
             onClick={onDismiss}
             className="text-left p-4 rounded-lg border border-slate-200 dark:border-slate-700 hover:border-brand-400 transition-colors"
           >
-            <div className="font-medium mb-1">✍ Start from scratch</div>
+            <div className="font-medium mb-1 flex items-center gap-1.5"><PencilIcon className="h-4 w-4 text-brand-600 dark:text-brand-400" /> Start from scratch</div>
             <div className="text-xs text-slate-500 dark:text-slate-400">Add transport, stays and POIs one at a time below.</div>
           </button>
           <button
             onClick={() => setMode("import")}
             className="text-left p-4 rounded-lg border border-slate-200 dark:border-slate-700 hover:border-brand-400 transition-colors"
           >
-            <div className="font-medium mb-1">📥 Import existing itinerary</div>
+            <div className="font-medium mb-1 flex items-center gap-1.5"><DownloadIcon className="h-4 w-4 text-brand-600 dark:text-brand-400" /> Import existing itinerary</div>
             <div className="text-xs text-slate-500 dark:text-slate-400">Paste text (or a booking/confirmation email), or upload a file — Claude will structure it.</div>
           </button>
           <button
             onClick={() => setMode("propose")}
             className="text-left p-4 rounded-lg border border-slate-200 dark:border-slate-700 hover:border-brand-400 transition-colors"
           >
-            <div className="font-medium mb-1">✨ Propose with AI</div>
+            <div className="font-medium mb-1 flex items-center gap-1.5"><SparklesIcon className="h-4 w-4 text-brand-600 dark:text-brand-400" /> Propose with AI</div>
             <div className="text-xs text-slate-500 dark:text-slate-400">Claude drafts a day-by-day plan from your trip goal and saved preferences.</div>
           </button>
         </div>

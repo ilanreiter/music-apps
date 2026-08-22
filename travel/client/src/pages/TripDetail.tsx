@@ -4,6 +4,7 @@ import { api } from "../lib/api";
 import { BookingAgent, BookingStatus, BudgetLine, Conflict, Trip, TripItem, TripItemType } from "../types";
 import { Badge, BadgeSelect, Button, Card, Input, Label, PageHeader, Select, Textarea } from "../components/ui";
 import TripSetup from "../components/TripSetup";
+import { AlertTriangleIcon } from "../components/icons";
 import type { MapPoint } from "../components/RouteMap";
 
 const RouteMap = React.lazy(() => import("../components/RouteMap"));
@@ -84,7 +85,9 @@ export default function TripDetail() {
 
       {conflicts.length > 0 && (
         <Card className="p-4 mb-4 border-red-300 dark:border-red-800 bg-red-50 dark:bg-red-950/40">
-          <div className="font-medium text-red-700 dark:text-red-300 mb-1 text-sm">⚠ {conflicts.length} scheduling conflict(s) detected</div>
+          <div className="font-medium text-red-700 dark:text-red-300 mb-1 text-sm flex items-center gap-1.5">
+            <AlertTriangleIcon className="h-4 w-4" /> {conflicts.length} scheduling conflict(s) detected
+          </div>
           <ul className="text-xs text-red-600 dark:text-red-400 space-y-1">
             {conflicts.map((c, i) => <li key={i}>{c.reason}</li>)}
           </ul>

@@ -2,15 +2,18 @@ import React, { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { api } from "../lib/api";
 import { Destination, Trip } from "../types";
-import { Card, PageHeader, Badge } from "../components/ui";
+import { Card, PageHeader, Badge, Skeleton } from "../components/ui";
 
 export default function Dashboard() {
   const [destinations, setDestinations] = useState<Destination[]>([]);
   const [trips, setTrips] = useState<Trip[]>([]);
+  const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    api.get<Destination[]>("/destinations").then(setDestinations).catch(() => {});
-    api.get<Trip[]>("/trips").then(setTrips).catch(() => {});
+    Promise.all([
+      api.get<Destination[]>("/destinations").then(setDestinations).catch(() => {}),
+      api.get<Trip[]>("/trips").then(setTrips).catch(() => {}),
+    ]).finally(() => setLoading(false));
   }, []);
 
   const upcoming = trips
@@ -27,9 +30,16 @@ export default function Dashboard() {
             <h2 className="font-semibold">Top destinations</h2>
             <Link to="/destinations" className="text-xs text-brand-600 hover:underline">View all</Link>
           </div>
-          {topDestinations.length === 0 && <p className="text-sm text-slate-500">No destinations yet. Add your first one!</p>}
+          {loading && (
+            <ul className="space-y-2">
+              {Array.from({ length: 3 }).map((_, i) => (
+                <li key={i}><Skeleton className="h-5 w-full" /></li>
+              ))}
+            </ul>
+          )}
+          {!loading && topDestinations.length === 0 && <p className="text-sm text-slate-500">No destinations yet. Add your first one!</p>}
           <ul className="space-y-2">
-            {topDestinations.map((d, i) => (
+            {!loading && topDestinations.map((d, i) => (
               <li key={d.id} className="flex items-center justify-between text-sm">
                 <span>
                   <span className="text-slate-400 mr-2">#{i + 1}</span>
@@ -46,9 +56,16 @@ export default function Dashboard() {
             <h2 className="font-semibold">Active trips</h2>
             <Link to="/trips" className="text-xs text-brand-600 hover:underline">View all</Link>
           </div>
-          {upcoming.length === 0 && <p className="text-sm text-slate-500">No trips in progress yet.</p>}
+          {loading && (
+            <ul className="space-y-2">
+              {Array.from({ length: 3 }).map((_, i) => (
+                <li key={i}><Skeleton className="h-5 w-full" /></li>
+              ))}
+            </ul>
+          )}
+          {!loading && upcoming.length === 0 && <p className="text-sm text-slate-500">No trips in progress yet.</p>}
           <ul className="space-y-2">
-            {upcoming.map((t) => (
+            {!loading && upcoming.map((t) => (
               <li key={t.id}>
                 <Link to={`/trips/${t.id}`} className="flex items-center justify-between text-sm hover:text-brand-700">
                   <span>{t.title}</span>
