@@ -2,7 +2,11 @@ import React, { useEffect, useState } from "react";
 import { useParams } from "react-router-dom";
 import { api } from "../lib/api";
 import { BookingAgent, BookingStatus, BudgetLine, Conflict, Trip, TripItem, TripItemType } from "../types";
-import { Badge, Button, Card, Input, Label, PageHeader, Select, Textarea } from "../components/ui";
+import { Badge, BadgeSelect, Button, Card, Input, Label, PageHeader, Select, Textarea } from "../components/ui";
+import TripSetup from "../components/TripSetup";
+import type { MapPoint } from "../components/RouteMap";
+
+const RouteMap = React.lazy(() => import("../components/RouteMap"));
 
 const TABS = ["Itinerary", "Route", "Budget", "Resources"] as const;
 type Tab = (typeof TABS)[number];
@@ -24,6 +28,32 @@ const BOOKING_TONE: Record<BookingStatus, string> = {
   CANCELLED: "red",
 };
 
+function startOfDay(iso: string) {
+  const d = new Date(iso);
+  d.setHours(0, 0, 0, 0);
+  return d.getTime();
+}
+
+// Best-effort day number for the leftmost column. Prefers the trip's actual
+// start date; falls back to the earliest dated item in the trip (for trips
+// planned before exact dates are known); falls back to a "Day N" prefix left
+// in notes by the AI propose/import flow (used when neither the trip nor any
+// item has a real date yet). Returns null when none of that is available.
+function dayNumberFor(trip: Trip, item: TripItem): number | null {
+  if (trip.startDate && item.startAt) {
+    return Math.round((startOfDay(item.startAt) - startOfDay(trip.startDate)) / 86_400_000) + 1;
+  }
+  if (item.startAt) {
+    const datedStarts = trip.items.filter((i) => i.startAt).map((i) => startOfDay(i.startAt as string));
+    if (datedStarts.length) {
+      const earliest = Math.min(...datedStarts);
+      return Math.round((startOfDay(item.startAt) - earliest) / 86_400_000) + 1;
+    }
+  }
+  const match = item.notes?.match(/^Day (\d+)/);
+  return match ? parseInt(match[1], 10) : null;
+}
+
 export default function TripDetail() {
   const { id } = useParams<{ id: string }>();
   const [trip, setTrip] = useState<Trip | null>(null);
@@ -31,7 +61,6 @@ export default function TripDetail() {
   const [agents, setAgents] = useState<BookingAgent[]>([]);
   const [tab, setTab] = useState<Tab>("Itinerary");
   const [showItemForm, setShowItemForm] = useState(false);
-  const [route, setRoute] = useState<{ order: { id: string; title: string }[]; totalKm: number } | null>(null);
 
   function load() {
     if (!id) return;
@@ -43,12 +72,6 @@ export default function TripDetail() {
     load();
     api.get<BookingAgent[]>("/booking-agents").then(setAgents).catch(() => {});
   }, [id]);
-
-  async function optimizeRoute() {
-    if (!id) return;
-    const r = await api.get<{ order: { id: string; title: string }[]; totalKm: number }>(`/trips/${id}/optimize-route`);
-    setRoute(r);
-  }
 
   if (!trip) return <p className="text-sm text-slate-500">Loading…</p>;
 
@@ -68,13 +91,17 @@ export default function TripDetail() {
         </Card>
       )}
 
-      <div className="flex gap-1 border-b border-slate-200 mb-6">
+      <TripSetup trip={trip} reload={load} />
+
+      <div className="flex gap-1 border-b border-slate-200 dark:border-slate-800 mb-6">
         {TABS.map((t) => (
           <button
             key={t}
             onClick={() => setTab(t)}
             className={`px-4 py-2 text-sm font-medium border-b-2 -mb-px ${
-              tab === t ? "border-brand-600 text-brand-700" : "border-transparent text-slate-500 hover:text-slate-700"
+              tab === t
+                ? "border-brand-600 text-brand-700 dark:text-brand-400"
+                : "border-transparent text-slate-500 dark:text-slate-400 hover:text-slate-700 dark:hover:text-slate-200"
             }`}
           >
             {t}
@@ -85,22 +112,96 @@ export default function TripDetail() {
       {tab === "Itinerary" && (
         <ItineraryTab trip={trip} agents={agents} reload={load} showForm={showItemForm} setShowForm={setShowItemForm} />
       )}
-      {tab === "Route" && (
-        <div>
-          <Button onClick={optimizeRoute} className="mb-4">Optimize POI route</Button>
-          {route && (
-            <Card className="p-4">
-              <p className="text-sm text-slate-600 mb-2">Suggested order (approx {route.totalKm} km total):</p>
-              <ol className="list-decimal list-inside text-sm space-y-1">
-                {route.order.map((p) => <li key={p.id}>{p.title}</li>)}
-              </ol>
-            </Card>
-          )}
-          {!route && <p className="text-sm text-slate-500">Add points of interest with coordinates, then optimize.</p>}
-        </div>
-      )}
+      {tab === "Route" && <RouteTab trip={trip} reload={load} />}
       {tab === "Budget" && <BudgetTab tripId={trip.id} lines={trip.budgetLines} reload={load} />}
       {tab === "Resources" && <ResourcesTab tripId={trip.id} resources={trip.resources} reload={load} />}
+    </div>
+  );
+}
+
+function RouteTab({ trip, reload }: { trip: Trip; reload: () => void }) {
+  const [optimized, setOptimized] = useState<{ order: MapPoint[]; totalKm: number } | null>(null);
+  const [optimizing, setOptimizing] = useState(false);
+  const [geocoding, setGeocoding] = useState(false);
+  const [geocodeError, setGeocodeError] = useState<string | null>(null);
+  const [geocodeMsg, setGeocodeMsg] = useState<string | null>(null);
+
+  const itineraryPoints: MapPoint[] = trip.items
+    .filter((i): i is TripItem & { lat: number; lng: number } => i.lat != null && i.lng != null)
+    .map((i) => ({ id: i.id, title: i.title, lat: i.lat, lng: i.lng }));
+
+  const missingCount = trip.items.filter((i) => i.lat == null || i.lng == null).length;
+
+  async function optimizeRoute() {
+    setOptimizing(true);
+    try {
+      const r = await api.get<{ order: MapPoint[]; totalKm: number }>(`/trips/${trip.id}/optimize-route`);
+      setOptimized(r);
+    } finally {
+      setOptimizing(false);
+    }
+  }
+
+  async function fillMissingCoordinates() {
+    setGeocoding(true);
+    setGeocodeError(null);
+    setGeocodeMsg(null);
+    try {
+      const r = await api.post<{ updated: number; checked: number }>(`/trips/${trip.id}/geocode-items`);
+      setGeocodeMsg(
+        r.updated > 0
+          ? `Placed ${r.updated} of ${r.checked} item(s) on the map.`
+          : "Couldn't identify map locations for the remaining items — they may be too generic (e.g. \"drive home\")."
+      );
+      reload();
+    } catch (err: any) {
+      setGeocodeError(err.message);
+    } finally {
+      setGeocoding(false);
+    }
+  }
+
+  const displayPoints = optimized ? optimized.order : itineraryPoints;
+
+  return (
+    <div>
+      <div className="flex items-center gap-3 mb-2 flex-wrap">
+        <Button onClick={optimizeRoute} disabled={optimizing}>
+          {optimizing ? "Optimizing…" : "Optimize POI route"}
+        </Button>
+        {missingCount > 0 && (
+          <Button variant="secondary" onClick={fillMissingCoordinates} disabled={geocoding}>
+            {geocoding ? "Locating…" : `Fill in ${missingCount} missing map location(s) with AI`}
+          </Button>
+        )}
+        {optimized && (
+          <span className="text-sm text-slate-500 dark:text-slate-400">
+            Suggested order — approx {optimized.totalKm} km total
+          </span>
+        )}
+        {optimized && (
+          <Button variant="ghost" onClick={() => setOptimized(null)}>Show full itinerary instead</Button>
+        )}
+      </div>
+      {geocodeMsg && <p className="text-sm text-green-600 dark:text-green-400 mb-2">{geocodeMsg}</p>}
+      {geocodeError && <p className="text-sm text-red-600 mb-2">{geocodeError}</p>}
+
+      {displayPoints.length === 0 ? (
+        <p className="text-sm text-slate-500 mt-2">
+          No itinerary items have coordinates yet. Use "Fill in missing map locations with AI" above, or add a latitude/longitude when creating a transport, stay, or POI item.
+        </p>
+      ) : (
+        <div className="space-y-4">
+          <React.Suspense fallback={<div className="h-[420px] rounded-lg border border-slate-200 dark:border-slate-800 flex items-center justify-center text-sm text-slate-400">Loading map…</div>}>
+            <RouteMap points={displayPoints} />
+          </React.Suspense>
+          <Card className="p-4">
+            <ol className="list-decimal list-inside text-sm space-y-1 text-slate-700 dark:text-slate-300">
+              {displayPoints.map((p) => <li key={p.id}>{p.title}</li>)}
+            </ol>
+          </Card>
+        </div>
+      )}
     </div>
   );
 }
@@ -241,8 +342,13 @@ function ItineraryTab({
       )}
 
       <div className="space-y-3">
-        {trip.items.map((item) => (
+        {trip.items.map((item) => {
+          const day = dayNumberFor(trip, item);
+          return (
           <Card key={item.id} className="p-4 flex items-center gap-4">
+            <div className="w-12 shrink-0 text-center text-xs font-semibold text-slate-400 dark:text-slate-500">
+              {day != null ? `Day ${day}` : "—"}
+            </div>
             <Badge tone={TYPE_TONE[item.type]}>{item.type}</Badge>
             <div className="flex-1">
               <div className="font-medium">{item.title}</div>
@@ -256,19 +362,19 @@ function ItineraryTab({
               {item.confirmationNo && <div className="text-xs text-slate-400">Confirmation: {item.confirmationNo}</div>}
               {item.bookingAgent && <div className="text-xs text-slate-400">Via {item.bookingAgent.name}</div>}
             </div>
-            <Select
+            <BadgeSelect
               value={item.bookingStatus}
-              onChange={(e) => updateStatus(item.id, e.target.value as BookingStatus)}
-              className="w-40"
-            >
-              {(["IDEA", "RESEARCHING", "READY_TO_BOOK", "BOOKED", "CONFIRMED", "CANCELLED"] as BookingStatus[]).map((s) => (
-                <option key={s} value={s}>{s}</option>
-              ))}
-            </Select>
-            <Badge tone={BOOKING_TONE[item.bookingStatus]}>{item.bookingStatus}</Badge>
+              onChange={(s) => updateStatus(item.id, s)}
+              tone={BOOKING_TONE[item.bookingStatus]}
+              options={(["IDEA", "RESEARCHING", "READY_TO_BOOK", "BOOKED", "CONFIRMED", "CANCELLED"] as BookingStatus[]).map((s) => ({
+                value: s,
+                label: s.replace(/_/g, " "),
+              }))}
+            />
             <Button variant="danger" onClick={() => removeItem(item.id)}>Remove</Button>
           </Card>
-        ))}
+          );
+        })}
         {trip.items.length === 0 && <p className="text-sm text-slate-500">No itinerary items yet.</p>}
       </div>
     </div>

@@ -65,4 +65,66 @@ router.delete("/:itemId", async (req, res) => {
   res.status(204).end();
 });
 
+const bulkItemSchema = z.object({
+  day: z.number().int().min(1),
+  type: z.enum(["TRANSPORT", "STAY", "POI", "ACTIVITY", "OTHER"]),
+  title: z.string().min(1),
+  time: z.string().nullable().optional(),
+  durationHours: z.number().nullable().optional(),
+  location: z.string().nullable().optional(),
+  lat: z.number().nullable().optional(),
+  lng: z.number().nullable().optional(),
+  notes: z.string().nullable().optional(),
+  estimatedCost: z.number().nullable().optional(),
+});
+
+const bulkSchema = z.object({ items: z.array(bulkItemSchema).min(1) });
+
+// Applies a day-relative AI proposal (from /trips/:id/propose-itinerary or
+// /import-itinerary) to real TripItems. Resolves day+time into absolute
+// datetimes when the trip has a start date; otherwise stores the day number
+// in the notes so items still have a discoverable order.
+router.post("/bulk", async (req, res) => {
+  const parsed = bulkSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
+
+  const tripId = (req.params as Record<string, string>).tripId;
+  const trip = await prisma.trip.findUnique({ where: { id: tripId } });
+  if (!trip) return res.status(404).json({ error: "Trip not found" });
+
+  const created = await prisma.$transaction(
+    parsed.data.items.map((item, index) => {
+      let startAt: Date | undefined;
+      if (trip.startDate) {
+        const [h, m] = (item.time || "09:00").split(":").map((n) => parseInt(n, 10) || 0);
+        startAt = new Date(trip.startDate);
+        startAt.setDate(startAt.getDate() + (item.day - 1));
+        startAt.setHours(h, m, 0, 0);
+      }
+      const endAt = startAt && item.durationHours ? new Date(startAt.getTime() + item.durationHours * 3600_000) : undefined;
+
+      const dayLabel = `Day ${item.day}`;
+      const notes = trip.startDate ? item.notes ?? undefined : [dayLabel, item.notes].filter(Boolean).join(" — ");
+
+      return prisma.tripItem.create({
+        data: {
+          tripId,
+          type: item.type,
+          title: item.title,
+          location: item.location ?? undefined,
+          lat: item.lat ?? undefined,
+          lng: item.lng ?? undefined,
+          cost: item.estimatedCost ?? undefined,
+          startAt,
+          endAt,
+          notes,
+          sortOrder: item.day * 100 + index,
+        },
+      });
+    })
+  );
+
+  res.status(201).json(created);
+});
+
 export default router;

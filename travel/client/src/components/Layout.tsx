@@ -11,6 +11,7 @@ const navItems = [
   { to: "/booking-agents", label: "Booking Agents" },
   { to: "/resources", label: "Resources" },
   { to: "/assistant", label: "AI Assistant" },
+  { to: "/preferences", label: "Preferences" },
 ];
 
 export default function Layout() {

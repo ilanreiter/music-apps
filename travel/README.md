@@ -58,7 +58,9 @@ few sample destinations, so you're not staring at an empty app.
 | Area | Where |
 |---|---|
 | Prioritized destination list | **Destinations** page — reorder with ▲/▼, track status (idea → researching → planned → booked → visited) |
-| Trip planning | **Trips → a trip → Itinerary tab** — add transport/stay/POI/activity items with dates, cost, provider, booking status |
+| Trip planning | **Trips → a trip** starts with high-level basics (dates or duration+season, planning type, goal/style), then the **Itinerary tab** for transport/stay/POI/activity items with dates, cost, provider, booking status |
+| Building an itinerary | Shown automatically for an empty trip: **start from scratch**, **paste/upload an existing itinerary** (including pasted email text — parsed into structured items by Claude), or **propose with AI** (Claude drafts a day-by-day plan from the trip's goal + your saved preferences). Proposals are reviewed/checked before anything is added |
+| Travel preferences | **Preferences** page — shared household interests/pace/budget style/notes, fed into every AI itinerary proposal and estimate |
 | Conflict detection | Automatic — shown as a banner at the top of a trip when two time-bound items (esp. transport/stays) overlap |
 | Route optimization | **Trips → a trip → Route tab** — nearest-neighbor ordering of POIs with lat/lng, to minimize backtracking |
 | Financial planning | **Finances** page for AI rough estimates + a per-trip totals view; **Trip → Budget tab** for category-by-category estimated vs. actual |
@@ -93,14 +95,17 @@ The Vite dev server proxies `/api` to `http://localhost:4000` by default (see
 See `server/prisma/schema.prisma` for the full model. At a glance:
 
 - `Destination` — the wishlist, with `priority` for ordering
-- `Trip` — optionally linked to a `Destination`
+- `Trip` — optionally linked to a `Destination`; carries high-level planning fields (`durationNights`/`travelSeason` for pre-date planning, `planningType`, `goal`)
 - `TripItem` — a polymorphic itinerary entry (`TRANSPORT`/`STAY`/`POI`/`ACTIVITY`/`OTHER`) carrying timing, cost, and booking status/confirmation/agent
 - `BudgetLine` — category-based estimated vs. actual spend per trip
 - `BookingAgent` — a contact/agency, linkable to `TripItem`s
 - `Resource` — links/notes scoped to a destination and/or trip
 - `AiMessage` — chat history for the assistant, scoped per trip (or general)
+- `Preferences` — a single shared-household row (interests, pace, budget style, free-text notes) used to steer AI itinerary proposals
 
 ## Notes on the "basic-but-working" pieces
 
 - **Conflict detection** is date-overlap logic (`server/src/lib/conflicts.ts`), not a full scheduling solver — it flags overlapping transport/stay windows, which is the case that actually matters (you can't be on two flights at once).
 - **Route optimization** is nearest-neighbor over straight-line (haversine) distance (`server/src/lib/routeOptimize.ts`) — good enough for ordering a day's POIs, not a real routing-API integration with roads/transit times.
+- **"Import from email"** is paste-in, not a live inbox connection — there's no email account wired into this app. Copy the itinerary/confirmation text out of the email and paste it (or save it as a `.txt`/`.eml` file and upload it) into the "Import existing itinerary" flow; Claude parses it the same way either way.
+- The Postgres port (5432) is published to `127.0.0.1` only in `docker-compose.yml`, so you can point a local GUI client or run `prisma migrate dev` against it directly without exposing it beyond your machine.

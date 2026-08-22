@@ -8,19 +8,47 @@ export function Card({ children, className = "" }: { children: React.ReactNode; 
   );
 }
 
+export const badgeTones: Record<string, string> = {
+  slate: "bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-300",
+  blue: "bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-300",
+  green: "bg-green-100 text-green-700 dark:bg-green-900/40 dark:text-green-300",
+  amber: "bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-300",
+  red: "bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-300",
+  purple: "bg-purple-100 text-purple-700 dark:bg-purple-900/40 dark:text-purple-300",
+};
+
 export function Badge({ children, tone = "slate" }: { children: React.ReactNode; tone?: string }) {
-  const tones: Record<string, string> = {
-    slate: "bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-300",
-    blue: "bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-300",
-    green: "bg-green-100 text-green-700 dark:bg-green-900/40 dark:text-green-300",
-    amber: "bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-300",
-    red: "bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-300",
-    purple: "bg-purple-100 text-purple-700 dark:bg-purple-900/40 dark:text-purple-300",
-  };
   return (
-    <span className={`inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium ${tones[tone] || tones.slate}`}>
+    <span className={`inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium ${badgeTones[tone] || badgeTones.slate}`}>
       {children}
     </span>
+  );
+}
+
+// A single dropdown that *looks* like a Badge — for editable status fields
+// where a separate label badge next to a wide <select> would just repeat
+// the same text twice. Sized to its content, not a fixed width.
+export function BadgeSelect<T extends string>({
+  value,
+  onChange,
+  options,
+  tone,
+}: {
+  value: T;
+  onChange: (value: T) => void;
+  options: { value: T; label: string }[];
+  tone: string;
+}) {
+  return (
+    <select
+      value={value}
+      onChange={(e) => onChange(e.target.value as T)}
+      className={`inline-block w-auto shrink-0 rounded-full pl-2.5 pr-6 py-0.5 text-xs font-medium border-0 cursor-pointer focus:outline-none focus:ring-1 focus:ring-brand-500 ${badgeTones[tone] || badgeTones.slate}`}
+    >
+      {options.map((o) => (
+        <option key={o.value} value={o.value}>{o.label}</option>
+      ))}
+    </select>
   );
 }
 

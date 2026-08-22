@@ -52,6 +52,22 @@ enum BudgetCategory {
   MISC
 }
 
+enum TripPlanningType {
+  SELF_PLANNED
+  GROUP
+  ORGANIZED
+}
+
+enum TripGoal {
+  NATURE
+  SIGHTSEEING
+  CITY
+  RELAXATION
+  ADVENTURE
+  MIXED
+  OTHER
+}
+
 model User {
   id           String   @id @default(cuid())
   email        String   @unique
@@ -85,6 +101,11 @@ model Trip {
   destination   Destination? @relation(fields: [destinationId], references: [id], onDelete: SetNull)
   startDate     DateTime?
   endDate       DateTime?
+  durationNights Int?
+  travelSeason  String?
+  planningType  TripPlanningType?
+  goal          TripGoal?
+  goalDetail    String?
   status        TripStatus   @default(DRAFT)
   travelers     String[]     @default([])
   notes         String?
@@ -157,6 +178,17 @@ model Resource {
   tripId        String?
   trip          Trip?        @relation(fields: [tripId], references: [id], onDelete: SetNull)
   createdAt     DateTime     @default(now())
+}
+
+// Singleton (id is always "default") — shared household travel preferences
+// used to steer AI-proposed itineraries and cost estimates.
+model Preferences {
+  id          String   @id @default("default")
+  interests   String[] @default([])
+  pace        String?
+  budgetStyle String?
+  notes       String?
+  updatedAt   DateTime @updatedAt
 }
 
 model AiMessage {

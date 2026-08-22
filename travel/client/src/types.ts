@@ -3,6 +3,8 @@ export type TripStatus = "DRAFT" | "PLANNING" | "BOOKED" | "IN_PROGRESS" | "COMP
 export type TripItemType = "TRANSPORT" | "STAY" | "POI" | "ACTIVITY" | "OTHER";
 export type BookingStatus = "IDEA" | "RESEARCHING" | "READY_TO_BOOK" | "BOOKED" | "CONFIRMED" | "CANCELLED";
 export type BudgetCategory = "TRANSPORT" | "LODGING" | "FOOD" | "ACTIVITIES" | "SHOPPING" | "INSURANCE" | "MISC";
+export type TripPlanningType = "SELF_PLANNED" | "GROUP" | "ORGANIZED";
+export type TripGoal = "NATURE" | "SIGHTSEEING" | "CITY" | "RELAXATION" | "ADVENTURE" | "MIXED" | "OTHER";
 
 export interface User {
   id: string;
@@ -86,6 +88,11 @@ export interface Trip {
   destination?: Destination | null;
   startDate?: string | null;
   endDate?: string | null;
+  durationNights?: number | null;
+  travelSeason?: string | null;
+  planningType?: TripPlanningType | null;
+  goal?: TripGoal | null;
+  goalDetail?: string | null;
   status: TripStatus;
   travelers: string[];
   notes?: string | null;
@@ -101,4 +108,30 @@ export interface Conflict {
   itemATitle: string;
   itemBTitle: string;
   reason: string;
+}
+
+export interface Preferences {
+  id: string;
+  interests: string[];
+  pace?: string | null;
+  budgetStyle?: string | null;
+  notes?: string | null;
+}
+
+export interface ProposedItem {
+  day: number;
+  type: TripItemType;
+  title: string;
+  time?: string | null;
+  durationHours?: number | null;
+  location?: string | null;
+  lat?: number | null;
+  lng?: number | null;
+  notes?: string | null;
+  estimatedCost?: number | null;
+}
+
+export interface ProposedItinerary {
+  summary?: string;
+  items: ProposedItem[];
 }

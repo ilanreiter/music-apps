@@ -12,6 +12,7 @@ import Finances from "./pages/Finances";
 import BookingAgents from "./pages/BookingAgents";
 import Resources from "./pages/Resources";
 import Assistant from "./pages/Assistant";
+import Preferences from "./pages/Preferences";
 
 function RequireAuth({ children }: { children: React.ReactNode }) {
   const { user, loading } = useAuth();
@@ -40,6 +41,7 @@ function AppRoutes() {
         <Route path="booking-agents" element={<BookingAgents />} />
         <Route path="resources" element={<Resources />} />
         <Route path="assistant" element={<Assistant />} />
+        <Route path="preferences" element={<Preferences />} />
       </Route>
       <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>
