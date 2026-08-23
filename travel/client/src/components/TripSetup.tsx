@@ -137,6 +137,69 @@ function TripBasics({ trip, reload }: { trip: Trip; reload: () => void }) {
   );
 }
 
+// Persists whatever the user tells the AI via "Anything else Claude should
+// know?" (see BuildItinerary below) onto the trip itself, so it stays
+// visible on the trip pane instead of only flashing by during proposal
+// review. Also directly editable here.
+function TripNotes({ trip, reload }: { trip: Trip; reload: () => void }) {
+  const [editing, setEditing] = useState(false);
+  const [notes, setNotes] = useState(trip.notes || "");
+
+  async function save(e: React.FormEvent) {
+    e.preventDefault();
+    await api.patch(`/trips/${trip.id}`, { notes: notes.trim() || null });
+    setEditing(false);
+    reload();
+  }
+
+  if (!editing) {
+    return (
+      <Card className="p-4 mb-6">
+        <div className="flex items-start justify-between gap-4">
+          <div className="flex-1">
+            <div className="text-sm font-medium text-slate-700 dark:text-slate-200 mb-1">Trip notes</div>
+            {trip.notes ? (
+              <p className="text-sm text-slate-600 dark:text-slate-300 whitespace-pre-wrap">{trip.notes}</p>
+            ) : (
+              <p className="text-sm text-slate-400 italic">
+                Nothing saved yet. Anything you tell Claude under "Anything else Claude should know?" when generating an itinerary is saved here automatically — or add notes directly.
+              </p>
+            )}
+          </div>
+          <Button variant="ghost" onClick={() => setEditing(true)}>{trip.notes ? "Edit" : "Add notes"}</Button>
+        </div>
+      </Card>
+    );
+  }
+
+  return (
+    <Card className="p-4 mb-6">
+      <form onSubmit={save}>
+        <Label>Trip notes</Label>
+        <Textarea
+          rows={3}
+          value={notes}
+          onChange={(e) => setNotes(e.target.value)}
+          placeholder="e.g. traveling with a toddler, avoid early mornings, one slow day…"
+        />
+        <div className="flex gap-2 mt-2">
+          <Button type="submit">Save</Button>
+          <Button
+            type="button"
+            variant="secondary"
+            onClick={() => {
+              setNotes(trip.notes || "");
+              setEditing(false);
+            }}
+          >
+            Cancel
+          </Button>
+        </div>
+      </form>
+    </Card>
+  );
+}
+
 function BuildItinerary({
   trip,
   reload,
@@ -150,7 +213,7 @@ function BuildItinerary({
 }) {
   const [mode, setMode] = useState<"choose" | "import" | "propose">("choose");
   const [pastedText, setPastedText] = useState("");
-  const [extraNotes, setExtraNotes] = useState("");
+  const [extraNotes, setExtraNotes] = useState(trip.notes || "");
   const [proposal, setProposal] = useState<ProposedItinerary | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -205,6 +268,12 @@ function BuildItinerary({
     setBusy(true);
     setError(null);
     try {
+      // Save the notes before the (slow, sometimes failing) AI call — so
+      // they're preserved even if generation errors out or times out.
+      if (extraNotes.trim() && extraNotes !== (trip.notes || "")) {
+        await api.patch(`/trips/${trip.id}`, { notes: extraNotes });
+        reload();
+      }
       const result = await api.post<ProposedItinerary>(`/trips/${trip.id}/propose-itinerary`, { extraNotes });
       setProposal(result);
     } catch (err: any) {
@@ -238,6 +307,7 @@ function BuildItinerary({
         onApplied={applyProposal}
         onDiscard={() => setProposal(null)}
         replaceCount={isRegenerate ? itemCount : 0}
+        submittedNotes={mode === "propose" ? extraNotes : undefined}
       />
     );
   }
@@ -305,7 +375,7 @@ function BuildItinerary({
           <Label>Anything else Claude should know? (optional)</Label>
           <Textarea rows={3} value={extraNotes} onChange={(e) => setExtraNotes(e.target.value)} placeholder="e.g. we want one slow day, avoid early mornings, traveling with a toddler…" />
           <p className="text-xs text-slate-400 mt-2">
-            Uses this trip's goal/dates and your saved travel preferences. Edit those on the Preferences page anytime.
+            Uses this trip's goal/dates and your saved travel preferences. Edit those on the Preferences page anytime. Whatever you type here is saved to this trip's "Trip notes" box above once you generate.
           </p>
           {error && <p className="text-sm text-red-600 mt-2">{error}</p>}
           <div className="flex gap-2 mt-4">
@@ -323,11 +393,13 @@ function ProposalReviewWrapper({
   onApplied,
   onDiscard,
   replaceCount = 0,
+  submittedNotes,
 }: {
   proposal: ProposedItinerary;
   onApplied: (items: ProposedItem[]) => void;
   onDiscard: () => void;
   replaceCount?: number;
+  submittedNotes?: string;
 }) {
   const [included, setIncluded] = useState<boolean[]>(proposal.items.map(() => true));
   const [busy, setBusy] = useState(false);
@@ -361,6 +433,11 @@ function ProposalReviewWrapper({
           Applying this will permanently delete the {replaceCount} existing item(s) on this trip and replace them with your selection below.
         </p>
       )}
+      {submittedNotes && submittedNotes.trim() && (
+        <p className="text-sm text-slate-500 dark:text-slate-400 mb-3 bg-slate-50 dark:bg-slate-800/60 border border-slate-200 dark:border-slate-700 rounded-md px-3 py-2">
+          <span className="font-medium text-slate-600 dark:text-slate-300">Your notes used for this proposal:</span> "{submittedNotes}"
+        </p>
+      )}
       {proposal.summary && <p className="text-sm text-slate-600 dark:text-slate-300 mb-4">{proposal.summary}</p>}
       <div className="space-y-4 max-h-96 overflow-y-auto pr-1">
         {[...byDay.entries()].sort(([a], [b]) => a - b).map(([day, entries]) => (
@@ -375,7 +452,11 @@ function ProposalReviewWrapper({
                     <span className="font-medium">{item.title}</span>
                     {item.time && <span className="text-slate-400"> · {item.time}</span>}
                     {item.location && <span className="text-slate-400"> · {item.location}</span>}
-                    {item.estimatedCost != null && <span className="text-slate-400"> · ~${item.estimatedCost}</span>}
+                    {item.costPerNight != null && item.nights != null ? (
+                      <span className="text-slate-400"> · ~${item.costPerNight}/night × {item.nights} night{item.nights === 1 ? "" : "s"} = ${(item.costPerNight * item.nights).toFixed(0)}</span>
+                    ) : (
+                      item.estimatedCost != null && <span className="text-slate-400"> · ~${item.estimatedCost}</span>
+                    )}
                     {item.notes && <div className="text-xs text-slate-400 mt-0.5">{item.notes}</div>}
                   </span>
                 </label>
@@ -413,6 +494,7 @@ export default function TripSetup({ trip, reload }: { trip: Trip; reload: () => 
   return (
     <div>
       <TripBasics trip={trip} reload={reload} />
+      <TripNotes trip={trip} reload={reload} />
       {trip.items.length === 0 && !dismissed && (
         <BuildItinerary trip={trip} reload={reload} onDismiss={() => setDismissed(true)} />
       )}

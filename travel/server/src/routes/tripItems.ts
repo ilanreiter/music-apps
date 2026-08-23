@@ -14,6 +14,8 @@ const itemSchema = z.object({
   startAt: z.string().datetime().nullable().optional(),
   endAt: z.string().datetime().nullable().optional(),
   cost: z.number().nullable().optional(),
+  costPerNight: z.number().nullable().optional(),
+  nights: z.number().int().nullable().optional(),
   currency: z.string().nullable().optional(),
   bookingStatus: z.enum(["IDEA", "RESEARCHING", "READY_TO_BOOK", "BOOKED", "CONFIRMED", "CANCELLED"]).optional(),
   confirmationNo: z.string().nullable().optional(),
@@ -21,6 +23,7 @@ const itemSchema = z.object({
   bookingAgentId: z.string().nullable().optional(),
   sortOrder: z.number().int().optional(),
   notes: z.string().nullable().optional(),
+  userNotes: z.string().nullable().optional(),
 });
 
 function toDate(v: string | null | undefined) {
@@ -85,6 +88,8 @@ const bulkItemSchema = z.object({
   lng: z.number().nullable().optional(),
   notes: z.string().nullable().optional(),
   estimatedCost: z.number().nullable().optional(),
+  costPerNight: z.number().nullable().optional(),
+  nights: z.number().int().nullable().optional(),
 });
 
 const bulkSchema = z.object({ items: z.array(bulkItemSchema).min(1) });
@@ -118,6 +123,14 @@ router.post("/bulk", async (req, res) => {
 
       const notes = item.notes ?? undefined;
 
+      // For STAY items, the total is always costPerNight * nights, computed
+      // here — the AI's own arithmetic on a multi-step multiplication is not
+      // trusted. Any estimatedCost sent alongside is ignored for STAY.
+      const cost =
+        item.type === "STAY" && item.costPerNight != null && item.nights != null
+          ? item.costPerNight * item.nights
+          : item.estimatedCost ?? undefined;
+
       return prisma.tripItem.create({
         data: {
           tripId,
@@ -126,7 +139,9 @@ router.post("/bulk", async (req, res) => {
           location: item.location ?? undefined,
           lat: item.lat ?? undefined,
           lng: item.lng ?? undefined,
-          cost: item.estimatedCost ?? undefined,
+          cost,
+          costPerNight: item.type === "STAY" ? item.costPerNight ?? undefined : undefined,
+          nights: item.type === "STAY" ? item.nights ?? undefined : undefined,
           startAt,
           endAt,
           notes,

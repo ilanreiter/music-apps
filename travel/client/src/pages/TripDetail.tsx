@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from "react";
-import { useParams } from "react-router-dom";
+import { useNavigate, useParams } from "react-router-dom";
 import { api } from "../lib/api";
 import { BookingAgent, BookingStatus, BudgetLine, Conflict, Trip, TripItem, TripItemType } from "../types";
 import { Badge, BadgeSelect, Button, Card, Input, Label, PageHeader, Select, Textarea } from "../components/ui";
@@ -11,14 +11,6 @@ const RouteMap = React.lazy(() => import("../components/RouteMap"));
 
 const TABS = ["Itinerary", "Route", "Budget", "Resources"] as const;
 type Tab = (typeof TABS)[number];
-
-const TYPE_TONE: Record<TripItemType, string> = {
-  TRANSPORT: "blue",
-  STAY: "purple",
-  POI: "green",
-  ACTIVITY: "amber",
-  OTHER: "slate",
-};
 
 const BOOKING_TONE: Record<BookingStatus, string> = {
   IDEA: "slate",
@@ -41,7 +33,18 @@ function startOfDay(iso: string) {
 // be shown to the user, only the clock time.
 function formatItemTime(trip: Trip, iso: string): string {
   const d = new Date(iso);
-  return trip.startDate ? d.toLocaleString() : d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+  if (trip.startDate) return d.toLocaleString();
+  // Undated trips anchor items to a fixed placeholder UTC date purely to
+  // preserve time-of-day (see UNDATED_TRIP_ANCHOR in tripItems.ts) — that
+  // clock time was set as UTC server-side, so it must be read back with the
+  // UTC getters here too. Using the local-time formatter instead would shift
+  // the displayed hour by the browser's timezone offset for no reason (e.g.
+  // a stored "09:00" showing as "4:00 AM" in US Central).
+  const hours = d.getUTCHours();
+  const minutes = d.getUTCMinutes();
+  const period = hours >= 12 ? "PM" : "AM";
+  const displayHour = hours % 12 === 0 ? 12 : hours % 12;
+  return `${displayHour}:${String(minutes).padStart(2, "0")} ${period}`;
 }
 
 function formatDuration(startAt?: string | null, endAt?: string | null): string | null {
@@ -77,6 +80,7 @@ function dayNumberFor(trip: Trip, item: TripItem): number | null {
 
 export default function TripDetail() {
   const { id } = useParams<{ id: string }>();
+  const navigate = useNavigate();
   const [trip, setTrip] = useState<Trip | null>(null);
   const [conflicts, setConflicts] = useState<Conflict[]>([]);
   const [agents, setAgents] = useState<BookingAgent[]>([]);
@@ -94,6 +98,13 @@ export default function TripDetail() {
     api.get<BookingAgent[]>("/booking-agents").then(setAgents).catch(() => {});
   }, [id]);
 
+  async function deleteTrip() {
+    if (!trip) return;
+    if (!confirm(`Delete "${trip.title}"? This permanently removes the trip and all its itinerary items, budget lines, and resources. This cannot be undone.`)) return;
+    await api.delete(`/trips/${trip.id}`);
+    navigate("/trips");
+  }
+
   if (!trip) return <p className="text-sm text-slate-500">Loading…</p>;
 
   return (
@@ -101,6 +112,7 @@ export default function TripDetail() {
       <PageHeader
         title={trip.title}
         subtitle={`${trip.destination?.name || "No destination"} · ${trip.status}`}
+        actions={<Button variant="danger" onClick={deleteTrip}>Delete trip</Button>}
       />
 
       {conflicts.length > 0 && (
@@ -136,7 +148,7 @@ export default function TripDetail() {
         <ItineraryTab trip={trip} agents={agents} reload={load} showForm={showItemForm} setShowForm={setShowItemForm} />
       )}
       {tab === "Route" && <RouteTab trip={trip} reload={load} />}
-      {tab === "Budget" && <BudgetTab tripId={trip.id} lines={trip.budgetLines} reload={load} />}
+      {tab === "Budget" && <BudgetTab tripId={trip.id} lines={trip.budgetLines} items={trip.items} reload={load} />}
       {tab === "Resources" && <ResourcesTab tripId={trip.id} resources={trip.resources} reload={load} />}
     </div>
   );
@@ -148,12 +160,19 @@ function RouteTab({ trip, reload }: { trip: Trip; reload: () => void }) {
   const [geocoding, setGeocoding] = useState(false);
   const [geocodeError, setGeocodeError] = useState<string | null>(null);
   const [geocodeMsg, setGeocodeMsg] = useState<string | null>(null);
+  const [dayFilter, setDayFilter] = useState<number | "ALL">("ALL");
 
-  const itineraryPoints: MapPoint[] = trip.items
+  const days = [...new Set(trip.items.map((i) => dayNumberFor(trip, i)).filter((d): d is number => d != null))].sort(
+    (a, b) => a - b
+  );
+
+  const dayFilteredItems = trip.items.filter((i) => dayFilter === "ALL" || dayNumberFor(trip, i) === dayFilter);
+
+  const itineraryPoints: MapPoint[] = dayFilteredItems
     .filter((i): i is TripItem & { lat: number; lng: number } => i.lat != null && i.lng != null)
     .map((i) => ({ id: i.id, title: i.title, lat: i.lat, lng: i.lng }));
 
-  const missingCount = trip.items.filter((i) => i.lat == null || i.lng == null).length;
+  const missingCount = dayFilteredItems.filter((i) => i.lat == null || i.lng == null).length;
 
   async function optimizeRoute() {
     setOptimizing(true);
@@ -184,10 +203,40 @@ function RouteTab({ trip, reload }: { trip: Trip; reload: () => void }) {
     }
   }
 
-  const displayPoints = optimized ? optimized.order : itineraryPoints;
+  // The optimize-route call always runs over the full itinerary server-side —
+  // when a day filter is active, narrow its result down to that day's points
+  // rather than re-requesting an optimization scoped to one day.
+  const dayFilteredIds = new Set(itineraryPoints.map((p) => p.id));
+  const displayPoints = optimized ? optimized.order.filter((p) => dayFilteredIds.has(p.id)) : itineraryPoints;
 
   return (
     <div>
+      <div className="flex flex-wrap items-center gap-2 mb-3">
+        <button
+          onClick={() => setDayFilter("ALL")}
+          className={`px-3 py-1 rounded-full text-xs font-medium border ${
+            dayFilter === "ALL"
+              ? "bg-brand-600 border-brand-600 text-white"
+              : "border-slate-200 dark:border-slate-700 text-slate-500 dark:text-slate-400 hover:border-brand-400"
+          }`}
+        >
+          All days
+        </button>
+        {days.map((d) => (
+          <button
+            key={d}
+            onClick={() => setDayFilter(d)}
+            className={`px-3 py-1 rounded-full text-xs font-medium border ${
+              dayFilter === d
+                ? "bg-brand-600 border-brand-600 text-white"
+                : "border-slate-200 dark:border-slate-700 text-slate-500 dark:text-slate-400 hover:border-brand-400"
+            }`}
+          >
+            Day {d}
+          </button>
+        ))}
+      </div>
+
       <div className="flex items-center gap-3 mb-2 flex-wrap">
         <Button onClick={optimizeRoute} disabled={optimizing}>
           {optimizing ? "Optimizing…" : "Optimize POI route"}
@@ -211,7 +260,9 @@ function RouteTab({ trip, reload }: { trip: Trip; reload: () => void }) {
 
       {displayPoints.length === 0 ? (
         <p className="text-sm text-slate-500 mt-2">
-          No itinerary items have coordinates yet. Use "Fill in missing map locations with AI" above, or add a latitude/longitude when creating a transport, stay, or POI item.
+          {dayFilter !== "ALL"
+            ? `No mapped items on Day ${dayFilter}.`
+            : 'No itinerary items have coordinates yet. Use "Fill in missing map locations with AI" above, or add a latitude/longitude when creating a transport, stay, or POI item.'}
         </p>
       ) : (
         <div className="space-y-4">
@@ -255,6 +306,7 @@ function ItineraryTab({
   const [bookingStatus, setBookingStatus] = useState<BookingStatus>("IDEA");
   const [confirmationNo, setConfirmationNo] = useState("");
   const [bookingAgentId, setBookingAgentId] = useState("");
+  const [categoryFilter, setCategoryFilter] = useState<(typeof BUDGET_CATEGORIES)[number] | "ALL">("ALL");
 
   // If a duration was given but no explicit end time, derive one from start + duration.
   function resolveEndAt(): string {
@@ -389,59 +441,270 @@ function ItineraryTab({
         </Card>
       )}
 
-      <div className="space-y-3">
-        {trip.items.map((item) => {
-          const day = dayNumberFor(trip, item);
-          const duration = formatDuration(item.startAt, item.endAt);
+      <div className="flex flex-wrap items-center gap-2 mb-4">
+        <button
+          onClick={() => setCategoryFilter("ALL")}
+          className={`px-3 py-1 rounded-full text-xs font-medium border ${
+            categoryFilter === "ALL"
+              ? "bg-brand-600 border-brand-600 text-white"
+              : "border-slate-200 dark:border-slate-700 text-slate-500 dark:text-slate-400 hover:border-brand-400"
+          }`}
+        >
+          All ({trip.items.length})
+        </button>
+        {BUDGET_CATEGORIES.map((cat) => {
+          const count = trip.items.filter((i) => budgetCategoryForItem(i) === cat).length;
+          if (count === 0) return null;
           return (
-          <Card key={item.id} className="p-4 flex items-center gap-4">
-            <div className="w-12 shrink-0 text-center text-xs font-semibold text-slate-400 dark:text-slate-500">
-              {day != null ? `Day ${day}` : "—"}
-            </div>
-            <Badge tone={TYPE_TONE[item.type]}>{item.type}</Badge>
-            <div className="flex-1">
-              <div className="font-medium">{item.title}</div>
-              <div className="text-xs text-slate-500">
-                {item.provider && `${item.provider} · `}
-                {item.location && `${item.location} · `}
-                {item.startAt && formatItemTime(trip, item.startAt)}
-                {item.endAt && ` → ${formatItemTime(trip, item.endAt)}`}
-              </div>
-              {duration && (
-                <div className="text-xs text-slate-400 mt-0.5">⏱ {duration} allocated</div>
-              )}
-              {item.cost != null && <div className="text-xs text-slate-400">{item.currency || "USD"} {item.cost}</div>}
-              {item.confirmationNo && <div className="text-xs text-slate-400">Confirmation: {item.confirmationNo}</div>}
-              {item.bookingAgent && <div className="text-xs text-slate-400">Via {item.bookingAgent.name}</div>}
-            </div>
-            <BadgeSelect
-              value={item.bookingStatus}
-              onChange={(s) => updateStatus(item.id, s)}
-              tone={BOOKING_TONE[item.bookingStatus]}
-              options={(["IDEA", "RESEARCHING", "READY_TO_BOOK", "BOOKED", "CONFIRMED", "CANCELLED"] as BookingStatus[]).map((s) => ({
-                value: s,
-                label: s.replace(/_/g, " "),
-              }))}
-            />
-            <Button variant="danger" onClick={() => removeItem(item.id)}>Remove</Button>
-          </Card>
+            <button
+              key={cat}
+              onClick={() => setCategoryFilter(cat)}
+              className={`px-3 py-1 rounded-full text-xs font-medium border ${
+                categoryFilter === cat
+                  ? "bg-brand-600 border-brand-600 text-white"
+                  : "border-slate-200 dark:border-slate-700 text-slate-500 dark:text-slate-400 hover:border-brand-400"
+              }`}
+            >
+              {categoryLabel(cat)} ({count})
+            </button>
           );
         })}
-        {trip.items.length === 0 && <p className="text-sm text-slate-500">No itinerary items yet.</p>}
+      </div>
+
+      <div className="overflow-x-auto">
+        <div className={`${ITEM_ROW_MIN_WIDTH} space-y-3`}>
+          <div className={`hidden sm:grid ${ITEM_ROW_GRID_COLS} gap-4 px-4 text-xs font-semibold text-slate-400 dark:text-slate-500 uppercase tracking-wide`}>
+            <div>Day</div>
+            <div>Category</div>
+            <div>Item</div>
+            <div>Duration</div>
+            <div>Cost</div>
+            <div>Status</div>
+            <div></div>
+          </div>
+          {trip.items
+            .filter((item) => categoryFilter === "ALL" || budgetCategoryForItem(item) === categoryFilter)
+            .map((item) => (
+              <ItineraryItemRow
+                key={item.id}
+                trip={trip}
+                item={item}
+                day={dayNumberFor(trip, item)}
+                duration={formatDuration(item.startAt, item.endAt)}
+                updateStatus={updateStatus}
+                removeItem={removeItem}
+                reload={reload}
+              />
+            ))}
+          {trip.items.length === 0 && <p className="text-sm text-slate-500">No itinerary items yet.</p>}
+          {trip.items.length > 0 && trip.items.filter((item) => categoryFilter === "ALL" || budgetCategoryForItem(item) === categoryFilter).length === 0 && (
+            <p className="text-sm text-slate-500">No items in this category.</p>
+          )}
+        </div>
       </div>
     </div>
   );
 }
 
-const BUDGET_CATEGORIES = ["TRANSPORT", "LODGING", "FOOD", "ACTIVITIES", "SHOPPING", "INSURANCE", "MISC"] as const;
+// Shared across the header row and every item row so columns line up down
+// the page. Wrapped in a horizontally-scrolling container (with a matching
+// min-width) rather than letting columns wrap/shrink on narrow screens,
+// since squeezing a 7-column table never stays legible.
+const ITEM_ROW_GRID_COLS = "grid-cols-[3rem_8rem_minmax(0,1fr)_6rem_9rem_10rem_4.5rem]";
+const ITEM_ROW_MIN_WIDTH = "min-w-[62rem]";
 
-function BudgetTab({ tripId, lines, reload }: { tripId: string; lines: BudgetLine[]; reload: () => void }) {
+function ItineraryItemRow({
+  trip,
+  item,
+  day,
+  duration,
+  updateStatus,
+  removeItem,
+  reload,
+}: {
+  trip: Trip;
+  item: TripItem;
+  day: number | null;
+  duration: string | null;
+  updateStatus: (itemId: string, s: BookingStatus) => void;
+  removeItem: (itemId: string) => void;
+  reload: () => void;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const [draft, setDraft] = useState(item.userNotes || "");
+  const [saving, setSaving] = useState(false);
+  const dirty = draft !== (item.userNotes || "");
+
+  async function saveUserNotes() {
+    setSaving(true);
+    try {
+      await api.patch(`/trips/${trip.id}/items/${item.id}`, { userNotes: draft.trim() || null });
+      reload();
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  const hasNotes = !!(item.notes || item.userNotes);
+
+  return (
+    <Card className="p-4">
+      <div className={`grid ${ITEM_ROW_GRID_COLS} gap-4 items-start`}>
+        <div className="text-xs font-semibold text-slate-400 dark:text-slate-500 pt-0.5">
+          {day != null ? `Day ${day}` : "—"}
+        </div>
+        <div className="pt-0.5">
+          <Badge tone={CATEGORY_TONE[budgetCategoryForItem(item)]}>{categoryLabel(budgetCategoryForItem(item))}</Badge>
+        </div>
+        <div className="min-w-0">
+          <div className="font-medium">{item.title}</div>
+          <div className="text-xs text-slate-500">
+            {item.provider && `${item.provider} · `}
+            {item.location && `${item.location} · `}
+            {item.startAt && formatItemTime(trip, item.startAt)}
+            {item.endAt && ` → ${formatItemTime(trip, item.endAt)}`}
+          </div>
+          {item.confirmationNo && <div className="text-xs text-slate-400">Confirmation: {item.confirmationNo}</div>}
+          {item.bookingAgent && <div className="text-xs text-slate-400">Via {item.bookingAgent.name}</div>}
+          <button
+            onClick={() => setExpanded(!expanded)}
+            className="text-xs text-brand-600 dark:text-brand-400 hover:underline mt-1"
+          >
+            {expanded ? "▲ Hide notes" : `▼ Notes${hasNotes ? " •" : ""}`}
+          </button>
+        </div>
+        <div className="text-xs text-slate-500 dark:text-slate-400 pt-0.5">
+          {duration && `⏱ ${duration}`}
+        </div>
+        <div className="text-xs text-slate-500 dark:text-slate-400 pt-0.5">
+          {item.cost != null &&
+            (item.costPerNight != null && item.nights != null
+              ? `${item.currency || "USD"} ${item.costPerNight}/night × ${item.nights} night${item.nights === 1 ? "" : "s"} = ${item.currency || "USD"} ${item.cost}`
+              : `${item.currency || "USD"} ${item.cost}`)}
+        </div>
+        <div>
+          <BadgeSelect
+            value={item.bookingStatus}
+            onChange={(s) => updateStatus(item.id, s)}
+            tone={BOOKING_TONE[item.bookingStatus]}
+            options={(["IDEA", "RESEARCHING", "READY_TO_BOOK", "BOOKED", "CONFIRMED", "CANCELLED"] as BookingStatus[]).map((s) => ({
+              value: s,
+              label: s.replace(/_/g, " "),
+            }))}
+          />
+        </div>
+        <div>
+          <Button variant="danger" onClick={() => removeItem(item.id)}>Remove</Button>
+        </div>
+      </div>
+
+      {expanded && (
+        <div className="mt-3 pt-3 border-t border-slate-200 dark:border-slate-800 space-y-3">
+          <div>
+            <div className="text-xs font-medium text-slate-500 dark:text-slate-400 mb-1">AI notes</div>
+            {item.notes ? (
+              <p className="text-sm text-slate-600 dark:text-slate-300 whitespace-pre-wrap">{item.notes}</p>
+            ) : (
+              <p className="text-sm text-slate-400 italic">None for this item.</p>
+            )}
+          </div>
+          <div>
+            <div className="text-xs font-medium text-slate-500 dark:text-slate-400 mb-1">Your notes</div>
+            <Textarea
+              rows={2}
+              value={draft}
+              onChange={(e) => setDraft(e.target.value)}
+              placeholder="Add your own notes — reservation details, reminders, anything the AI didn't cover…"
+            />
+            <div className="flex gap-2 mt-2">
+              <Button onClick={saveUserNotes} disabled={saving || !dirty}>{saving ? "Saving…" : "Save"}</Button>
+              {dirty && (
+                <Button variant="secondary" onClick={() => setDraft(item.userNotes || "")}>Cancel</Button>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+    </Card>
+  );
+}
+
+const BUDGET_CATEGORIES = ["TRANSPORT", "FLIGHTS", "LODGING", "FOOD", "ACTIVITIES", "OTHER"] as const;
+
+const CATEGORY_TONE: Record<(typeof BUDGET_CATEGORIES)[number], string> = {
+  TRANSPORT: "blue",
+  FLIGHTS: "indigo",
+  LODGING: "purple",
+  FOOD: "amber",
+  ACTIVITIES: "green",
+  OTHER: "slate",
+};
+
+const CATEGORY_EMOJI: Record<(typeof BUDGET_CATEGORIES)[number], string> = {
+  TRANSPORT: "🚗",
+  FLIGHTS: "✈️",
+  LODGING: "🏨",
+  FOOD: "🍽️",
+  ACTIVITIES: "🎟️",
+  OTHER: "📦",
+};
+
+function categoryLabel(cat: (typeof BUDGET_CATEGORIES)[number]): string {
+  return `${CATEGORY_EMOJI[cat]} ${cat}`;
+}
+
+// Maps itinerary item types to the closest budget category, so AI/manual
+// cost estimates on itinerary items can be folded into the budget totals
+// without the user re-entering them by hand.
+const ITEM_TYPE_TO_BUDGET_CATEGORY: Record<TripItemType, (typeof BUDGET_CATEGORIES)[number]> = {
+  TRANSPORT: "TRANSPORT",
+  STAY: "LODGING",
+  POI: "ACTIVITIES",
+  ACTIVITY: "ACTIVITIES",
+  OTHER: "OTHER",
+};
+
+// Item type alone can't distinguish a meal or a flight from any other
+// TRANSPORT/OTHER/ACTIVITY item, so a title match routes these to their own
+// category regardless of what type the AI (or a manual add) tagged them with.
+const FOOD_TITLE_PATTERN = /\b(meal|meals|breakfast|lunch|dinner|food)\b/i;
+const FLIGHT_TITLE_PATTERN = /\b(flight|flights|airfare|airline)\b/i;
+
+function budgetCategoryForItem(item: TripItem): (typeof BUDGET_CATEGORIES)[number] {
+  if (FOOD_TITLE_PATTERN.test(item.title)) return "FOOD";
+  if (item.type === "TRANSPORT" && FLIGHT_TITLE_PATTERN.test(item.title)) return "FLIGHTS";
+  return ITEM_TYPE_TO_BUDGET_CATEGORY[item.type];
+}
+
+function BudgetTab({
+  tripId,
+  lines,
+  items,
+  reload,
+}: {
+  tripId: string;
+  lines: BudgetLine[];
+  items: TripItem[];
+  reload: () => void;
+}) {
   const [category, setCategory] = useState<(typeof BUDGET_CATEGORIES)[number]>("TRANSPORT");
   const [label, setLabel] = useState("");
   const [estimated, setEstimated] = useState("");
   const [actual, setActual] = useState("");
 
-  const totalEstimated = lines.reduce((s, l) => s + l.estimated, 0);
+  const costedItems = items.filter((i) => i.cost != null);
+  const itineraryTotal = costedItems.reduce((s, i) => s + (i.cost ?? 0), 0);
+  const itineraryByCategory = new Map<(typeof BUDGET_CATEGORIES)[number], { total: number; count: number }>();
+  for (const item of costedItems) {
+    const cat = budgetCategoryForItem(item);
+    const entry = itineraryByCategory.get(cat) || { total: 0, count: 0 };
+    entry.total += item.cost ?? 0;
+    entry.count += 1;
+    itineraryByCategory.set(cat, entry);
+  }
+
+  const manualEstimated = lines.reduce((s, l) => s + l.estimated, 0);
+  const totalEstimated = manualEstimated + itineraryTotal;
   const totalActual = lines.reduce((s, l) => s + (l.actual ?? 0), 0);
 
   async function addLine(e: React.FormEvent) {
@@ -467,19 +730,43 @@ function BudgetTab({ tripId, lines, reload }: { tripId: string; lines: BudgetLin
         <Card className="p-4">
           <div className="text-xs text-slate-500">Total estimated</div>
           <div className="text-2xl font-semibold">${totalEstimated.toFixed(2)}</div>
+          <div className="text-xs text-slate-400 mt-1">
+            ${itineraryTotal.toFixed(2)} from itinerary items + ${manualEstimated.toFixed(2)} manual
+          </div>
         </Card>
         <Card className="p-4">
           <div className="text-xs text-slate-500">Total actual</div>
           <div className="text-2xl font-semibold">${totalActual.toFixed(2)}</div>
+          <div className="text-xs text-slate-400 mt-1">From manual budget lines only</div>
         </Card>
       </div>
+
+      {costedItems.length > 0 && (
+        <Card className="p-5 mb-6">
+          <h2 className="font-semibold mb-1">From itinerary items</h2>
+          <p className="text-sm text-slate-500 dark:text-slate-400 mb-4">
+            Automatically totaled from cost estimates on this trip's {costedItems.length} costed item(s) — updates whenever the itinerary changes, no manual entry needed.
+          </p>
+          <div className="space-y-2">
+            {[...itineraryByCategory.entries()].map(([cat, { total, count }]) => (
+              <div key={cat} className="flex items-center gap-4 text-sm">
+                <Badge tone={CATEGORY_TONE[cat]}>{categoryLabel(cat)}</Badge>
+                <div className="flex-1 text-slate-500 dark:text-slate-400">
+                  {count} item{count === 1 ? "" : "s"}
+                </div>
+                <div className="font-medium">${total.toFixed(2)}</div>
+              </div>
+            ))}
+          </div>
+        </Card>
+      )}
 
       <Card className="p-5 mb-6">
         <form onSubmit={addLine} className="grid grid-cols-4 gap-4 items-end">
           <div>
             <Label>Category</Label>
             <Select value={category} onChange={(e) => setCategory(e.target.value as any)}>
-              {BUDGET_CATEGORIES.map((c) => <option key={c} value={c}>{c}</option>)}
+              {BUDGET_CATEGORIES.map((c) => <option key={c} value={c}>{categoryLabel(c)}</option>)}
             </Select>
           </div>
           <div>
@@ -500,10 +787,11 @@ function BudgetTab({ tripId, lines, reload }: { tripId: string; lines: BudgetLin
         </form>
       </Card>
 
+      <h2 className="font-semibold mb-2">Manual budget lines</h2>
       <div className="space-y-2">
         {lines.map((l) => (
           <Card key={l.id} className="p-3 flex items-center gap-4">
-            <Badge>{l.category}</Badge>
+            <Badge tone={CATEGORY_TONE[l.category]}>{categoryLabel(l.category)}</Badge>
             <div className="flex-1 text-sm">{l.label}</div>
             <div className="text-sm text-slate-500">est. ${l.estimated.toFixed(2)}</div>
             <div className="text-sm text-slate-700">actual ${(l.actual ?? 0).toFixed(2)}</div>

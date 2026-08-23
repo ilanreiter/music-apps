@@ -44,12 +44,11 @@ enum BookingStatus {
 
 enum BudgetCategory {
   TRANSPORT
+  FLIGHTS
   LODGING
   FOOD
   ACTIVITIES
-  SHOPPING
-  INSURANCE
-  MISC
+  OTHER
 }
 
 enum TripPlanningType {
@@ -131,6 +130,11 @@ model TripItem {
   startAt         DateTime?
   endAt           DateTime?
   cost            Float?
+  // For STAY items, cost is derived deterministically as costPerNight * nights
+  // (never trusted from the AI's own arithmetic) — these two are kept
+  // alongside cost so the breakdown can be displayed. Null for other types.
+  costPerNight    Float?
+  nights          Int?
   currency        String?       @default("USD")
   bookingStatus   BookingStatus @default(IDEA)
   confirmationNo  String?
@@ -138,7 +142,13 @@ model TripItem {
   bookingAgentId  String?
   bookingAgent    BookingAgent? @relation(fields: [bookingAgentId], references: [id], onDelete: SetNull)
   sortOrder       Int           @default(0)
+  // AI-authored rationale/what-to-expect (or logistics context, e.g. a gas
+  // stop's mileage basis) — set by propose/import, never edited by the user.
   notes           String?
+  // The user's own free-text notes on this item — kept separate from `notes`
+  // so regenerating/re-importing the AI's notes never clobbers what the user
+  // wrote themselves.
+  userNotes       String?
   createdAt       DateTime      @default(now())
   updatedAt       DateTime      @updatedAt
 }

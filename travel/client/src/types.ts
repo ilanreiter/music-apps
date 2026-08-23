@@ -2,7 +2,7 @@ export type DestinationStatus = "IDEA" | "RESEARCHING" | "PLANNED" | "BOOKED" | 
 export type TripStatus = "DRAFT" | "PLANNING" | "BOOKED" | "IN_PROGRESS" | "COMPLETED" | "CANCELLED";
 export type TripItemType = "TRANSPORT" | "STAY" | "POI" | "ACTIVITY" | "OTHER";
 export type BookingStatus = "IDEA" | "RESEARCHING" | "READY_TO_BOOK" | "BOOKED" | "CONFIRMED" | "CANCELLED";
-export type BudgetCategory = "TRANSPORT" | "LODGING" | "FOOD" | "ACTIVITIES" | "SHOPPING" | "INSURANCE" | "MISC";
+export type BudgetCategory = "TRANSPORT" | "FLIGHTS" | "LODGING" | "FOOD" | "ACTIVITIES" | "OTHER";
 export type TripPlanningType = "SELF_PLANNED" | "GROUP" | "ORGANIZED";
 export type TripGoal = "NATURE" | "SIGHTSEEING" | "CITY" | "RELAXATION" | "ADVENTURE" | "MIXED" | "OTHER";
 
@@ -27,6 +27,7 @@ export interface Destination {
   createdAt: string;
   updatedAt: string;
   _count?: { trips: number };
+  trips?: { id: string; status: TripStatus }[];
 }
 
 export interface BookingAgent {
@@ -51,6 +52,8 @@ export interface TripItem {
   startAt?: string | null;
   endAt?: string | null;
   cost?: number | null;
+  costPerNight?: number | null;
+  nights?: number | null;
   currency?: string | null;
   bookingStatus: BookingStatus;
   confirmationNo?: string | null;
@@ -59,6 +62,7 @@ export interface TripItem {
   bookingAgent?: BookingAgent | null;
   sortOrder: number;
   notes?: string | null;
+  userNotes?: string | null;
 }
 
 export interface BudgetLine {
@@ -143,6 +147,8 @@ export interface ProposedItem {
   lng?: number | null;
   notes?: string | null;
   estimatedCost?: number | null;
+  costPerNight?: number | null;
+  nights?: number | null;
 }
 
 export interface ProposedItinerary {

@@ -15,6 +15,7 @@ export const badgeTones: Record<string, string> = {
   amber: "bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-300",
   red: "bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-300",
   purple: "bg-purple-100 text-purple-700 dark:bg-purple-900/40 dark:text-purple-300",
+  indigo: "bg-indigo-100 text-indigo-700 dark:bg-indigo-900/40 dark:text-indigo-300",
 };
 
 export function Badge({ children, tone = "slate" }: { children: React.ReactNode; tone?: string }) {

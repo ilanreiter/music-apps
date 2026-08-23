@@ -21,12 +21,21 @@ export interface Conflict {
 // touring a museum while mid-flight).
 const EXCLUSIVE_TYPES = new Set(["TRANSPORT", "STAY"]);
 
+// A "Gas / fuel" item is a brief pit stop that happens *during* whatever
+// drive it's paired with, not a separate commitment — it's expected to
+// overlap that drive (and often the day's default-time activity) by design,
+// so it's excluded from conflict checking entirely rather than flagged as
+// "can't be in two places at once".
+const NON_CONFLICTING_TITLE = /^gas\s*\/\s*fuel/i;
+
 function overlaps(aStart: Date, aEnd: Date, bStart: Date, bEnd: Date) {
   return aStart < bEnd && bStart < aEnd;
 }
 
 export function detectConflicts(items: ConflictCheckItem[]): Conflict[] {
-  const timed = items.filter((i) => i.startAt && i.endAt) as (ConflictCheckItem & {
+  const timed = items.filter(
+    (i) => i.startAt && i.endAt && !NON_CONFLICTING_TITLE.test(i.title)
+  ) as (ConflictCheckItem & {
     startAt: Date;
     endAt: Date;
   })[];
