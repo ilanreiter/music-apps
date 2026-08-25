@@ -5,7 +5,7 @@ import { prisma } from "../db";
 const router = Router({ mergeParams: true });
 
 const budgetSchema = z.object({
-  category: z.enum(["TRANSPORT", "FLIGHTS", "LODGING", "FOOD", "ACTIVITIES", "OTHER"]),
+  category: z.enum(["TRANSPORT", "FLIGHTS", "FUEL", "LODGING", "FOOD", "ACTIVITIES", "OTHER"]),
   label: z.string().min(1),
   estimated: z.number().default(0),
   actual: z.number().nullable().optional(),

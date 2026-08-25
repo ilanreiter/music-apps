@@ -216,6 +216,7 @@ function BuildItinerary({
   const [extraNotes, setExtraNotes] = useState(trip.notes || "");
   const [proposal, setProposal] = useState<ProposedItinerary | null>(null);
   const [busy, setBusy] = useState(false);
+  const [busyProvider, setBusyProvider] = useState<"claude" | "gemini" | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [copyStatus, setCopyStatus] = useState<"idle" | "copying" | "copied">("idle");
   const [manualCopyText, setManualCopyText] = useState<string | null>(null);
@@ -312,8 +313,9 @@ function BuildItinerary({
     }
   }
 
-  async function runPropose() {
+  async function runPropose(provider: "claude" | "gemini" = "claude") {
     setBusy(true);
+    setBusyProvider(provider);
     setError(null);
     try {
       // Save the notes before the (slow, sometimes failing) AI call — so
@@ -322,12 +324,14 @@ function BuildItinerary({
         await api.patch(`/trips/${trip.id}`, { notes: extraNotes });
         reload();
       }
-      const result = await api.post<ProposedItinerary>(`/trips/${trip.id}/propose-itinerary`, { extraNotes });
+      const path = provider === "gemini" ? "propose-itinerary-gemini" : "propose-itinerary";
+      const result = await api.post<ProposedItinerary>(`/trips/${trip.id}/${path}`, { extraNotes });
       setProposal(result);
     } catch (err: any) {
       setError(err.message);
     } finally {
       setBusy(false);
+      setBusyProvider(null);
     }
   }
 
@@ -426,11 +430,17 @@ function BuildItinerary({
             Uses this trip's goal/dates and your saved travel preferences. Edit those on the Preferences page anytime. Whatever you type here is saved to this trip's "Trip notes" box above once you generate.
           </p>
           <p className="text-xs text-slate-400 mt-1">
-            "Generate proposal" costs API usage. To use a free/Pro claude.ai chat instead: copy the prompt, paste it into claude.ai, then paste the reply below.
+            "Generate with Gemini" is free (Google's free API tier) — a good default for everyday use. "Generate with Claude" costs API usage;
+            to use it for free instead, copy the prompt, paste it into claude.ai, then paste the reply below.
           </p>
           {error && <p className="text-sm text-red-600 mt-2">{error}</p>}
-          <div className="flex gap-2 mt-4">
-            <Button onClick={runPropose} disabled={busy}>{busy ? "Thinking…" : "Generate proposal"}</Button>
+          <div className="flex flex-wrap gap-2 mt-4">
+            <Button onClick={() => runPropose("gemini")} disabled={busy}>
+              {busyProvider === "gemini" ? "Thinking…" : "Generate with Gemini (free)"}
+            </Button>
+            <Button variant="secondary" onClick={() => runPropose("claude")} disabled={busy}>
+              {busyProvider === "claude" ? "Thinking…" : "Generate with Claude"}
+            </Button>
             <Button variant="secondary" onClick={copyPrompt} disabled={copyStatus === "copying"}>
               {copyStatus === "copied" ? "Copied!" : copyStatus === "copying" ? "Copying…" : "Copy AI prompt"}
             </Button>

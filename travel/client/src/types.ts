@@ -2,7 +2,7 @@ export type DestinationStatus = "IDEA" | "RESEARCHING" | "PLANNED" | "BOOKED" | 
 export type TripStatus = "DRAFT" | "PLANNING" | "BOOKED" | "IN_PROGRESS" | "COMPLETED" | "CANCELLED";
 export type TripItemType = "TRANSPORT" | "STAY" | "POI" | "ACTIVITY" | "OTHER";
 export type BookingStatus = "IDEA" | "RESEARCHING" | "READY_TO_BOOK" | "BOOKED" | "CONFIRMED" | "CANCELLED";
-export type BudgetCategory = "TRANSPORT" | "FLIGHTS" | "LODGING" | "FOOD" | "ACTIVITIES" | "OTHER";
+export type BudgetCategory = "TRANSPORT" | "FLIGHTS" | "FUEL" | "LODGING" | "FOOD" | "ACTIVITIES" | "OTHER";
 export type TripPlanningType = "SELF_PLANNED" | "GROUP" | "ORGANIZED";
 export type TripGoal = "NATURE" | "SIGHTSEEING" | "CITY" | "RELAXATION" | "ADVENTURE" | "MIXED" | "OTHER";
 

@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { getAnthropicClient, AI_MODEL } from "./anthropic";
+import { getGeminiApiKey, GEMINI_MODEL } from "./gemini";
 
 // Day-relative shape the AI returns items in — the caller resolves `day`
 // (1-indexed, relative to the trip start date) into absolute datetimes,
@@ -51,7 +52,7 @@ const ITEM_SHAPE_INSTRUCTIONS = `Respond ONLY with strict JSON (no markdown fenc
 }
 "day" is 1-indexed relative to the first day of the trip. Use STAY once per lodging (checked in day, checked out on the departure day is fine to omit a duplicate). Use TRANSPORT for inter-city/inter-region movement and arrival/departure flights. Use POI for sights/landmarks, ACTIVITY for booked/planned activities (tours, classes, etc). Include "lat"/"lng" (decimal degrees) whenever you can identify a real, mappable place for the item (landmarks, hotels, neighborhoods, airports) — use your knowledge of the actual location, not a guess at the trip's general area. Leave both null for anything without a concrete single location (e.g. "free time", "travel day").
 
-Every item's "time"+"durationHours" window must be exclusive of every other item's window that same day — the traveler can only be in one place at a time, so no two windows may overlap. In particular: if a drive includes a stop along the way (e.g. "drive to A, sightsee, then continue to B"), do NOT create one TRANSPORT item whose duration spans the whole thing — split it into two separate TRANSPORT legs ("A to the stop" and "the stop to B") with the POI/ACTIVITY item's window sitting between them, none overlapping. A TRANSPORT item's title should describe a single leg, not "X, then Y".
+Every item that has a "time" set must have a window ("time"+"durationHours") exclusive of every other timed item's window that same day — the traveler can only be in one place at a time, so no two windows may overlap. In particular: if a drive includes a stop along the way (e.g. "drive to A, sightsee, then continue to B"), do NOT create one TRANSPORT item whose duration spans the whole thing — split it into two separate TRANSPORT legs ("A to the stop" and "the stop to B") with the POI/ACTIVITY item's window sitting between them, none overlapping. A TRANSPORT item's title should describe a single leg, not "X, then Y". This overlap rule doesn't apply to items with "time" left null (e.g. the daily Meals/Gas budget line items described below) — they're not scheduled against the day's timeline at all.
 
 Critical: this output is parsed by a strict JSON parser. If any string value (title, location, notes, summary) itself contains a double-quote character — e.g. a nickname or quoted phrase like the "Golden Gate" — you MUST escape it as \\" so the JSON stays valid. Prefer rephrasing to avoid inner quotes entirely when possible. Do not include trailing commas. When writing "lat" and "lng", write each value exactly once immediately after its key ("lat": 44.59, "lng": -104.71) — never write a bare number a second time before the next key; that produces invalid JSON.
 
@@ -279,9 +280,9 @@ ${input.extraNotes ? `Additional context from the travelers: ${input.extraNotes}
 Take the traveler profiles into account: their ages, stay/transport/food preferences, and any notes (dietary, mobility, etc) should shape which items you propose.
 ${formatHomeLocationsInstruction(input.travelerProfiles)}
 
-Also include ongoing living-cost items so the total budget is realistic, not just bookable reservations:
-- One OTHER item per day titled "Meals" (or "Meals - Day N") with "estimatedCost" covering breakfast/lunch/dinner for all travelers that day, sized to the household's budget style and any food preferences/dietary notes above. Skip a day only if all meals are already covered elsewhere (e.g. an all-inclusive stay or a flight day with no time to eat out).
-- If the trip involves a rental car or self-driving (road trip, day trips beyond walking/transit distance), one TRANSPORT item titled "Gas / fuel" (or per-leg if driving segments are far apart) with a total estimated fuel cost for that driving, separate from any rental car booking fee itself. Its "durationHours" (e.g. 0.25–0.5) is only how long the physical pump stop takes — the "estimatedCost" is for the entire leg/day's driving distance, not that short stop, so those two numbers are intentionally on very different scales. Because of that mismatch, you MUST fill in "notes" with the cost basis every time, e.g. "Estimated fuel for ~150 miles of driving today" — never leave notes null on a Gas/fuel item. "time" may be left null.
+Also include ongoing living-cost items so the total budget is realistic, not just bookable reservations. These are budget line items, not scheduled events — leave "time" and "durationHours" both null for them (do not invent a clock time), since they don't need to fit into the day's schedule or avoid overlapping with anything else that day:
+- One OTHER item per day titled "Meals" (or "Meals - Day N") with "estimatedCost" covering breakfast/lunch/dinner for all travelers that day, sized to the household's budget style and any food preferences/dietary notes above. Skip a day only if all meals are already covered elsewhere (e.g. an all-inclusive stay or a flight day with no time to eat out). Exception: if a meal is at a specific restaurant you're recommending (not a generic daily estimate), give it its own item with a real "time" instead — that's a scheduled reservation, not a budget line.
+- If the trip involves a rental car or self-driving (road trip, day trips beyond walking/transit distance), one TRANSPORT item titled "Gas / fuel" (or per-leg if driving segments are far apart) with a total estimated fuel cost for that driving, separate from any rental car booking fee itself — not a scheduled pump stop, just the day's/leg's fuel cost. You MUST fill in "notes" with the cost basis every time, e.g. "Estimated fuel for ~150 miles of driving today" — never leave notes null on a Gas/fuel item.
 
 ${ITEM_SHAPE_INSTRUCTIONS}`;
 
@@ -300,6 +301,86 @@ export async function proposeItinerary(input: ProposeItineraryInput): Promise<Pr
   const { system, prompt, maxTokens } = buildProposePrompt(input);
 
   return requestProposedItinerary(client, system, prompt, maxTokens);
+}
+
+// Google's free tier returns transient 429 (rate limit) / 503 (overloaded)
+// fairly often — the Anthropic SDK retries these automatically, but raw
+// fetch doesn't, so we do it ourselves with a short backoff.
+async function fetchGeminiWithRetry(url: string, body: unknown, retries = 3): Promise<any> {
+  let lastErr: unknown;
+  for (let i = 0; i <= retries; i++) {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (res.ok) return res.json();
+    const text = (await res.text()).slice(0, 500);
+    lastErr = new Error(`Gemini API error ${res.status}: ${text}`);
+    if ((res.status === 429 || res.status >= 500) && i < retries) {
+      await new Promise((r) => setTimeout(r, 1000 * Math.pow(2, i)));
+      continue;
+    }
+    throw lastErr;
+  }
+  throw lastErr;
+}
+
+// Same retry shape as requestProposedItinerary (truncation -> bigger budget,
+// malformed JSON -> resample), against Google's Gemini API instead of
+// Claude's. Free-tier eligible, so this is the no-cost generation path.
+async function requestProposedItineraryGemini(
+  apiKey: string,
+  system: string,
+  prompt: string,
+  initialMaxTokens: number,
+  attempts = 3
+): Promise<ProposedItinerary> {
+  let lastErr: unknown;
+  let maxTokens = initialMaxTokens;
+  for (let i = 0; i < attempts; i++) {
+    const data: any = await fetchGeminiWithRetry(
+      `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${apiKey}`,
+      {
+        systemInstruction: { parts: [{ text: system }] },
+        contents: [{ role: "user", parts: [{ text: prompt }] }],
+        generationConfig: { maxOutputTokens: maxTokens, responseMimeType: "application/json" },
+      }
+    );
+    const candidate = data.candidates?.[0];
+    const finishReason: string | undefined = candidate?.finishReason;
+
+    // eslint-disable-next-line no-console
+    console.log(
+      `[itineraryAi] gemini attempt ${i + 1} (max_tokens=${maxTokens}, finish_reason=${finishReason}): ` +
+        `input=${data.usageMetadata?.promptTokenCount ?? "?"} output=${data.usageMetadata?.candidatesTokenCount ?? "?"} tokens (free tier)`
+    );
+
+    if (finishReason === "MAX_TOKENS") {
+      lastErr = new Error(
+        `Gemini response was truncated at ${maxTokens} tokens — this trip may be too long to generate in one proposal.`
+      );
+      if (i < attempts - 1) maxTokens = Math.min(MAX_ITINERARY_TOKENS, Math.round(maxTokens * 1.6));
+      continue;
+    }
+
+    const text = candidate?.content?.parts?.map((p: any) => p.text ?? "").join("") ?? "{}";
+    try {
+      return parseProposedItinerary(text);
+    } catch (err) {
+      lastErr = err;
+    }
+  }
+  throw lastErr;
+}
+
+export async function proposeItineraryGemini(input: ProposeItineraryInput): Promise<ProposedItinerary> {
+  const apiKey = getGeminiApiKey();
+  if (!apiKey) throw new Error("Gemini is not configured");
+
+  const { system, prompt, maxTokens } = buildProposePrompt(input);
+
+  return requestProposedItineraryGemini(apiKey, system, prompt, maxTokens);
 }
 
 export interface ImportItineraryInput {

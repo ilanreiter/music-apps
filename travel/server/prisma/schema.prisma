@@ -45,6 +45,7 @@ enum BookingStatus {
 enum BudgetCategory {
   TRANSPORT
   FLIGHTS
+  FUEL
   LODGING
   FOOD
   ACTIVITIES

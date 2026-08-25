@@ -3,7 +3,7 @@ import { z } from "zod";
 import { prisma } from "../db";
 import { detectConflicts } from "../lib/conflicts";
 import { optimizeRoute } from "../lib/routeOptimize";
-import { proposeItinerary, importItinerary, geocodeItems, buildProposePrompt } from "../lib/itineraryAi";
+import { proposeItinerary, proposeItineraryGemini, importItinerary, geocodeItems, buildProposePrompt } from "../lib/itineraryAi";
 
 const router = Router();
 
@@ -166,6 +166,22 @@ router.post("/:id/propose-itinerary", async (req, res) => {
     res.json(proposal);
   } catch (err: any) {
     res.status(503).json({ error: err.message || "AI proposal failed" });
+  }
+});
+
+// Same as propose-itinerary but via Gemini's free tier — no API cost.
+router.post("/:id/propose-itinerary-gemini", async (req, res) => {
+  const parsed = proposeSchema.safeParse(req.body ?? {});
+  if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
+
+  const input = await resolveProposeInput(req.params.id, parsed.data.extraNotes);
+  if (!input) return res.status(404).json({ error: "Not found" });
+
+  try {
+    const proposal = await proposeItineraryGemini(input);
+    res.json(proposal);
+  } catch (err: any) {
+    res.status(503).json({ error: err.message || "Gemini proposal failed" });
   }
 });
 

@@ -6,6 +6,7 @@ import { Badge, BadgeSelect, Button, Card, Input, Label, PageHeader, Select, Tex
 import TripSetup from "../components/TripSetup";
 import { AlertTriangleIcon } from "../components/icons";
 import type { MapPoint } from "../components/RouteMap";
+import { colorForDay } from "../lib/dayColors";
 
 const RouteMap = React.lazy(() => import("../components/RouteMap"));
 
@@ -170,7 +171,7 @@ function RouteTab({ trip, reload }: { trip: Trip; reload: () => void }) {
 
   const itineraryPoints: MapPoint[] = dayFilteredItems
     .filter((i): i is TripItem & { lat: number; lng: number } => i.lat != null && i.lng != null)
-    .map((i) => ({ id: i.id, title: i.title, lat: i.lat, lng: i.lng }));
+    .map((i) => ({ id: i.id, title: i.title, lat: i.lat, lng: i.lng, day: dayNumberFor(trip, i) }));
 
   const missingCount = dayFilteredItems.filter((i) => i.lat == null || i.lng == null).length;
 
@@ -205,9 +206,14 @@ function RouteTab({ trip, reload }: { trip: Trip; reload: () => void }) {
 
   // The optimize-route call always runs over the full itinerary server-side —
   // when a day filter is active, narrow its result down to that day's points
-  // rather than re-requesting an optimization scoped to one day.
+  // rather than re-requesting an optimization scoped to one day. Its response
+  // doesn't carry `day` (server only knows id/title/lat/lng), so reattach it
+  // from itineraryPoints, which was computed client-side and does have it.
+  const dayById = new Map(itineraryPoints.map((p) => [p.id, p.day]));
   const dayFilteredIds = new Set(itineraryPoints.map((p) => p.id));
-  const displayPoints = optimized ? optimized.order.filter((p) => dayFilteredIds.has(p.id)) : itineraryPoints;
+  const displayPoints = optimized
+    ? optimized.order.filter((p) => dayFilteredIds.has(p.id)).map((p) => ({ ...p, day: dayById.get(p.id) }))
+    : itineraryPoints;
 
   return (
     <div>
@@ -226,12 +232,13 @@ function RouteTab({ trip, reload }: { trip: Trip; reload: () => void }) {
           <button
             key={d}
             onClick={() => setDayFilter(d)}
-            className={`px-3 py-1 rounded-full text-xs font-medium border ${
+            className={`flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-medium border ${
               dayFilter === d
                 ? "bg-brand-600 border-brand-600 text-white"
                 : "border-slate-200 dark:border-slate-700 text-slate-500 dark:text-slate-400 hover:border-brand-400"
             }`}
           >
+            <span className="w-2 h-2 rounded-full shrink-0" style={{ background: colorForDay(d) }} />
             Day {d}
           </button>
         ))}
@@ -629,11 +636,12 @@ function ItineraryItemRow({
   );
 }
 
-const BUDGET_CATEGORIES = ["TRANSPORT", "FLIGHTS", "LODGING", "FOOD", "ACTIVITIES", "OTHER"] as const;
+const BUDGET_CATEGORIES = ["TRANSPORT", "FLIGHTS", "FUEL", "LODGING", "FOOD", "ACTIVITIES", "OTHER"] as const;
 
 const CATEGORY_TONE: Record<(typeof BUDGET_CATEGORIES)[number], string> = {
   TRANSPORT: "blue",
   FLIGHTS: "indigo",
+  FUEL: "red",
   LODGING: "purple",
   FOOD: "amber",
   ACTIVITIES: "green",
@@ -643,6 +651,7 @@ const CATEGORY_TONE: Record<(typeof BUDGET_CATEGORIES)[number], string> = {
 const CATEGORY_EMOJI: Record<(typeof BUDGET_CATEGORIES)[number], string> = {
   TRANSPORT: "🚗",
   FLIGHTS: "✈️",
+  FUEL: "⛽",
   LODGING: "🏨",
   FOOD: "🍽️",
   ACTIVITIES: "🎟️",
@@ -664,14 +673,20 @@ const ITEM_TYPE_TO_BUDGET_CATEGORY: Record<TripItemType, (typeof BUDGET_CATEGORI
   OTHER: "OTHER",
 };
 
-// Item type alone can't distinguish a meal or a flight from any other
-// TRANSPORT/OTHER/ACTIVITY item, so a title match routes these to their own
-// category regardless of what type the AI (or a manual add) tagged them with.
+// Item type alone can't distinguish a meal, a flight, or a fuel line from any
+// other TRANSPORT/OTHER/ACTIVITY item, so a title match routes these to their
+// own category regardless of what type the AI (or a manual add) tagged them
+// with. Fuel is deliberately its own category, not folded into TRANSPORT —
+// the AI prices the drive/flight itself as the transport cost (often $0 for
+// a personal car) and fuel as a separate line, so merging them would still
+// leave "Transport" looking wrong for a road trip.
 const FOOD_TITLE_PATTERN = /\b(meal|meals|breakfast|lunch|dinner|food)\b/i;
 const FLIGHT_TITLE_PATTERN = /\b(flight|flights|airfare|airline)\b/i;
+const FUEL_TITLE_PATTERN = /\b(gas|fuel|gasoline|petrol)\b/i;
 
 function budgetCategoryForItem(item: TripItem): (typeof BUDGET_CATEGORIES)[number] {
   if (FOOD_TITLE_PATTERN.test(item.title)) return "FOOD";
+  if (FUEL_TITLE_PATTERN.test(item.title)) return "FUEL";
   if (item.type === "TRANSPORT" && FLIGHT_TITLE_PATTERN.test(item.title)) return "FLIGHTS";
   return ITEM_TYPE_TO_BUDGET_CATEGORY[item.type];
 }
