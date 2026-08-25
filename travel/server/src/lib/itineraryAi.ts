@@ -71,6 +71,27 @@ const MAX_ITINERARY_TOKENS = 100_000;
 //   instead and don't waste an attempt trying to parse the truncated text.
 // Streaming (not .create()) is required once max_tokens gets large, to avoid
 // the SDK's own client-side timeout on a long-running request.
+// Sonnet 5 standard per-token rates ($/1M tokens); Anthropic may run a lower
+// intro rate for a limited window, so treat this as an upper-bound estimate.
+const INPUT_COST_PER_MTOK = 3;
+const OUTPUT_COST_PER_MTOK = 15;
+
+function logItineraryUsage(
+  attempt: number,
+  maxTokens: number,
+  stopReason: string | null,
+  usage: { input_tokens: number; output_tokens: number }
+) {
+  const cost =
+    (usage.input_tokens / 1_000_000) * INPUT_COST_PER_MTOK +
+    (usage.output_tokens / 1_000_000) * OUTPUT_COST_PER_MTOK;
+  // eslint-disable-next-line no-console
+  console.log(
+    `[itineraryAi] attempt ${attempt} (max_tokens=${maxTokens}, stop_reason=${stopReason}): ` +
+      `input=${usage.input_tokens} output=${usage.output_tokens} tokens, ~$${cost.toFixed(4)} (standard rate estimate)`
+  );
+}
+
 async function requestProposedItinerary(
   client: NonNullable<ReturnType<typeof getAnthropicClient>>,
   system: string,
@@ -87,6 +108,8 @@ async function requestProposedItinerary(
       system,
       messages: [{ role: "user", content: prompt }],
     }).finalMessage();
+
+    logItineraryUsage(i + 1, maxTokens, response.stop_reason, response.usage);
 
     if (response.stop_reason === "max_tokens") {
       lastErr = new Error(
@@ -194,7 +217,15 @@ export function formatHomeLocationsInstruction(travelers: TravelerProfileInput[]
 
 export interface ProposeItineraryInput {
   destinationName: string;
+  destinationCountry?: string | null;
+  destinationRegion?: string | null;
+  destinationNotes?: string | null;
+  destinationTags?: string[] | null;
+  destinationBestSeason?: string | null;
   nights: number;
+  startDate?: Date | null;
+  endDate?: Date | null;
+  travelSeason?: string | null;
   goal: string;
   goalDetail?: string;
   travelers: number;
@@ -204,16 +235,42 @@ export interface ProposeItineraryInput {
   extraNotes?: string;
 }
 
-export async function proposeItinerary(input: ProposeItineraryInput): Promise<ProposedItinerary> {
-  const client = getAnthropicClient();
-  if (!client) throw new Error("AI is not configured");
+function formatDateRangeInstruction(input: ProposeItineraryInput): string {
+  const fmt = (d: Date) => d.toISOString().slice(0, 10);
+  if (input.startDate && input.endDate) {
+    return `Trip dates: ${fmt(input.startDate)} to ${fmt(input.endDate)}. Use these actual calendar dates to inform seasonal/weather-appropriate choices (opening hours, closures, weather, crowd levels, local events/holidays in that window).`;
+  }
+  if (input.travelSeason) {
+    return `Time of year: ${input.travelSeason} (exact dates not set yet). Use this to inform seasonal/weather-appropriate choices.`;
+  }
+  return "";
+}
 
+function formatDestinationDetails(input: ProposeItineraryInput): string {
+  const parts = [
+    input.destinationCountry ? `country: ${input.destinationCountry}` : null,
+    input.destinationRegion ? `region: ${input.destinationRegion}` : null,
+    input.destinationBestSeason ? `known best season: ${input.destinationBestSeason}` : null,
+    input.destinationTags && input.destinationTags.length ? `tags: ${input.destinationTags.join(", ")}` : null,
+    input.destinationNotes ? `notes: "${input.destinationNotes}"` : null,
+  ].filter(Boolean);
+  return parts.length ? `Destination details — ${parts.join("; ")}.` : "";
+}
+
+const PROPOSE_SYSTEM_PROMPT = "You are a meticulous travel planner. You produce only valid JSON when asked to.";
+
+// Shared by proposeItinerary (calls the API) and the propose-itinerary-prompt
+// route (returns the prompt text as-is, e.g. for pasting into claude.ai chat
+// instead of paying for the API call).
+export function buildProposePrompt(input: ProposeItineraryInput): { system: string; prompt: string; maxTokens: number } {
   const prefsBlock = input.preferences
     ? `Household travel preferences: interests=${(input.preferences.interests || []).join(", ") || "none specified"}; pace=${input.preferences.pace || "unspecified"}; budget style=${input.preferences.budgetStyle || "unspecified"}; notes="${input.preferences.notes || ""}".`
     : "No saved travel preferences.";
 
   const prompt = `Propose a day-by-day itinerary for a trip to ${input.destinationName}, ${input.nights} night(s), for ${input.travelers} traveler(s).
 Trip goal/style: ${input.goal}. Planning type: ${input.planningType}.
+${formatDateRangeInstruction(input)}
+${formatDestinationDetails(input)}
 ${input.goalDetail ? `Specifically, what the travelers want out of this trip: "${input.goalDetail}". Weight this heavily — it's more specific than the general goal/style category above.` : ""}
 ${prefsBlock}
 ${formatTravelerProfilesBlock(input.travelerProfiles)}
@@ -233,12 +290,16 @@ ${ITEM_SHAPE_INSTRUCTIONS}`;
   // (multi-week road trips) don't truncate on the first attempt.
   const maxTokens = Math.min(MAX_ITINERARY_TOKENS, Math.max(16_384, 2_500 * input.nights + 4_000));
 
-  return requestProposedItinerary(
-    client,
-    "You are a meticulous travel planner. You produce only valid JSON when asked to.",
-    prompt,
-    maxTokens
-  );
+  return { system: PROPOSE_SYSTEM_PROMPT, prompt, maxTokens };
+}
+
+export async function proposeItinerary(input: ProposeItineraryInput): Promise<ProposedItinerary> {
+  const client = getAnthropicClient();
+  if (!client) throw new Error("AI is not configured");
+
+  const { system, prompt, maxTokens } = buildProposePrompt(input);
+
+  return requestProposedItinerary(client, system, prompt, maxTokens);
 }
 
 export interface ImportItineraryInput {

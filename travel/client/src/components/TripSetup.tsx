@@ -217,6 +217,9 @@ function BuildItinerary({
   const [proposal, setProposal] = useState<ProposedItinerary | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [copyStatus, setCopyStatus] = useState<"idle" | "copying" | "copied">("idle");
+  const [manualCopyText, setManualCopyText] = useState<string | null>(null);
+  const [showPasteback, setShowPasteback] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const itemCount = trip.items.length;
 
@@ -261,6 +264,51 @@ function BuildItinerary({
       setError(err.message);
     } finally {
       setBusy(false);
+    }
+  }
+
+  function legacyCopy(text: string): boolean {
+    const textarea = document.createElement("textarea");
+    textarea.value = text;
+    textarea.style.position = "fixed";
+    textarea.style.opacity = "0";
+    document.body.appendChild(textarea);
+    textarea.focus();
+    textarea.select();
+    let ok = false;
+    try {
+      ok = document.execCommand("copy");
+    } catch {
+      ok = false;
+    }
+    document.body.removeChild(textarea);
+    return ok;
+  }
+
+  async function copyPrompt() {
+    setCopyStatus("copying");
+    setError(null);
+    setManualCopyText(null);
+    try {
+      const { prompt } = await api.post<{ system: string; prompt: string }>(`/trips/${trip.id}/propose-itinerary-prompt`, { extraNotes });
+      setShowPasteback(true);
+      // navigator.clipboard is undefined outside a secure context (e.g.
+      // loading the app over plain HTTP from a non-localhost host) — fall
+      // back to the legacy execCommand copy, then to a manual select box.
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(prompt);
+        setCopyStatus("copied");
+        setTimeout(() => setCopyStatus("idle"), 2000);
+      } else if (legacyCopy(prompt)) {
+        setCopyStatus("copied");
+        setTimeout(() => setCopyStatus("idle"), 2000);
+      } else {
+        setManualCopyText(prompt);
+        setCopyStatus("idle");
+      }
+    } catch (err: any) {
+      setError(err.message);
+      setCopyStatus("idle");
     }
   }
 
@@ -377,11 +425,42 @@ function BuildItinerary({
           <p className="text-xs text-slate-400 mt-2">
             Uses this trip's goal/dates and your saved travel preferences. Edit those on the Preferences page anytime. Whatever you type here is saved to this trip's "Trip notes" box above once you generate.
           </p>
+          <p className="text-xs text-slate-400 mt-1">
+            "Generate proposal" costs API usage. To use a free/Pro claude.ai chat instead: copy the prompt, paste it into claude.ai, then paste the reply below.
+          </p>
           {error && <p className="text-sm text-red-600 mt-2">{error}</p>}
           <div className="flex gap-2 mt-4">
             <Button onClick={runPropose} disabled={busy}>{busy ? "Thinking…" : "Generate proposal"}</Button>
+            <Button variant="secondary" onClick={copyPrompt} disabled={copyStatus === "copying"}>
+              {copyStatus === "copied" ? "Copied!" : copyStatus === "copying" ? "Copying…" : "Copy AI prompt"}
+            </Button>
             <Button variant="secondary" onClick={() => setMode("choose")}>Back</Button>
           </div>
+          {manualCopyText && (
+            <div className="mt-3">
+              <Label>Clipboard access isn't available here — select all and copy manually</Label>
+              <Textarea
+                rows={6}
+                readOnly
+                value={manualCopyText}
+                onFocus={(e) => e.currentTarget.select()}
+              />
+            </div>
+          )}
+          {showPasteback && (
+            <div className="mt-4 pt-4 border-t border-slate-200 dark:border-slate-700">
+              <Label>Paste claude.ai's reply here</Label>
+              <Textarea
+                rows={6}
+                value={pastedText}
+                onChange={(e) => setPastedText(e.target.value)}
+                placeholder="Paste the JSON (or plain-text itinerary) claude.ai gave you…"
+              />
+              <div className="flex gap-2 mt-2">
+                <Button onClick={runImport} disabled={busy || !pastedText.trim()}>{busy ? "Parsing…" : "Parse pasted itinerary"}</Button>
+              </div>
+            </div>
+          )}
         </div>
       )}
     </Card>

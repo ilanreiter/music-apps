@@ -3,7 +3,7 @@ import { z } from "zod";
 import { prisma } from "../db";
 import { detectConflicts } from "../lib/conflicts";
 import { optimizeRoute } from "../lib/routeOptimize";
-import { proposeItinerary, importItinerary, geocodeItems } from "../lib/itineraryAi";
+import { proposeItinerary, importItinerary, geocodeItems, buildProposePrompt } from "../lib/itineraryAi";
 
 const router = Router();
 
@@ -105,12 +105,9 @@ const proposeSchema = z.object({
   extraNotes: z.string().optional(),
 });
 
-router.post("/:id/propose-itinerary", async (req, res) => {
-  const parsed = proposeSchema.safeParse(req.body ?? {});
-  if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
-
-  const trip = await prisma.trip.findUnique({ where: { id: req.params.id }, include: { destination: true } });
-  if (!trip) return res.status(404).json({ error: "Not found" });
+async function resolveProposeInput(tripId: string, extraNotes: string | undefined) {
+  const trip = await prisma.trip.findUnique({ where: { id: tripId }, include: { destination: true } });
+  if (!trip) return null;
 
   const nights =
     trip.durationNights ??
@@ -121,18 +118,51 @@ router.post("/:id/propose-itinerary", async (req, res) => {
   const preferences = await prisma.preferences.findUnique({ where: { id: "default" } });
   const travelerProfiles = await prisma.traveler.findMany({ orderBy: { createdAt: "asc" } });
 
+  return {
+    destinationName: trip.destination?.name || trip.title,
+    destinationCountry: trip.destination?.country,
+    destinationRegion: trip.destination?.region,
+    destinationNotes: trip.destination?.notes,
+    destinationTags: trip.destination?.tags,
+    destinationBestSeason: trip.destination?.bestSeason,
+    nights,
+    startDate: trip.startDate,
+    endDate: trip.endDate,
+    travelSeason: trip.travelSeason,
+    goal: trip.goal || "MIXED",
+    goalDetail: trip.goalDetail || undefined,
+    travelers: travelerProfiles.length || trip.travelers.length || 2,
+    planningType: trip.planningType || "SELF_PLANNED",
+    preferences,
+    travelerProfiles,
+    extraNotes,
+  };
+}
+
+// Returns the exact prompt propose-itinerary would send to Claude, without
+// calling the API — lets the user paste it into claude.ai chat (covered by
+// a Pro/free plan) instead of paying for the API call, then paste the reply
+// into /import-itinerary.
+router.post("/:id/propose-itinerary-prompt", async (req, res) => {
+  const parsed = proposeSchema.safeParse(req.body ?? {});
+  if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
+
+  const input = await resolveProposeInput(req.params.id, parsed.data.extraNotes);
+  if (!input) return res.status(404).json({ error: "Not found" });
+
+  const { system, prompt } = buildProposePrompt(input);
+  res.json({ system, prompt });
+});
+
+router.post("/:id/propose-itinerary", async (req, res) => {
+  const parsed = proposeSchema.safeParse(req.body ?? {});
+  if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
+
+  const input = await resolveProposeInput(req.params.id, parsed.data.extraNotes);
+  if (!input) return res.status(404).json({ error: "Not found" });
+
   try {
-    const proposal = await proposeItinerary({
-      destinationName: trip.destination?.name || trip.title,
-      nights,
-      goal: trip.goal || "MIXED",
-      goalDetail: trip.goalDetail || undefined,
-      travelers: travelerProfiles.length || trip.travelers.length || 2,
-      planningType: trip.planningType || "SELF_PLANNED",
-      preferences,
-      travelerProfiles,
-      extraNotes: parsed.data.extraNotes,
-    });
+    const proposal = await proposeItinerary(input);
     res.json(proposal);
   } catch (err: any) {
     res.status(503).json({ error: err.message || "AI proposal failed" });
