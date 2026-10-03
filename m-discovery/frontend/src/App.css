@@ -20,6 +20,15 @@
      passes CVD/contrast checks against a dark surface close to --bg-card. */
   --series-1: #3987e5;
   --series-2: #008300;
+  /* Hairline borders + a live/idle glow pair, carried over from the WLED
+     equalizer companion page's design language for the player bar - a
+     translucent line reads as a glass edge instead of a flat border, and
+     the glow pair gives "currently playing" a real visual signal instead
+     of just text. */
+  --line: rgba(255, 255, 255, 0.07);
+  --line2: rgba(255, 255, 255, 0.14);
+  --live: #4de1b4;
+  --idle: #5d6980;
 }
 
 body {
@@ -144,6 +153,17 @@ main.with-player {
 .settings-btn:hover {
   color: var(--text-main);
   background: var(--bg-card-hover);
+}
+
+/* .settings-btn is a <button> by default; this reuses its look on an <a>
+   that links out to the separate WLED LED-equalizer project on the same
+   server, so it needs the display/alignment/underline resets a button
+   gets for free. */
+.led-eq-link {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  text-decoration: none;
 }
 
 .settings-overlay {
@@ -1780,10 +1800,10 @@ main.with-player {
   width: 66.67%;
   margin-bottom: 16px;
   padding: 14px 24px;
-  background: var(--bg-card);
-  border: 1px solid var(--border);
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.035), rgba(255, 255, 255, 0)), var(--bg-card);
+  border: 1px solid var(--line);
   border-radius: 16px;
-  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.35);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.35), inset 0 1px 0 rgba(255, 255, 255, 0.04);
 }
 
 .player-thumb-wrap {
@@ -1794,6 +1814,12 @@ main.with-player {
   overflow: hidden;
   background: var(--bg-input);
   cursor: pointer;
+  box-shadow: 0 0 0 0 transparent;
+  transition: box-shadow 0.2s;
+}
+
+.player-bar.is-playing .player-thumb-wrap {
+  box-shadow: 0 0 0 2px var(--live), 0 0 14px rgba(77, 225, 180, 0.35);
 }
 
 .player-thumb-wrap img {
@@ -1894,6 +1920,31 @@ main.with-player {
   font-weight: 600;
 }
 
+/* Glowing live/idle dot, next to "Playing on {device}" - same signal as the
+   WLED page's connection pill (a lit, glowing dot means "this is really
+   happening right now", not just a label). */
+.np-live-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  margin-right: 6px;
+  vertical-align: middle;
+  background: var(--idle);
+  transition: background 0.2s, box-shadow 0.2s;
+}
+
+.np-live-dot.live {
+  background: var(--live);
+  box-shadow: 0 0 8px var(--live);
+  animation: np-live-pulse 2s ease-in-out infinite;
+}
+
+@keyframes np-live-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.55; }
+}
+
 .player-tech {
   text-align: center;
   font-size: 0.72rem;
@@ -1926,17 +1977,61 @@ main.with-player {
   display: flex;
   align-items: center;
   gap: 8px;
-  background: var(--bg-card);
-  border: 1px solid var(--border);
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.04), rgba(255, 255, 255, 0)), var(--bg-card);
+  border: 1px solid var(--line2);
   border-radius: 12px;
   padding: 10px 14px;
   box-shadow: 0 12px 32px rgba(0, 0, 0, 0.45);
   z-index: 3;
 }
 
+/* Gradient-filled track + a ringed thumb, matching the WLED page's range
+   sliders - the plain accent-color default looks flat next to the rest of
+   this uplifted player chrome. */
 .player-volume-menu input[type="range"] {
   width: 120px;
-  accent-color: var(--accent);
+  -webkit-appearance: none;
+  appearance: none;
+  height: 20px;
+  background: transparent;
+  cursor: pointer;
+}
+
+.player-volume-menu input[type="range"]::-webkit-slider-runnable-track {
+  height: 6px;
+  border-radius: 6px;
+  background: linear-gradient(90deg, var(--accent) 0 var(--p, 50%), var(--bg-input) var(--p, 50%) 100%);
+}
+
+.player-volume-menu input[type="range"]::-moz-range-track {
+  height: 6px;
+  border-radius: 6px;
+  background: var(--bg-input);
+}
+
+.player-volume-menu input[type="range"]::-moz-range-progress {
+  height: 6px;
+  border-radius: 6px;
+  background: var(--accent);
+}
+
+.player-volume-menu input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 18px;
+  height: 18px;
+  margin-top: -6px;
+  border-radius: 50%;
+  background: #f2f6ff;
+  border: 3px solid var(--accent);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.5);
+}
+
+.player-volume-menu input[type="range"]::-moz-range-thumb {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: #f2f6ff;
+  border: 3px solid var(--accent);
 }
 
 .player-volume-menu span {
@@ -1964,13 +2059,14 @@ main.with-player {
 }
 
 .player-btn:hover {
-  background: var(--accent);
+  background: linear-gradient(135deg, var(--accent), var(--accent-hover));
   color: white;
 }
 
 .player-btn.active {
-  background: var(--accent);
+  background: linear-gradient(135deg, var(--accent), var(--accent-hover));
   color: white;
+  box-shadow: 0 0 0 1px rgba(99, 102, 241, 0.4) inset;
 }
 
 .player-btn:disabled {
@@ -2047,8 +2143,8 @@ main.with-player {
 
 .np-bottom-bar {
   grid-area: bar;
-  background: rgba(0, 0, 0, 0.28);
-  border: 1px solid var(--border);
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.03), rgba(255, 255, 255, 0)), rgba(0, 0, 0, 0.28);
+  border: 1px solid var(--line);
   border-radius: 14px;
   padding: 14px 24px 16px;
   flex-shrink: 0;
@@ -2226,7 +2322,8 @@ main.with-player {
   left: 0;
   height: 100%;
   border-radius: 3px;
-  background: var(--accent);
+  background: linear-gradient(90deg, var(--accent), var(--accent-hover));
+  box-shadow: 0 0 10px rgba(99, 102, 241, 0.55);
 }
 
 .np-progress-handle {
@@ -2235,9 +2332,10 @@ main.with-player {
   width: 13px;
   height: 13px;
   border-radius: 50%;
-  background: white;
+  background: #f2f6ff;
+  border: 3px solid var(--accent);
   transform: translate(-50%, -50%);
-  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.4);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.5);
 }
 
 .np-progress-times {
@@ -2282,8 +2380,9 @@ main.with-player {
 }
 
 .np-side-btn.active {
-  background: var(--accent);
+  background: linear-gradient(135deg, var(--accent), var(--accent-hover));
   color: white;
+  box-shadow: 0 0 0 1px rgba(99, 102, 241, 0.4) inset;
 }
 
 .np-destination {
@@ -2294,8 +2393,8 @@ main.with-player {
   position: absolute;
   bottom: calc(100% + 10px);
   right: 0;
-  background: var(--bg-card);
-  border: 1px solid var(--border);
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.04), rgba(255, 255, 255, 0)), var(--bg-card);
+  border: 1px solid var(--line2);
   border-radius: 12px;
   padding: 6px;
   min-width: 200px;
@@ -2515,12 +2614,13 @@ main.with-player {
   width: 76px;
   height: 76px;
   font-size: 1.8rem;
-  background: var(--accent);
+  background: linear-gradient(135deg, var(--accent), var(--accent-hover));
   color: white;
+  box-shadow: 0 0 24px rgba(99, 102, 241, 0.45);
 }
 
 .player-btn.xlarge:hover {
-  background: var(--accent-hover);
+  filter: brightness(1.08);
 }
 
 .cleanup-subtabs {

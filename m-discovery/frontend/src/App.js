@@ -3279,6 +3279,16 @@ function App() {
             Play Log
           </button>
         </nav>
+        <a
+          className="settings-btn led-eq-link"
+          href={`http://${window.location.hostname}:8770`}
+          target="_blank"
+          rel="noopener noreferrer"
+          aria-label="Open the WLED LED equalizer"
+          title="Open the WLED LED equalizer (separate project, same server)"
+        >
+          &#128161;
+        </a>
         <button className="settings-btn" onClick={() => setSettingsOpen(true)} aria-label="Settings" title="Settings">
           &#9881;
         </button>
@@ -4699,12 +4709,15 @@ function PlayerBar({
                   )}
                 </div>
               </section>
-              <p className="np-destination-label">Playing on {destinationLabel}</p>
+              <p className="np-destination-label">
+                <span className={`np-live-dot${isPlaying ? ' live' : ''}`} aria-hidden="true" />
+                Playing on {destinationLabel}
+              </p>
             </div>
           </div>
         </div>
       )}
-      <div className="player-bar">
+      <div className={`player-bar${isPlaying ? ' is-playing' : ''}`}>
         <div className="player-thumb-wrap" onClick={() => setExpanded(true)}>
           <img
             key={track.id}
@@ -4735,6 +4748,7 @@ function PlayerBar({
               </span>
               <span className="player-status-label">Playing on:</span>
               <span className="player-status-value" title={destinationLabel}>
+                <span className={`np-live-dot${isPlaying ? ' live' : ''}`} aria-hidden="true" />
                 <span className="player-destination-icon">{destinationIcon}</span>
                 <span className="player-destination-name">{destinationLabel}</span>
               </span>
@@ -4773,6 +4787,7 @@ function PlayerBar({
                     max="100"
                     value={displayVolume}
                     onChange={handleVolumeSliderChange}
+                    style={{ '--p': `${displayVolume}%` }}
                   />
                   <span>{displayVolume}%</span>
                 </div>
