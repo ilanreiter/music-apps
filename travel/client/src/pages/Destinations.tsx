@@ -126,14 +126,21 @@ export default function Destinations() {
             <Select
               value={d.status}
               onChange={(e) => setDestStatus(d.id, e.target.value as DestinationStatus)}
-              className="w-40"
+              className="!w-auto shrink-0"
             >
               {Object.keys(STATUS_TONE).map((s) => (
                 <option key={s} value={s}>{s}</option>
               ))}
             </Select>
             <Badge tone={STATUS_TONE[d.status]}>{d._count?.trips ?? 0} trip(s)</Badge>
-            <Button variant="secondary" onClick={() => startTrip(d)}>Plan trip</Button>
+            {(() => {
+              const activeTrip = d.trips?.find((t) => t.status !== "CANCELLED");
+              return activeTrip ? (
+                <Button variant="secondary" onClick={() => navigate(`/trips/${activeTrip.id}`)}>Continue planning</Button>
+              ) : (
+                <Button variant="secondary" onClick={() => startTrip(d)}>Plan trip</Button>
+              );
+            })()}
             <Button variant="danger" onClick={() => remove(d.id)}>Delete</Button>
           </Card>
         ))}

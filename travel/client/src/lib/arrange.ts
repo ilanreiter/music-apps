@@ -8,8 +8,8 @@ export interface Placement { id: string; planYear: number | null; planSeason: st
 /** Weighted violation score: a higher-ranked rule always outweighs every lower one. */
 function score(
   cards: { d: RoadmapDest; year: number }[], s: RoadmapSettings, pairings: Pairing[],
-  weight: Record<string, number>, suggested: Map<string, number>,
-) {
+  order: string[], disabled: string[], suggested: Map<string, number>,
+): number[] {
   const years = new Map<number, { d: RoadmapDest; year: number }[]>();
   for (const c of cards) years.set(c.year, [...(years.get(c.year) ?? []), c]);
   let far = 0, cap = 0;
@@ -33,7 +33,9 @@ function score(
   const gaps = seasonGaps(cards.map((c) => ({ year: c.year, season: c.d.planSeason })), s.startYear);
   let drift = 0;
   for (const c of cards) drift += Math.abs(c.year - (suggested.get(c.d.id) ?? c.year));
-  return weight.far * far + weight.cap * cap + weight.mobility * mobility + weight.season * season + weight.quarter * quarter + weight.gaps * gaps + weight.pair * pair + 0.01 * drift;
+  const vals: Record<string, number> = { far, cap, mobility, season, quarter, gaps, pair, rank: 0 };
+  // Lexicographic vector: rule 1's violations, then rule 2's, ... then drift from the plan.
+  return [...order.map((id) => (disabled.includes(id) ? 0 : vals[id] ?? 0)), drift];
 }
 
 /**
@@ -43,8 +45,6 @@ function score(
  */
 export function arrange(dests: RoadmapDest[], s: RoadmapSettings, pairings: Pairing[], ruleOrder: string[], disabled: string[] = []): Placement[] {
   const order = [...ruleOrder, ...DEFAULT_RULE_ORDER.filter((r) => !ruleOrder.includes(r))];
-  const weight: Record<string, number> = {};
-  order.forEach((id, i) => { weight[id] = disabled.includes(id) ? 0 : Math.pow(10, order.length - 1 - i); });
 
   const cards = dests.filter((d) => d.status !== "VISITED" && d.suggestedYear != null);
   const suggested = new Map(cards.map((d) => [d.id, d.suggestedYear!]));
@@ -65,14 +65,16 @@ export function arrange(dests: RoadmapDest[], s: RoadmapSettings, pairings: Pair
   const seasonOf = new Map(cards.map((d) => [d.id, d.pinned ? d.planSeason : d.suggestedSeason ?? d.planSeason]));
   const suggestedSeason = new Map(cards.map((d) => [d.id, d.suggestedSeason ?? d.planSeason]));
   const view = () => cards.map((d) => ({ d: { ...d, planSeason: d.pinned ? d.planSeason : seasonOf.get(d.id) ?? d.planSeason }, year: year.get(d.id)! }));
-  const total = () => score(view(), s, pairings, weight, suggested);
+  const total = () => score(view(), s, pairings, order, disabled, suggested);
+  // True when vector a is lexicographically smaller than b (higher-ranked rules always win).
+  const less = (a: number[], b: number[]) => { for (let i = 0; i < a.length; i++) { if (a[i] < b[i] - 1e-9) return true; if (a[i] > b[i] + 1e-9) return false; } return false; };
   const yearsRange = Array.from({ length: s.endYear - s.startYear + 1 }, (_, i) => s.startYear + i);
   const setUnit = (u: RoadmapDest[], y: number) => u.forEach((d) => year.set(d.id, y));
 
   let best = total();
   for (let iter = 0; iter < 150; iter++) {
     let move: (() => void) | null = null;
-    let bestScore = best - 1e-9;
+    let bestScore = best;
     for (const u of units) {
       const from = year.get(u[0].id)!;
       const fromSeason = seasonOf.get(u[0].id) ?? null;
@@ -83,14 +85,14 @@ export function arrange(dests: RoadmapDest[], s: RoadmapSettings, pairings: Pair
         setUnit(u, y); if (u.length === 1) seasonOf.set(u[0].id, sn);
         const sc = total();
         setUnit(u, from); if (u.length === 1) seasonOf.set(u[0].id, fromSeason);
-        if (sc < bestScore) { bestScore = sc; move = () => { setUnit(u, y); if (u.length === 1) seasonOf.set(u[0].id, sn); }; }
+        if (less(sc, bestScore)) { bestScore = sc; move = () => { setUnit(u, y); if (u.length === 1) seasonOf.set(u[0].id, sn); }; }
       }
     }
     for (let i = 0; i < units.length; i++) for (let j = i + 1; j < units.length; j++) {
       const a = units[i], b = units[j], ya = year.get(a[0].id)!, yb = year.get(b[0].id)!;
       if (ya === yb) continue;
       setUnit(a, yb); setUnit(b, ya); const sc = total(); setUnit(a, ya); setUnit(b, yb);
-      if (sc < bestScore) { bestScore = sc; move = () => { setUnit(a, yb); setUnit(b, ya); }; }
+      if (less(sc, bestScore)) { bestScore = sc; move = () => { setUnit(a, yb); setUnit(b, ya); }; }
     }
     if (!move) break;
     move(); best = bestScore;

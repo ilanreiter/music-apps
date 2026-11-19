@@ -20,7 +20,10 @@ const destinationSchema = z.object({
 router.get("/", async (_req, res) => {
   const destinations = await prisma.destination.findMany({
     orderBy: [{ priority: "asc" }, { createdAt: "desc" }],
-    include: { _count: { select: { trips: true } } },
+    include: {
+      _count: { select: { trips: true } },
+      trips: { select: { id: true, status: true }, orderBy: { createdAt: "desc" } },
+    },
   });
   res.json(destinations);
 });
