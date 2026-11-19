@@ -15,7 +15,7 @@ import { MiniMap, WorldMapDefs } from "../components/WorldMap";
 import { NumCell } from "./Budget";
 import { MOBILITY, RuleCheck, SEASONS, destCost, fmt, ruleChecks, summarize } from "../lib/roadmap";
 import { Flags } from "../components/Flags";
-import { arrange } from "../lib/arrange";
+import { arrange, arrangeDetailed, Placement } from "../lib/arrange";
 import { destMeta } from "../lib/destMeta";
 import { SEASON_META } from "../lib/seasons";
 
@@ -210,12 +210,48 @@ export default function Dashboard() {
     catch (e: any) { setError(e.message); }
   };
   const togglePin = async (d: RoadmapDest) => {
-    setDests((cur) => cur.map((x) => (x.id === d.id ? { ...x, pinned: !d.pinned } : x)));
-    try { await api.patch(`/roadmap/destinations/${d.id}`, { pinned: !d.pinned }); } catch (e: any) { setError(e.message); load(); }
+    const next = dests.map((x) => (x.id === d.id ? { ...x, pinned: !d.pinned } : x));
+    setDests(next);
+    try { await api.patch(`/roadmap/destinations/${d.id}`, { pinned: !d.pinned }); } catch (e: any) { setError(e.message); load(); return; }
+    if (data?.settings.autoOrder) await runAuto(next);
+  };
+  // Auto mode: search for the rule order with the fewest conflicts, save it and arrange the board.
+  const runAuto = async (cur: RoadmapDest[] = dests, disabled: string[] = data?.settings.ruleDisabled ?? [], settings = data?.settings) => {
+    if (!data || !settings) return;
+    setArranging(true); setNote("");
+    const started = Date.now();
+    const before = arrangeDetailed(cur, settings, data.pairings, settings.ruleOrder ?? [], disabled).conflicts;
+    const r: { order: string[]; placements: Placement[]; conflicts: number } = await new Promise((resolve) => {
+      const w = new Worker(new URL("../lib/auto.worker.ts", import.meta.url), { type: "module" });
+      w.onmessage = (e) => { resolve(e.data); w.terminate(); };
+      w.postMessage({ dests: cur, s: settings, pairings: data.pairings, start: settings.ruleOrder ?? [], disabled });
+    });
+    const wait = Math.max(0, 700 - (Date.now() - started));
+    if (wait) await new Promise((x) => setTimeout(x, wait));
+    setData((d) => (d ? { ...d, settings: { ...d.settings, ruleOrder: r.order } } : d));
+    try {
+      await api.patch("/roadmap/settings", { ruleOrder: r.order });
+      if (r.placements.length) {
+        const byId = new Map(r.placements.map((u) => [u.id, u]));
+        setDests((c) => c.map((d) => (byId.has(d.id) ? { ...d, ...byId.get(d.id)! } : d)));
+        await api.post("/roadmap/reorder", r.placements);
+      }
+    } catch (e: any) { setError(e.message); load(); }
+    setArranging(false);
+    setNote(`Auto order: ${r.conflicts} conflict${r.conflicts === 1 ? "" : "s"} (${before} with the previous order)`);
+    setTimeout(() => setNote(""), 6000);
+  };
+  const toggleAuto = async (on: boolean) => {
+    if (!data) return;
+    const settings = { ...data.settings, autoOrder: on };
+    setData({ ...data, settings });
+    try { await api.patch("/roadmap/settings", { autoOrder: on }); } catch (e: any) { setError(e.message); load(); return; }
+    if (on) await runAuto(dests, settings.ruleDisabled ?? [], settings);
   };
   // Re-arrange every unpinned card for the given rule order, immediately.
   const applyRules = async (ruleOrder: string[], disabled: string[] = data?.settings.ruleDisabled ?? []) => {
     if (!data) return;
+    if (data.settings.autoOrder) return runAuto(dests, disabled);
     setArranging(true); setNote("");
     // Let the spinner paint before the (synchronous) search runs, and keep it visible long enough to notice.
     await new Promise((r) => setTimeout(r, 60));
@@ -240,6 +276,7 @@ export default function Dashboard() {
     await applyRules(order, next);
   };
   const reorderRules = async (ids: string[]) => {
+    if (data?.settings.autoOrder) return;
     setData((cur) => (cur ? { ...cur, settings: { ...cur.settings, ruleOrder: ids } } : cur));
     try { await api.patch("/roadmap/settings", { ruleOrder: ids }); } catch (e: any) { setError(e.message); load(); return; }
     await applyRules(ids);
@@ -308,8 +345,16 @@ export default function Dashboard() {
                 <h2 className="font-semibold">Prioritization rules</h2>
                 <Link to="/budget" className="text-xs text-brand-600 hover:underline">Edit limits on Budget</Link>
               </div>
-              <p className="text-xs text-slate-500 mb-3">Drag the rules into the order that matters most — #1 wins conflicts. Unpinned cards re-arrange as soon as you drop.</p>
-              <RuleList checks={checks} onReorder={reorderRules} onToggle={toggleRule} />
+              <label className="flex items-center gap-2 mb-2 text-sm cursor-pointer w-fit">
+                <button type="button" role="switch" aria-checked={!!s.autoOrder} disabled={arranging} onClick={() => toggleAuto(!s.autoOrder)}
+                  className={`relative h-5 w-9 rounded-full transition-colors ${s.autoOrder ? "bg-brand-600" : "bg-slate-300 dark:bg-slate-600"}`}>
+                  <span className={`absolute top-0.5 h-4 w-4 rounded-full bg-white transition-all ${s.autoOrder ? "left-[18px]" : "left-0.5"}`} />
+                </button>
+                <span className="font-medium">Auto order</span>
+                <span className="text-xs text-slate-500">finds the rule order with the fewest conflicts</span>
+              </label>
+              <p className="text-xs text-slate-500 mb-3">{s.autoOrder ? "Auto order is on: the list shows the best order found and re-runs when you pin a card or switch a rule. Switch it off to drag rules yourself." : "Drag the rules into the order that matters most — #1 wins conflicts. Unpinned cards re-arrange as soon as you drop."}</p>
+              <RuleList checks={checks} locked={!!s.autoOrder} onReorder={reorderRules} onToggle={toggleRule} />
             </Card>
           </motion.div>
         )}
@@ -455,12 +500,12 @@ function RuleRow({ c, index, onToggle }: { c: RuleCheck; index: number; onToggle
   );
 }
 
-function RuleList({ checks, onReorder, onToggle }: { checks: RuleCheck[]; onReorder: (ids: string[]) => void; onToggle: (id: string, enabled: boolean) => void }) {
+function RuleList({ checks, locked, onReorder, onToggle }: { checks: RuleCheck[]; locked?: boolean; onReorder: (ids: string[]) => void; onToggle: (id: string, enabled: boolean) => void }) {
   const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 4 } }), useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }));
   const ids = checks.map((c) => c.id);
   return (
     <DndContext sensors={sensors} collisionDetection={closestCorners} onDragEnd={(e: DragEndEvent) => {
-      if (!e.over || e.active.id === e.over.id) return;
+      if (locked || !e.over || e.active.id === e.over.id) return;
       onReorder(arrayMove(ids, ids.indexOf(String(e.active.id)), ids.indexOf(String(e.over.id))));
     }}>
       <SortableContext items={ids} strategy={verticalListSortingStrategy}>

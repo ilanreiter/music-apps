@@ -158,7 +158,7 @@ export interface ProposedItinerary {
 
 export interface RoadmapSettings {
   startYear: number; endYear: number; annualCap: number; maxFarPerYear: number;
-  ageA: number | null; ageB: number | null; highMobilityUntil: number | null; ruleOrder: string[]; ruleDisabled: string[];
+  ageA: number | null; ageB: number | null; highMobilityUntil: number | null; ruleOrder: string[]; ruleDisabled: string[]; autoOrder: boolean;
 }
 export interface Pairing { id: string; name: string; year: number | null; quarter: string | null; savings: number }
 export interface RoadmapDest {

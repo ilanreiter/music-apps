@@ -272,4 +272,5 @@ model RoadmapSettings {
   highMobilityUntil   Int?
   ruleOrder           String[] @default([])
   ruleDisabled        String[] @default([])
+  autoOrder           Boolean @default(false)
 }

@@ -33,7 +33,7 @@ const settingsSchema = z.object({
   startYear: z.number().int(), endYear: z.number().int(), annualCap: z.number().nonnegative(),
   maxFarPerYear: z.number().int().nonnegative(), ageA: z.number().int().nullable(),
   ageB: z.number().int().nullable(), highMobilityUntil: z.number().int().nullable(),
-  ruleOrder: z.array(z.string()), ruleDisabled: z.array(z.string()),
+  ruleOrder: z.array(z.string()), ruleDisabled: z.array(z.string()), autoOrder: z.boolean(),
 }).partial();
 
 router.patch("/settings", async (req, res) => {

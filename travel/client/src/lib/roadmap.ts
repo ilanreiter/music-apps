@@ -88,6 +88,10 @@ export function summarize(data: { settings: RoadmapSettings; pairings: Pairing[]
       if (d.bestSeason && d.planSeason && d.bestSeason !== d.planSeason && d.secondSeason !== d.planSeason)
         warnings.push(`${d.name}: planned ${d.planSeason}, best in ${d.bestSeason}`);
     }
+    for (const d of on("best") ? dests : []) {
+      if (d.bestSeason && d.planSeason && d.planSeason !== d.bestSeason && d.secondSeason === d.planSeason)
+        warnings.push(`${d.name}: planned in 2nd-best ${d.planSeason}, best is ${d.bestSeason}`);
+    }
     for (const p of on("pair") ? pairings : []) {
       const members = dests.filter((d) => d.pairingId === p.id);
       const all = planned.filter((d) => d.pairingId === p.id);
@@ -116,6 +120,7 @@ export function ruleChecks(years: YearSummary[], s: RoadmapSettings, pairings: P
   const inv = difficultyInversions(placed.map((d) => ({ id: d.id, level: difficultyLevel(d.mobility), year: d.planYear! })));
   const mobBad = Math.max(late.length, inv.trips);
   const off = placed.filter((d) => d.planSeason && d.bestSeason && d.planSeason !== d.bestSeason && d.planSeason !== d.secondSeason);
+  const notBest = placed.filter((d) => d.planSeason && d.bestSeason && d.planSeason !== d.bestSeason).length;
   const split = pairings.filter((p) => new Set(placed.filter((d) => d.pairingId === p.id).map((d) => d.planYear)).size > 1);
   const cells = new Map<string, Set<string>>();
   for (const d of placed) {
@@ -131,6 +136,7 @@ export function ruleChecks(years: YearSummary[], s: RoadmapSettings, pairings: P
     { id: "cap", title: "Stay under the annual spend cap", detail: "Each year's total stays beneath the yearly ceiling.", status: overBad ? "warn" : "ok", result: n(overBad, overBad === 1 ? "year over" : "years over") },
     { id: "mobility", title: s.highMobilityUntil ? `Demanding trips first (through ${s.highMobilityUntil})` : "Demanding trips first", detail: "Harder trips (altitude, bush, self-drive) go earliest while energy is highest, easing off year by year toward rail and slow travel.", status: mobBad ? "warn" : "ok", result: n(mobBad, mobBad === 1 ? "trip out of difficulty order" : "trips out of difficulty order") },
     { id: "season", title: "Travel in the best or 2nd-best season", detail: "Escape New England winters; use shoulder seasons in Europe.", status: off.length ? "warn" : "ok", result: n(off.length, off.length === 1 ? "off-season trip" : "off-season trips") },
+    { id: "best", title: "Prefer the best season", detail: "Aim for each trip's best season; its 2nd-best season counts as a miss here (it is fine for the rule above).", status: notBest ? "warn" : "ok", result: n(notBest, notBest === 1 ? "trip not in its best season" : "trips not in their best season") },
     { id: "quarter", title: "One trip per season", detail: "No more than one departure in any season of a year; a pairing counts as one trip.", status: crowded ? "warn" : "ok", result: n(crowded, crowded === 1 ? "crowded season" : "crowded seasons") },
     { id: "gaps", title: "No empty seasons", detail: "Fill every season from the first year onward before leaving gaps; empty seasons after the last trip are fine.", status: gaps ? "warn" : "ok", result: n(gaps, gaps === 1 ? "empty season" : "empty seasons") },
     { id: "pair", title: "Keep regional pairings together", detail: "Paired destinations share one departure and save airfare.", status: split.length ? "warn" : "ok", result: n(split.length, split.length === 1 ? "pairing split" : "pairings split") },
