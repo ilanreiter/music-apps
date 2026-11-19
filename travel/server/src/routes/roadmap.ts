@@ -77,6 +77,40 @@ router.delete("/pairings/:id", async (req, res) => {
   res.status(204).end();
 });
 
+// Combine cards into one pairing (one departure). Reuses an existing pairing among them.
+router.post("/combine", async (req, res) => {
+  const parsed = z.object({ ids: z.array(z.string()).min(2), name: z.string().min(1) }).safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
+  const { ids, name } = parsed.data;
+  const rows = await prisma.destination.findMany({ where: { id: { in: ids } }, select: { id: true, planYear: true, pairingId: true } });
+  const old = [...new Set(rows.map((r) => r.pairingId).filter((x): x is string => !!x))];
+  const year = rows.find((r) => r.planYear != null)?.planYear ?? null;
+  const target = old[0] ?? (await prisma.pairing.create({ data: { name, year } })).id;
+  // Members of a merged pairing that were not in the selection come along too.
+  await prisma.destination.updateMany({ where: { OR: [{ id: { in: ids } }, { pairingId: { in: old } }] }, data: { pairingId: target } });
+  const gone = old.filter((p) => p !== target);
+  if (gone.length) await prisma.pairing.deleteMany({ where: { id: { in: gone } } });
+  res.json({ pairingId: target });
+});
+
+// Split cards apart: drop them from their pairing and move them to the given seasons.
+// The new season also becomes the card's "suggested" season so a reset keeps the split.
+router.post("/split", async (req, res) => {
+  const parsed = z.array(z.object({ id: z.string(), planSeason: z.string().nullable() })).safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
+  const ids = parsed.data.map((m) => m.id);
+  const before = await prisma.destination.findMany({ where: { id: { in: ids } }, select: { pairingId: true } });
+  await prisma.$transaction(parsed.data.map((m) => prisma.destination.update({
+    where: { id: m.id }, data: { pairingId: null, planSeason: m.planSeason, suggestedSeason: m.planSeason },
+  })));
+  const pids = [...new Set(before.map((b) => b.pairingId).filter((x): x is string => !!x))];
+  for (const p of pids) if ((await prisma.destination.count({ where: { pairingId: p } })) < 2) {
+    await prisma.destination.updateMany({ where: { pairingId: p }, data: { pairingId: null } });
+    await prisma.pairing.delete({ where: { id: p } });
+  }
+  res.json({ ok: true });
+});
+
 // Fill location / second season / weather for planned destinations that lack
 // them, and record the rules-based slot so drag-and-drop moves can be reset.
 router.post("/enrich", async (_req, res) => {

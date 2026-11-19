@@ -1,7 +1,7 @@
 import { Pairing, RoadmapDest, RoadmapSettings } from "../types";
 import { destCost, difficultyInversions, difficultyLevel, isHighMobility, seasonGaps, SEASONS } from "./roadmap";
 
-export const DEFAULT_RULE_ORDER = ["far", "cap", "mobility", "season", "best", "quarter", "gaps", "pair", "rank"];
+export const DEFAULT_RULE_ORDER = ["far", "cap", "mobility", "season", "quarter", "gaps", "pair", "rank"];
 
 export interface Placement { id: string; planYear: number | null; planSeason: string | null; priority: number }
 
@@ -25,7 +25,6 @@ function metrics(
   const inv = difficultyInversions(cards.map((c) => ({ id: c.d.id, level: difficultyLevel(c.d.mobility), year: c.year })));
   const mobility = cutoff + inv.pairs;
   const season = cards.filter((c) => c.d.planSeason && c.d.bestSeason && c.d.planSeason !== c.d.bestSeason && c.d.planSeason !== c.d.secondSeason).length;
-  const best = cards.filter((c) => c.d.planSeason && c.d.bestSeason && c.d.planSeason !== c.d.bestSeason).length;
   const pair = pairings.filter((p) => new Set(cards.filter((c) => c.d.pairingId === p.id).map((c) => c.year)).size > 1).length;
   const quarters = new Map<string, Set<string>>();
   for (const c of cards) {
@@ -36,9 +35,9 @@ function metrics(
   const gaps = seasonGaps(cards.map((c) => ({ year: c.year, season: c.d.planSeason })), s.startYear);
   let drift = 0;
   for (const c of cards) drift += Math.abs(c.year - (suggested.get(c.d.id) ?? c.year));
-  const vals: Record<string, number> = { far, cap, mobility, season, best, quarter, gaps, pair, rank: 0 };
+  const vals: Record<string, number> = { far, cap, mobility, season, quarter, gaps, pair, rank: 0 };
   const farYears = [...years.values()].filter((list) => new Set(list.filter((c) => c.d.isFar).map((c) => c.d.pairingId ?? c.d.id)).size > s.maxFarPerYear).length;
-  const plain: Record<string, number> = { far: farYears, cap: capYears, mobility: Math.max(cutoff, inv.trips), season, best, quarter, gaps, pair, rank: 0 };
+  const plain: Record<string, number> = { far: farYears, cap: capYears, mobility: Math.max(cutoff, inv.trips), season, quarter, gaps, pair, rank: 0 };
   return { vals, plain, drift };
 }
 

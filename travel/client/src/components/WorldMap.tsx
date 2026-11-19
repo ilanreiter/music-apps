@@ -47,11 +47,18 @@ export function WorldMapDefs() {
 
 const BIG = new Set(["United States of America", "China", "Australia", "Brazil"]);
 const VB_W = 62, VB_H = 88; // narrow and tall: a window onto the world around the pin
-export function MiniMap({ lat, lng, name, countries = [], states = [] }: { lat: number | null; lng: number | null; name: string; countries?: string[]; states?: string[] }) {
-  const pin = lat != null && lng != null ? project(lat, lng) : null;
+export function MiniMap({ lat, lng, name, countries = [], states = [], points }: { lat: number | null; lng: number | null; name: string; countries?: string[]; states?: string[]; points?: [number, number][] }) {
+  const pts = (points ?? []).map(([la, ln]) => project(la, ln));
+  const pin = pts.length ? [(Math.min(...pts.map((p) => p[0])) + Math.max(...pts.map((p) => p[0]))) / 2, (Math.min(...pts.map((p) => p[1])) + Math.max(...pts.map((p) => p[1]))) / 2]
+    : lat != null && lng != null ? project(lat, lng) : null;
   // Zoom in tight on small countries, stay wider for continent-sized ones.
   const big = countries.some((c) => BIG.has(c));
-  const zoom = big ? 1.4 : states.length ? 2.2 : 3;
+  let zoom = big ? 1.4 : states.length ? 2.2 : 3;
+  if (pts.length > 1) {
+    const sx = Math.max(...pts.map((p) => p[0])) - Math.min(...pts.map((p) => p[0])) + 22;
+    const sy = Math.max(...pts.map((p) => p[1])) - Math.min(...pts.map((p) => p[1])) + 22;
+    zoom = Math.max(1.2, Math.min(zoom, VB_W / sx, VB_H / sy));
+  }
   const w = VB_W / zoom, h = VB_H / zoom;
   const x0 = pin ? Math.max(0, Math.min(200 - w, pin[0] - w / 2)) : 73;
   const y0 = pin ? Math.max(-6, Math.min(82 - h, pin[1] - h / 2)) : -6;

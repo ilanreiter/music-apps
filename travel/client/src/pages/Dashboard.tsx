@@ -7,13 +7,13 @@ import {
 import { SortableContext, arrayMove, sortableKeyboardCoordinates, useSortable, verticalListSortingStrategy } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 import { AnimatePresence, motion } from "framer-motion";
-import { AlertTriangle, CheckCircle2, GripVertical, Loader2, CloudSun, Flag, Info, Pin, Plane, RotateCcw, ScrollText, Upload, Wallet, X } from "lucide-react";
+import { AlertTriangle, CheckCircle2, GripVertical, Link2, Loader2, CloudSun, Flag, Info, Pin, Plane, RotateCcw, ScrollText, Unlink, Upload, Wallet, X } from "lucide-react";
 import { api } from "../lib/api";
 import { RoadmapData, RoadmapDest, RoadmapSettings } from "../types";
 import { Button, Card, Select, Skeleton } from "../components/ui";
 import { MiniMap, WorldMapDefs } from "../components/WorldMap";
 import { NumCell } from "./Budget";
-import { MOBILITY, RuleCheck, SEASONS, destCost, fmt, ruleChecks, summarize } from "../lib/roadmap";
+import { MOBILITY, RuleCheck, SEASONS, cardConflicts, destCost, emptySlots, fmt, ruleChecks, summarize } from "../lib/roadmap";
 import { Flags } from "../components/Flags";
 import { arrange, arrangeDetailed, Placement } from "../lib/arrange";
 import { destMeta } from "../lib/destMeta";
@@ -33,7 +33,7 @@ function SeasonLabel({ season }: { season: string | null }) {
 
 const difficultyLevel = (m: string | null) => Math.max(0, MOBILITY.indexOf(m ?? "")) + (m ? 1 : 0);
 
-function Card_({ d, rank, cellSeason, overlay, onPin }: { d: RoadmapDest; rank: number; cellSeason: string | null; overlay?: boolean; onPin?: () => void }) {
+function Card_({ d, rank, cellSeason, overlay, onPin, conflicts }: { d: RoadmapDest; rank: number; cellSeason: string | null; overlay?: boolean; onPin?: () => void; conflicts?: string[] }) {
   const lvl = difficultyLevel(d.mobility);
   const off = cellSeason && d.bestSeason && cellSeason !== d.bestSeason && cellSeason !== d.secondSeason;
   const weather = !cellSeason || cellSeason === d.bestSeason ? d.weather : cellSeason === d.secondSeason ? d.weatherAlt : null;
@@ -50,6 +50,12 @@ function Card_({ d, rank, cellSeason, overlay, onPin }: { d: RoadmapDest; rank: 
           <span className="font-semibold text-base leading-tight">{d.name}</span>
         </div>
         <div className="flex items-center gap-1.5 shrink-0 text-slate-400">
+          {!!conflicts?.length && (
+            <span title={conflicts.join("\n")} className="flex items-center gap-0.5 rounded-full bg-red-50 dark:bg-red-950/50 px-1.5 py-0.5 text-red-600 font-medium">
+              <AlertTriangle className="h-3 w-3" />{conflicts.length}
+            </span>
+          )}
+          {d.pairingId && <span title="Combined with other cards into one trip" className="text-brand-600"><Link2 className="h-3.5 w-3.5" /></span>}
           {isMoved(d) && !d.pinned && <span title="Moved from the suggested slot" className="h-2 w-2 rounded-full bg-amber-500" />}
           <span className="tabular-nums">#{rank}</span>
           {onPin && (
@@ -90,30 +96,133 @@ function Card_({ d, rank, cellSeason, overlay, onPin }: { d: RoadmapDest; rank: 
   );
 }
 
-function SortableCard({ d, rank, cellSeason, onOpen, onPin }: { d: RoadmapDest; rank: number; cellSeason: string | null; onOpen: () => void; onPin: () => void }) {
-  const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({ id: d.id, disabled: d.pinned });
+/** Several combined destinations shown as ONE card: totals are summed, one frame, one move. */
+function GroupCard({ members, name, overlay, onPin, onSplit, onOpenMember, conflicts }: {
+  members: RoadmapDest[]; name: string; overlay?: boolean; onPin?: () => void; onSplit?: () => void; onOpenMember?: (d: RoadmapDest) => void; conflicts?: string[];
+}) {
+  const lead = members[0];
+  const metas = members.map((m) => destMeta(m.name));
+  const days = members.reduce((t, m) => t + (m.days ?? 0), 0);
+  const total = members.reduce((t, m) => t + destCost(m), 0);
+  const level = Math.max(...members.map((m) => difficultyLevel(m.mobility)));
+  const hardest = members.find((m) => difficultyLevel(m.mobility) === level)?.mobility ?? null;
+  const pinned = members.some((m) => m.pinned);
+  const points = members.filter((m) => m.lat != null && m.lng != null).map((m) => [m.lat!, m.lng!] as [number, number]);
+  const frame = lead.bestSeason && SEASON_META[lead.bestSeason] ? SEASON_META[lead.bestSeason].color : undefined;
   return (
-    <div ref={setNodeRef} style={{ transform: CSS.Transform.toString(transform), transition, opacity: isDragging ? 0.35 : 1 }}
-      className={`${d.pinned ? "cursor-pointer" : "cursor-grab active:cursor-grabbing"} touch-none`} onClick={onOpen} {...attributes} {...listeners}>
-      <Card_ d={d} rank={rank} cellSeason={cellSeason} onPin={onPin} />
+    <div style={frame ? { borderColor: frame } : undefined}
+      className={`rounded-lg border-2 bg-white dark:bg-slate-900 p-3 text-xs shadow-sm select-none ${frame ? "" : "border-slate-200 dark:border-slate-700"} ${
+        overlay ? "shadow-xl rotate-1" : pinned ? "ring-2 ring-offset-1 ring-brand-400/60 dark:ring-offset-slate-900" : ""}`}>
+      <div className="flex items-start justify-between gap-2">
+        <div className="flex items-center gap-2 min-w-0">
+          <Flags codes={metas.flatMap((m) => m.flags ?? [])} fallback={metas[0].icon} />
+          <span className="font-semibold text-base leading-tight">{name}</span>
+        </div>
+        <div className="flex items-center gap-1.5 shrink-0 text-slate-400">
+          {!!conflicts?.length && (
+            <span title={conflicts.join("\n")} className="flex items-center gap-0.5 rounded-full bg-red-50 dark:bg-red-950/50 px-1.5 py-0.5 text-red-600 font-medium">
+              <AlertTriangle className="h-3 w-3" />{conflicts.length}
+            </span>
+          )}
+          {onSplit && (
+            <button type="button" onPointerDown={(e) => e.stopPropagation()} onClick={(e) => { e.stopPropagation(); onSplit(); }}
+              title="Split back into separate cards" className="rounded p-0.5 text-brand-600 hover:bg-slate-100 dark:hover:bg-slate-800"><Unlink className="h-3.5 w-3.5" /></button>
+          )}
+          {onPin && (
+            <button type="button" onPointerDown={(e) => e.stopPropagation()} onClick={(e) => { e.stopPropagation(); onPin(); }}
+              title={pinned ? "Unpin (allow moving and resetting)" : "Pin in place"} aria-pressed={pinned}
+              className={`rounded p-0.5 hover:bg-slate-100 dark:hover:bg-slate-800 ${pinned ? "text-brand-600" : ""}`}>
+              <Pin className={`h-3.5 w-3.5 ${pinned ? "fill-current" : ""}`} />
+            </button>
+          )}
+        </div>
+      </div>
+      <div className="mt-0.5 text-slate-500 leading-tight">{members.map((m) => m.name).join(" + ")}</div>
+      <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-slate-600 dark:text-slate-300">
+        <span>Best <SeasonLabel season={lead.bestSeason} /></span>
+        <span className="text-slate-500">2nd <SeasonLabel season={lead.secondSeason} /></span>
+        {members.some((m) => m.isFar) && <Plane className="h-3.5 w-3.5 text-slate-400" aria-label="Long-haul" />}
+      </div>
+      <div className="mt-2 -mr-3 grid grid-cols-[1fr_50%] gap-2">
+        <div className="min-w-0 flex flex-col gap-1.5">
+          <dl className="rounded-md bg-slate-50 dark:bg-slate-800/60 px-2 py-1.5 space-y-0.5 tabular-nums">
+            <div className="flex justify-between"><dt className="text-slate-500">Ideal</dt><dd className="font-semibold">{days} days</dd></div>
+            <div className="flex justify-between"><dt className="text-slate-500">Per day</dt><dd className="font-semibold">{days ? fmt(total / days) : "—"}</dd></div>
+            <div className="flex justify-between"><dt className="text-slate-500">Total</dt><dd className="font-semibold">{fmt(total)}</dd></div>
+          </dl>
+          <span className="block text-slate-500"><Flag className="inline h-3 w-3 mr-1 -mt-0.5" />Difficulty: <b className="text-slate-700 dark:text-slate-200 font-medium">{hardest ?? "—"}</b></span>
+        </div>
+        <div className="relative min-h-[5.5rem]">
+          <MiniMap lat={lead.lat} lng={lead.lng} name={name} countries={metas.flatMap((m) => m.countries)} states={metas.flatMap((m) => m.states ?? [])} points={points} />
+        </div>
+      </div>
+      <ul className="mt-2 space-y-1">
+        {members.map((m, i) => (
+          <li key={m.id} onClick={(e) => { if (onOpenMember) { e.stopPropagation(); onOpenMember(m); } }}
+            className="flex items-start gap-1.5 text-slate-500 cursor-pointer hover:text-slate-700 dark:hover:text-slate-200">
+            <Flags codes={metas[i].flags} fallback={metas[i].icon} />
+            <span className="min-w-0"><b className="font-medium text-slate-700 dark:text-slate-200">{m.name}</b> · {m.days ?? "—"} days · {m.weather ?? "—"}</span>
+          </li>
+        ))}
+      </ul>
     </div>
   );
 }
 
-function Cell({ id, items, ranks, season, onOpen, onPin, wide, tint }: {
+function SortableCard({ d, rank, cellSeason, onOpen, onPin, conflicts, members, groupName, onSplit, onOpenMember }: { d: RoadmapDest; rank: number; cellSeason: string | null; onOpen: () => void; onPin: () => void; conflicts?: string[]; members?: RoadmapDest[]; groupName?: string; onSplit?: () => void; onOpenMember?: (d: RoadmapDest) => void }) {
+  const pinned = members ? members.some((m) => m.pinned) : d.pinned;
+  const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({ id: d.id, disabled: pinned });
+  return (
+    <div ref={setNodeRef} style={{ transform: CSS.Transform.toString(transform), transition, opacity: isDragging ? 0.35 : 1 }}
+      className={`${pinned ? "cursor-pointer" : "cursor-grab active:cursor-grabbing"} touch-none`} onClick={onOpen} {...attributes} {...listeners}>
+      {members ? <GroupCard members={members} name={groupName ?? members.map((m) => m.name).join(" + ")} onPin={onPin} onSplit={onSplit} onOpenMember={onOpenMember} conflicts={conflicts} />
+        : <Card_ d={d} rank={rank} cellSeason={cellSeason} onPin={onPin} conflicts={conflicts} />}
+    </div>
+  );
+}
+
+function Cell({ id, items, ranks, season, onOpen, onPin, wide, tint, conflicts, empty, onCombine, onSplit, onPinGroup, pairingName }: {
+  conflicts?: Map<string, string[]>; empty?: boolean; onCombine?: (items: RoadmapDest[]) => void; onSplit?: (items: RoadmapDest[]) => void; onPinGroup?: (items: RoadmapDest[]) => void; pairingName?: (id: string) => string | undefined;
   id: string; items: RoadmapDest[]; ranks: Map<string, number>; season: string | null; onOpen: (d: RoadmapDest) => void; onPin: (d: RoadmapDest) => void; wide?: boolean; tint?: string;
 }) {
   const { setNodeRef, isOver } = useDroppable({ id: `cell:${id}` });
+  // Combined cards (same pairing, same cell) collapse into one entry.
+  const entries: RoadmapDest[][] = [];
+  for (const d of items) {
+    const g = d.pairingId ? entries.find((e) => e[0].pairingId === d.pairingId) : undefined;
+    if (g) g.push(d); else entries.push([d]);
+  }
   return (
     <div ref={setNodeRef} style={{ background: isOver ? undefined : tint }}
       className={`min-h-[7rem] rounded-lg p-2 transition-colors border border-dashed ${
-        isOver ? "bg-brand-50 dark:bg-brand-900/30 border-brand-400" : "border-slate-200 dark:border-slate-800"}`}>
-      <SortableContext items={items.map((d) => d.id)} strategy={verticalListSortingStrategy}>
+        isOver ? "bg-brand-50 dark:bg-brand-900/30 border-brand-400" : empty ? "border-red-300 dark:border-red-900 bg-red-50/60 dark:bg-red-950/20" : "border-slate-200 dark:border-slate-800"}`}>
+      {entries.length >= 2 && onCombine && onSplit && (
+        <div className="mb-2 flex items-center justify-end gap-1.5 text-[11px]">
+          {(
+
+            <button type="button" onClick={() => onCombine(items)} title="Combine these cards into one trip (one departure)"
+              className="flex items-center gap-1 rounded-md border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 px-2 py-0.5 text-slate-600 dark:text-slate-300 hover:border-brand-400 hover:text-brand-600">
+              <Link2 className="h-3 w-3" />Combine
+            </button>
+          )}
+          <button type="button" onClick={() => onSplit(items)} title="Separate these cards into different seasons of the year"
+            className="flex items-center gap-1 rounded-md border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 px-2 py-0.5 text-slate-600 dark:text-slate-300 hover:border-brand-400 hover:text-brand-600">
+            <Unlink className="h-3 w-3" />Split
+          </button>
+        </div>
+      )}
+      <SortableContext items={entries.map((e) => e[0].id)} strategy={verticalListSortingStrategy}>
         <div className={wide ? "grid gap-2 grid-cols-[repeat(auto-fill,minmax(275px,1fr))]" : "space-y-2"}>
-          {items.map((d) => <SortableCard key={d.id} d={d} rank={ranks.get(d.id) ?? 0} cellSeason={season} onOpen={() => onOpen(d)} onPin={() => onPin(d)} />)}
+          {entries.map((e) => e.length > 1 ? (
+            <SortableCard key={e[0].id} d={e[0]} rank={ranks.get(e[0].id) ?? 0} cellSeason={season} members={e} groupName={pairingName?.(e[0].pairingId!)}
+              conflicts={[...new Set(e.flatMap((m) => conflicts?.get(m.id) ?? []))]} onOpen={() => onOpen(e[0])} onPin={() => onPinGroup?.(e)}
+              onSplit={() => onSplit?.(e)} onOpenMember={onOpen} />
+          ) : (
+            <SortableCard key={e[0].id} d={e[0]} rank={ranks.get(e[0].id) ?? 0} cellSeason={season} onOpen={() => onOpen(e[0])} onPin={() => onPin(e[0])} conflicts={conflicts?.get(e[0].id)} />
+          ))}
         </div>
       </SortableContext>
-      {items.length === 0 && <div className="h-full min-h-[5rem] flex items-center justify-center text-xs text-slate-400">Drop here</div>}
+      {items.length === 0 && <div className={`h-full min-h-[5rem] flex items-center justify-center text-xs ${empty ? "text-red-500 font-medium" : "text-slate-400"}`}>{empty ? "Empty season" : "Drop here"}</div>}
     </div>
   );
 }
@@ -167,10 +276,14 @@ export default function Dashboard() {
     if (!over) return;
     const a = dests.find((d) => d.id === active.id);
     if (!a) return;
+    // A combined card moves as one: every member of its pairing in this cell.
+    const unit = a.pairingId ? dests.filter((d) => d.pairingId === a.pairingId && keyOf(d) === keyOf(a)) : [a];
+    const unitIds = new Set(unit.map((d) => d.id));
     const overId = String(over.id);
+    if (unitIds.has(overId)) return;
     let tkey: string;
     let idx: number;
-    const sameKey = (k: string) => (cells.get(k) ?? []).filter((d) => d.id !== a.id);
+    const sameKey = (k: string) => (cells.get(k) ?? []).filter((d) => !unitIds.has(d.id));
     if (overId.startsWith("cell:")) {
       tkey = overId.slice(5);
       idx = sameKey(tkey).length;
@@ -185,7 +298,7 @@ export default function Dashboard() {
       idx = movingDown ? oi + 1 : oi;
     }
     const order = sameKey(tkey);
-    order.splice(idx, 0, a);
+    order.splice(idx, 0, ...unit);
     // Re-deal the cell's existing priority values in the new order, so the
     // global ranking of every other card is untouched.
     const pool = order.map((d) => d.priority).sort((x, y) => x - y);
@@ -268,6 +381,44 @@ export default function Dashboard() {
     setNote(updates.length ? `Rearranged ${updates.length} card${updates.length === 1 ? "" : "s"}` : "No cards needed to move for this order");
     setTimeout(() => setNote(""), 4000);
   };
+  const pairingName = (id: string) => data?.pairings.find((p) => p.id === id)?.name;
+  const pinGroup = async (members: RoadmapDest[]) => {
+    const value = !members.every((m) => m.pinned);
+    const ids = new Set(members.map((m) => m.id));
+    const next = dests.map((x) => (ids.has(x.id) ? { ...x, pinned: value } : x));
+    setDests(next);
+    try { await Promise.all(members.map((m) => api.patch(`/roadmap/destinations/${m.id}`, { pinned: value }))); } catch (e: any) { setError(e.message); load(); return; }
+    if (data?.settings.autoOrder) await runAuto(next);
+  };
+  const combine = async (items: RoadmapDest[]) => {
+    setNote("");
+    try {
+      await api.post("/roadmap/combine", { ids: items.map((d) => d.id), name: items.map((d) => d.name.split(/[ (]/)[0]).join(" + ") });
+      await load(); setNote(`Combined ${items.length} cards into one trip`);
+    } catch (e: any) { setError(e.message); }
+    setTimeout(() => setNote(""), 4000);
+  };
+  // Un-combine and spread the cards over different seasons of the same year.
+  const split = async (items: RoadmapDest[]) => {
+    setNote("");
+    const year = items[0].planYear;
+    const ids = new Set(items.map((d) => d.id));
+    const taken = new Set(dests.filter((d) => d.planYear === year && !ids.has(d.id) && d.planSeason).map((d) => d.planSeason!));
+    const moves: { id: string; planSeason: string | null }[] = [];
+    let stuck = 0;
+    for (const d of items) {
+      const options = [d.planSeason, d.bestSeason, d.secondSeason, ...SEASONS].filter((x): x is string => !!x);
+      const pick = options.find((x) => !taken.has(x));
+      if (pick) taken.add(pick); else stuck++;
+      moves.push({ id: d.id, planSeason: pick ?? d.planSeason });
+    }
+    try {
+      await api.post("/roadmap/split", moves);
+      await load();
+      setNote(stuck ? `Split, but ${stuck} card${stuck === 1 ? "" : "s"} stay${stuck === 1 ? "s" : ""} here: every season of ${year} is taken` : `Split ${items.length} cards into separate seasons`);
+    } catch (e: any) { setError(e.message); }
+    setTimeout(() => setNote(""), 5000);
+  };
   const toggleRule = async (id: string, enabled: boolean) => {
     const cur = data?.settings.ruleDisabled ?? [];
     const next = enabled ? cur.filter((x) => x !== id) : [...new Set([...cur, id])];
@@ -291,6 +442,9 @@ export default function Dashboard() {
 
   const s = data.settings;
   const years = summarize({ settings: s, pairings: data.pairings, destinations: dests });
+  const conflicts = cardConflicts(dests, s, data.pairings);
+  const empties = emptySlots(dests, s);
+  const gapOn = !(s.ruleDisabled ?? []).includes("gaps");
   const movedCount = dests.filter((d) => isMoved(d) && !d.pinned).length;
   const pinnedCount = dests.filter((d) => d.pinned).length;
   const order = s.ruleOrder ?? [];
@@ -387,7 +541,7 @@ export default function Dashboard() {
               <React.Fragment key={y.year}>
                 <RowHeader y={y} s={s} />
                 {SEASONS.map((sn) => (
-                  <Cell key={sn} id={`${y.year}|${sn}`} items={cells.get(`${y.year}|${sn}`) ?? []} ranks={ranks} season={sn}
+                  <Cell key={sn} id={`${y.year}|${sn}`} items={cells.get(`${y.year}|${sn}`) ?? []} ranks={ranks} season={sn} conflicts={conflicts} onCombine={combine} onSplit={split} onPinGroup={pinGroup} pairingName={pairingName} empty={gapOn && empties.has(`${y.year}|${sn}`)}
                     onOpen={(d) => setSelected(d.id)} onPin={togglePin} tint={`color-mix(in srgb, ${SEASON_META[sn].color} 6%, transparent)`} />
                 ))}
               </React.Fragment>
@@ -399,7 +553,9 @@ export default function Dashboard() {
           </div>
         </div>
         <DragOverlay dropAnimation={{ duration: 180 }}>
-          {dragging && <div className="w-[275px]"><Card_ d={dragging} rank={ranks.get(dragging.id) ?? 0} cellSeason={null} overlay /></div>}
+          {dragging && <div className="w-[275px]">{dragging.pairingId && dests.filter((d) => d.pairingId === dragging.pairingId && keyOf(d) === keyOf(dragging)).length > 1
+            ? <GroupCard members={dests.filter((d) => d.pairingId === dragging.pairingId && keyOf(d) === keyOf(dragging))} name={pairingName(dragging.pairingId) ?? dragging.name} overlay />
+            : <Card_ d={dragging} rank={ranks.get(dragging.id) ?? 0} cellSeason={null} overlay />}</div>}
         </DragOverlay>
       </DndContext>
 
@@ -414,10 +570,10 @@ function RowHeader({ y, s }: { y: ReturnType<typeof summarize>[number]; s: Roadm
   const over = y.spend > s.annualCap;
   const pct = Math.min(100, (y.spend / s.annualCap) * 100);
   return (
-    <div className="rounded-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-3 text-xs self-start sticky left-0">
+    <div className={`rounded-lg bg-white dark:bg-slate-900 border p-3 text-xs self-start sticky left-0 ${y.warnings.length ? "border-red-300 dark:border-red-900 ring-1 ring-red-300/60 dark:ring-red-900/60" : "border-slate-200 dark:border-slate-800"}`}>
       <div className="flex items-baseline justify-between">
         <span className="text-lg font-display font-semibold">{y.year}</span>
-        {y.warnings.length > 0 && <span title={y.warnings.join("\n")} className="flex items-center gap-0.5 text-amber-600"><AlertTriangle className="h-3.5 w-3.5" />{y.warnings.length}</span>}
+        {y.warnings.length > 0 && <span title={y.warnings.join("\n")} className="flex items-center gap-0.5 rounded-full bg-red-50 dark:bg-red-950/50 px-1.5 py-0.5 text-red-600 font-medium"><AlertTriangle className="h-3.5 w-3.5" />{y.warnings.length}</span>}
       </div>
       <div className="text-slate-400 mb-2">{y.ageA != null ? `Ages ${y.ageA} & ${y.ageB}` : ""}</div>
       <dl className="space-y-0.5 tabular-nums">
