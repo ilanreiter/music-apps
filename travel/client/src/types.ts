@@ -63,6 +63,18 @@ export interface TripItem {
   sortOrder: number;
   notes?: string | null;
   userNotes?: string | null;
+  freeCancelUntil?: string | null;
+  paid?: boolean;
+}
+
+export interface ChecklistItem {
+  id: string;
+  tripId: string;
+  text: string;
+  category?: string | null;
+  dueDate?: string | null;
+  done: boolean;
+  sortOrder: number;
 }
 
 export interface BudgetLine {
@@ -103,6 +115,7 @@ export interface Trip {
   items: TripItem[];
   budgetLines: BudgetLine[];
   resources: Resource[];
+  checklist?: ChecklistItem[];
   _count?: { items: number };
 }
 

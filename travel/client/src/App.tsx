@@ -6,10 +6,7 @@ import Layout from "./components/Layout";
 import Login from "./pages/Login";
 import Dashboard from "./pages/Dashboard";
 import Budget from "./pages/Budget";
-import Destinations from "./pages/Destinations";
-import Trips from "./pages/Trips";
 import TripDetail from "./pages/TripDetail";
-import Finances from "./pages/Finances";
 import BookingAgents from "./pages/BookingAgents";
 import Resources from "./pages/Resources";
 import Assistant from "./pages/Assistant";
@@ -37,11 +34,12 @@ function AppRoutes() {
       >
         <Route index element={<Dashboard />} />
         <Route path="budget" element={<Budget />} />
-        <Route path="destinations" element={<Destinations />} />
-        <Route path="trips" element={<Trips />} />
+        {/* Removed tabs: old links land on the Dashboard. Trip detail pages are still opened from a card. */}
+        <Route path="destinations" element={<Navigate to="/" replace />} />
+        <Route path="trips" element={<Navigate to="/" replace />} />
         <Route path="trips/:id" element={<TripDetail />} />
         <Route path="travelers" element={<Travelers />} />
-        <Route path="finances" element={<Finances />} />
+        <Route path="finances" element={<Navigate to="/budget" replace />} />
         <Route path="booking-agents" element={<BookingAgents />} />
         <Route path="resources" element={<Resources />} />
         <Route path="assistant" element={<Assistant />} />

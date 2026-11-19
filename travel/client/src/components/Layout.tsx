@@ -3,16 +3,13 @@ import { NavLink, Outlet } from "react-router-dom";
 import { useAuth } from "../lib/AuthContext";
 import { useTheme } from "../lib/ThemeContext";
 import { motion } from "framer-motion";
-import { Bot, BookOpen, LayoutGrid, PiggyBank, Handshake, MapPinned, Settings, Users, Wallet, Luggage } from "lucide-react";
+import { Bot, BookOpen, LayoutGrid, PiggyBank, Handshake, Settings, Users } from "lucide-react";
 import { CompassIcon, MoonIcon, SunIcon } from "./icons";
 
 const navItems = [
   { to: "/", label: "Dashboard", end: true, Icon: LayoutGrid },
   { to: "/budget", label: "Budget", Icon: PiggyBank },
-  { to: "/destinations", label: "Destinations", Icon: MapPinned },
-  { to: "/trips", label: "Trips", Icon: Luggage },
   { to: "/travelers", label: "Travelers", Icon: Users },
-  { to: "/finances", label: "Finances", Icon: Wallet },
   { to: "/booking-agents", label: "Booking Agents", Icon: Handshake },
   { to: "/resources", label: "Resources", Icon: BookOpen },
   { to: "/assistant", label: "AI Assistant", Icon: Bot },

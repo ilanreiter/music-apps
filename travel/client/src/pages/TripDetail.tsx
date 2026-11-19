@@ -1,17 +1,24 @@
 import React, { useEffect, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import { api } from "../lib/api";
-import { BookingAgent, BookingStatus, BudgetLine, Conflict, Trip, TripItem, TripItemType } from "../types";
+import { BookingAgent, BookingStatus, BudgetLine, Conflict, RoadmapData, RoadmapDest, Trip, TripItem, TripItemType } from "../types";
 import { Badge, BadgeSelect, Button, Card, Input, Label, PageHeader, Select, Textarea } from "../components/ui";
 import TripSetup from "../components/TripSetup";
+import OverviewTab, { PlanTab } from "../components/trip/OverviewTab";
+import ScheduleTab from "../components/trip/ScheduleTab";
+import BookingsTab from "../components/trip/BookingsTab";
+import ChecklistTab from "../components/trip/ChecklistTab";
+import PlacesImport from "../components/trip/PlacesImport";
+import { WorldMapDefs } from "../components/WorldMap";
+import { Card_, GroupCard } from "./Dashboard";
 import { AlertTriangleIcon } from "../components/icons";
 import type { MapPoint } from "../components/RouteMap";
 import { colorForDay } from "../lib/dayColors";
 
 const RouteMap = React.lazy(() => import("../components/RouteMap"));
 
-const TABS = ["Itinerary", "Route", "Budget", "Resources"] as const;
-type Tab = (typeof TABS)[number];
+const TABS: PlanTab[] = ["Overview", "Itinerary", "Schedule", "Bookings", "Checklist", "Route", "Budget", "Resources"];
+type Tab = PlanTab;
 
 const BOOKING_TONE: Record<BookingStatus, string> = {
   IDEA: "slate",
@@ -85,8 +92,9 @@ export default function TripDetail() {
   const [trip, setTrip] = useState<Trip | null>(null);
   const [conflicts, setConflicts] = useState<Conflict[]>([]);
   const [agents, setAgents] = useState<BookingAgent[]>([]);
-  const [tab, setTab] = useState<Tab>("Itinerary");
+  const [tab, setTab] = useState<Tab>("Overview");
   const [showItemForm, setShowItemForm] = useState(false);
+  const [roadmap, setRoadmap] = useState<RoadmapData | null>(null);
 
   function load() {
     if (!id) return;
@@ -97,16 +105,24 @@ export default function TripDetail() {
   useEffect(() => {
     load();
     api.get<BookingAgent[]>("/booking-agents").then(setAgents).catch(() => {});
+    api.get<RoadmapData>("/roadmap").then(setRoadmap).catch(() => {});
   }, [id]);
 
   async function deleteTrip() {
     if (!trip) return;
     if (!confirm(`Delete "${trip.title}"? This permanently removes the trip and all its itinerary items, budget lines, and resources. This cannot be undone.`)) return;
     await api.delete(`/trips/${trip.id}`);
-    navigate("/trips");
+    navigate("/");
   }
 
   if (!trip) return <p className="text-sm text-slate-500">Loading…</p>;
+
+  // The destination's card from the dashboard (flag, map, seasons, duration, cost, difficulty, weather) — plus any trips combined with it.
+  const planned: RoadmapDest | undefined = roadmap?.destinations.find((x) => x.id === trip.destinationId);
+  const mates = planned?.pairingId ? roadmap!.destinations.filter((x) => x.pairingId === planned.pairingId && x.status !== "VISITED") : planned ? [planned] : [];
+  const rank = planned && roadmap ? [...roadmap.destinations].sort((a, b) => a.priority - b.priority).findIndex((x) => x.id === planned.id) + 1 : 0;
+  const pairingName = planned?.pairingId ? roadmap?.pairings.find((p) => p.id === planned.pairingId)?.name : undefined;
+
 
   return (
     <div>
@@ -116,6 +132,17 @@ export default function TripDetail() {
         actions={<Button variant="danger" onClick={deleteTrip}>Delete trip</Button>}
       />
 
+      <div className={planned ? "grid grid-cols-1 gap-4 lg:grid-cols-[minmax(320px,440px)_1fr] mb-2 items-start" : ""}>
+      {planned && (
+        <div>
+          <WorldMapDefs />
+          {mates.length > 1
+            ? <GroupCard members={mates} name={pairingName ?? mates.map((m) => m.name).join(" + ")} />
+            : <Card_ d={planned} rank={rank} cellSeason={planned.planSeason} />}
+          {planned.planYear && <p className="mt-1.5 text-xs text-slate-500">Planned for {planned.planSeason ?? "—"} {planned.planYear}</p>}
+        </div>
+      )}
+      <div>
       {conflicts.length > 0 && (
         <Card className="p-4 mb-4 border-red-300 dark:border-red-800 bg-red-50 dark:bg-red-950/40">
           <div className="font-medium text-red-700 dark:text-red-300 mb-1 text-sm flex items-center gap-1.5">
@@ -127,7 +154,9 @@ export default function TripDetail() {
         </Card>
       )}
 
-      <TripSetup trip={trip} reload={load} />
+      {(tab === "Overview" || tab === "Itinerary") && <TripSetup trip={trip} reload={load} />}
+      </div>
+      </div>
 
       <div className="flex gap-1 border-b border-slate-200 dark:border-slate-800 mb-6">
         {TABS.map((t) => (
@@ -145,6 +174,10 @@ export default function TripDetail() {
         ))}
       </div>
 
+      {tab === "Overview" && <OverviewTab trip={trip} goTo={setTab} />}
+      {tab === "Schedule" && <ScheduleTab trip={trip} conflicts={conflicts} />}
+      {tab === "Bookings" && <BookingsTab trip={trip} agents={agents} reload={load} />}
+      {tab === "Checklist" && <ChecklistTab trip={trip} reload={load} />}
       {tab === "Itinerary" && (
         <ItineraryTab trip={trip} agents={agents} reload={load} showForm={showItemForm} setShowForm={setShowItemForm} />
       )}
@@ -363,6 +396,7 @@ function ItineraryTab({
 
   return (
     <div>
+      <PlacesImport trip={trip} reload={reload} />
       <div className="flex justify-end mb-4">
         <Button onClick={() => setShowForm(!showForm)}>{showForm ? "Cancel" : "+ Add item"}</Button>
       </div>

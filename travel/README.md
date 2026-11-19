@@ -33,7 +33,7 @@ database schema is created for you on first boot.
 
 ### Enabling the AI assistant
 
-The AI Assistant page and the "rough cost estimator" on the Finances page
+The AI Assistant page and the AI estimates on the Dashboard (Add destination, per-card estimate)
 both call the Claude API. Set `ANTHROPIC_API_KEY` in `.env` (get one at
 https://console.anthropic.com/) and restart the `server` container:
 
@@ -58,16 +58,15 @@ few sample destinations, so you're not staring at an empty app.
 | Area | Where |
 |---|---|
 | **Roadmap** (home page) | Multi-year portfolio plan: per-year spend vs. annual cap, far-trip limit, ages, demanding-trip cutoff, season fit and split-pairing warnings; inline-edit each destination's year/season/days/costs; regional pairings with airfare savings; visited history. **Import from markdown** loads a portfolio summary file (see `retirement_travel_portfolio_summary_2027_2034.md`) — re-importing updates by name |
-| Prioritized destination list | **Destinations** page — reorder with ▲/▼, track status (idea → researching → planned → booked → visited) |
-| Trip planning | **Trips → a trip** starts with high-level basics (dates or duration+season, planning type, goal/style), then the **Itinerary tab** for transport/stay/POI/activity items with dates, cost, provider, booking status |
+| Trip planning | **Plan trip** on a Dashboard card (or the drawer) opens the trip, which starts with high-level basics (dates or duration+season, planning type, goal/style), then the **Itinerary tab** for transport/stay/POI/activity items with dates, cost, provider, booking status |
 | Building an itinerary | Shown automatically for an empty trip: **start from scratch**, **paste/upload an existing itinerary** (including pasted email text — parsed into structured items by Claude), or **propose with AI** (Claude drafts a day-by-day plan from the trip's goal + your saved preferences). Proposals are reviewed/checked before anything is added |
 | Travel preferences | **Preferences** page — shared household interests/pace/budget style/notes, fed into every AI itinerary proposal and estimate |
 | Conflict detection | Automatic — shown as a banner at the top of a trip when two time-bound items (esp. transport/stays) overlap |
 | Route optimization | **Trips → a trip → Route tab** — nearest-neighbor ordering of POIs with lat/lng, to minimize backtracking |
-| Financial planning | **Finances** page for AI rough estimates + a per-trip totals view; **Trip → Budget tab** for category-by-category estimated vs. actual |
+| Financial planning | **Budget** page for the multi-year plan; **Trip → Budget tab** for category-by-category estimated vs. actual |
 | Booking agents | **Booking Agents** page — contacts/agencies, linkable to individual itinerary items |
 | Resource discovery | **Resources** page (global) and the **Resources tab** on a trip (scoped) — guides, visa info, packing lists, links |
-| AI integration | **AI Assistant** page (chat, trip-aware) and the estimator on **Finances** |
+| AI integration | **AI Assistant** page (chat, trip-aware) and the AI estimates on the **Dashboard** |
 
 ## Development (without Docker)
 

@@ -24,6 +24,8 @@ const itemSchema = z.object({
   sortOrder: z.number().int().optional(),
   notes: z.string().nullable().optional(),
   userNotes: z.string().nullable().optional(),
+  freeCancelUntil: z.string().datetime().nullable().optional(),
+  paid: z.boolean().optional(),
 });
 
 function toDate(v: string | null | undefined) {
@@ -35,10 +37,11 @@ router.post("/", async (req, res) => {
   const parsed = itemSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
 
-  const { startAt, endAt, ...rest } = parsed.data;
+  const { startAt, endAt, freeCancelUntil, ...rest } = parsed.data;
   const item = await prisma.tripItem.create({
     data: {
       ...rest,
+      freeCancelUntil: toDate(freeCancelUntil) ?? undefined,
       tripId: (req.params as Record<string, string>).tripId,
       startAt: toDate(startAt) ?? undefined,
       endAt: toDate(endAt) ?? undefined,
@@ -51,11 +54,12 @@ router.patch("/:itemId", async (req, res) => {
   const parsed = itemSchema.partial().safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
 
-  const { startAt, endAt, ...rest } = parsed.data;
+  const { startAt, endAt, freeCancelUntil, ...rest } = parsed.data;
   const item = await prisma.tripItem.update({
     where: { id: req.params.itemId },
     data: {
       ...rest,
+      ...(freeCancelUntil !== undefined && { freeCancelUntil: toDate(freeCancelUntil) }),
       ...(startAt !== undefined && { startAt: toDate(startAt) }),
       ...(endAt !== undefined && { endAt: toDate(endAt) }),
     },
@@ -105,6 +109,24 @@ const UNDATED_TRIP_ANCHOR = new Date(Date.UTC(2000, 0, 1));
 // /import-itinerary) to real TripItems, resolving day+time into datetimes
 // (real ones if the trip has a start date, otherwise anchored to a fixed
 // placeholder date so time-of-day and duration still round-trip).
+// Add places (e.g. imported from Google Maps) as points of interest.
+router.post("/places", async (req, res) => {
+  const parsed = z.object({ places: z.array(z.object({
+    title: z.string().min(1), lat: z.number().nullable(), lng: z.number().nullable(), notes: z.string().nullable().optional(), url: z.string().nullable().optional(),
+  })).min(1).max(300) }).safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
+  const tripId = (req.params as Record<string, string>).tripId;
+  const trip = await prisma.trip.findUnique({ where: { id: tripId }, include: { _count: { select: { items: true } } } });
+  if (!trip) return res.status(404).json({ error: "Trip not found" });
+  const created = await prisma.$transaction(parsed.data.places.map((p, n) => prisma.tripItem.create({
+    data: {
+      tripId, type: "POI", title: p.title, lat: p.lat ?? undefined, lng: p.lng ?? undefined, bookingUrl: p.url ?? undefined,
+      notes: p.notes ?? undefined, sortOrder: trip._count.items + n, bookingStatus: "IDEA",
+    },
+  })));
+  res.status(201).json({ added: created.length });
+});
+
 router.post("/bulk", async (req, res) => {
   const parsed = bulkSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });

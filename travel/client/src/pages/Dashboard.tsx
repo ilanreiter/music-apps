@@ -40,7 +40,7 @@ function SeasonLabel({ season }: { season: string | null }) {
 
 const difficultyLevel = (m: string | null) => Math.max(0, MOBILITY.indexOf(m ?? "")) + (m ? 1 : 0);
 
-function Card_({ d, rank, cellSeason, overlay, onPin, conflicts, onVisited, onRemove, onEstimate, estimating }: { d: RoadmapDest; rank: number; cellSeason: string | null; overlay?: boolean; onPin?: () => void; conflicts?: string[]; onVisited?: () => void; onRemove?: () => void; onEstimate?: () => void; estimating?: boolean }) {
+export function Card_({ d, rank, cellSeason, overlay, onPin, conflicts, onVisited, onRemove, onEstimate, estimating }: { d: RoadmapDest; rank: number; cellSeason: string | null; overlay?: boolean; onPin?: () => void; conflicts?: string[]; onVisited?: () => void; onRemove?: () => void; onEstimate?: () => void; estimating?: boolean }) {
   const lvl = difficultyLevel(d.mobility);
   const off = cellSeason && d.bestSeason && cellSeason !== d.bestSeason && cellSeason !== d.secondSeason;
   const weather = !cellSeason || cellSeason === d.bestSeason ? d.weather : cellSeason === d.secondSeason ? d.weatherAlt : null;
@@ -119,7 +119,7 @@ function Card_({ d, rank, cellSeason, overlay, onPin, conflicts, onVisited, onRe
 }
 
 /** Several combined destinations shown as ONE card: totals are summed, one frame, one move. */
-function GroupCard({ members, name, overlay, onPin, onSplit, onOpenMember, conflicts, onVisited, onEstimate, estimating }: {
+export function GroupCard({ members, name, overlay, onPin, onSplit, onOpenMember, conflicts, onVisited, onEstimate, estimating }: {
   members: RoadmapDest[]; name: string; overlay?: boolean; onPin?: () => void; onSplit?: () => void; onOpenMember?: (d: RoadmapDest) => void; conflicts?: string[]; onVisited?: () => void; onEstimate?: () => void; estimating?: boolean;
 }) {
   const lead = members[0];

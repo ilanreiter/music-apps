@@ -139,6 +139,7 @@ model Trip {
   budgetLines   BudgetLine[]
   resources     Resource[]
   aiMessages    AiMessage[]
+  checklist     ChecklistItem[]
 }
 
 model TripItem {
@@ -173,6 +174,9 @@ model TripItem {
   // so regenerating/re-importing the AI's notes never clobbers what the user
   // wrote themselves.
   userNotes       String?
+  // Booking management: last day to cancel for free, and whether it has been paid.
+  freeCancelUntil DateTime?
+  paid            Boolean       @default(false)
   createdAt       DateTime      @default(now())
   updatedAt       DateTime      @updatedAt
 }
@@ -276,4 +280,17 @@ model RoadmapSettings {
   ruleOrder           String[] @default([])
   ruleDisabled        String[] @default([])
   autoOrder           Boolean @default(false)
+}
+
+// A pre-trip to-do (visa, insurance, packing, ...) in a trip's checklist.
+model ChecklistItem {
+  id        String    @id @default(cuid())
+  tripId    String
+  trip      Trip      @relation(fields: [tripId], references: [id], onDelete: Cascade)
+  text      String
+  category  String?
+  dueDate   DateTime?
+  done      Boolean   @default(false)
+  sortOrder Int       @default(0)
+  createdAt DateTime  @default(now())
 }

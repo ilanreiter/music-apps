@@ -4,6 +4,8 @@ import { prisma } from "../db";
 import { detectConflicts } from "../lib/conflicts";
 import { optimizeRoute } from "../lib/routeOptimize";
 import { proposeItinerary, proposeItineraryGemini, importItinerary, geocodeItems, buildProposePrompt } from "../lib/itineraryAi";
+import { extractBookings } from "../lib/tripPlanningAi";
+import { parsePlaces } from "../lib/placesImport";
 
 const router = Router();
 
@@ -38,6 +40,7 @@ router.get("/:id", async (req, res) => {
       items: { orderBy: [{ startAt: "asc" }, { sortOrder: "asc" }], include: { bookingAgent: true } },
       budgetLines: true,
       resources: true,
+      checklist: { orderBy: [{ done: "asc" }, { dueDate: "asc" }, { sortOrder: "asc" }, { createdAt: "asc" }] },
     },
   });
   if (!trip) return res.status(404).json({ error: "Not found" });
@@ -204,6 +207,30 @@ router.post("/:id/import-itinerary", async (req, res) => {
     res.json(proposal);
   } catch (err: any) {
     res.status(503).json({ error: err.message || "AI import failed" });
+  }
+});
+
+// Extract bookings (flights, hotels, cars, tours...) from pasted confirmation emails / receipts for review.
+router.post("/:id/import-bookings", async (req, res) => {
+  const parsed = z.object({ rawText: z.string().min(10) }).safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
+  const trip = await prisma.trip.findUnique({ where: { id: req.params.id }, include: { destination: true } });
+  if (!trip) return res.status(404).json({ error: "Not found" });
+  try {
+    res.json({ bookings: await extractBookings(parsed.data.rawText, trip.destination?.name || trip.title) });
+  } catch (e: any) {
+    res.status(503).json({ error: e.message || "AI import failed" });
+  }
+});
+
+// Parse a Google Maps export (Takeout GeoJSON/CSV, My Maps KML) or pasted places/links into places to review.
+router.post("/:id/import-places", async (req, res) => {
+  const parsed = z.object({ filename: z.string().default(""), content: z.string().min(1).max(5_000_000) }).safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
+  try {
+    res.json({ places: parsePlaces(parsed.data.filename, parsed.data.content) });
+  } catch {
+    res.status(422).json({ error: "That file could not be read. Use a Takeout .json/.csv, a My Maps .kml, or paste place names / Google Maps links." });
   }
 });
 
