@@ -7,7 +7,7 @@ import {
 import { SortableContext, arrayMove, sortableKeyboardCoordinates, useSortable, verticalListSortingStrategy } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 import { AnimatePresence, motion } from "framer-motion";
-import { AlertTriangle, CheckCircle2, Check, Sparkles, GripVertical, Link2, Plus, Trash2, Undo2, Loader2, CloudSun, Flag, Info, Pin, Plane, RotateCcw, ScrollText, Unlink, Upload, Wallet, X } from "lucide-react";
+import { AlertTriangle, CheckCircle2, Check, Sparkles, Gauge, GripVertical, Link2, Plus, Trash2, Undo2, Loader2, CloudSun, Flag, Info, Pin, Plane, RotateCcw, ScrollText, Unlink, Upload, Wallet, X } from "lucide-react";
 import { api } from "../lib/api";
 import { RoadmapData, RoadmapDest, RoadmapSettings } from "../types";
 import { Button, Card, Select, Skeleton } from "../components/ui";
@@ -301,7 +301,7 @@ export default function Dashboard() {
   const [data, setData] = useState<RoadmapData | null>(null);
   const [dests, setDests] = useState<RoadmapDest[]>([]);
   const [visited, setVisited] = useState<RoadmapDest[]>([]);
-  const [aiBusy, setAiBusy] = useState(false);
+  const [optBusy, setOptBusy] = useState(false);
   const [estimating, setEstimating] = useState<Set<string>>(new Set());
   const [error, setError] = useState("");
   const [dragId, setDragId] = useState<string | null>(null);
@@ -503,29 +503,28 @@ export default function Dashboard() {
     setEstimating((s) => { const n = new Set(s); ids.forEach((i) => n.delete(i)); return n; });
     setTimeout(() => setNote(""), 9000);
   };
-  // Ask Claude to propose the trip order (year + season) from the rules and the traveler profiles.
-  const aiOrder = async () => {
-    if (!data || aiBusy) return;
-    setAiBusy(true); setArranging(true); setNote(""); setError("");
+  // Exact optimizer: the fewest possible conflicts for the unpinned scheduled trips.
+  const optimize = async () => {
+    if (!data || optBusy) return;
+    setOptBusy(true); setArranging(true); setNote(""); setError("");
     try {
-      const before = countConflicts(dests, data.settings, data.pairings, data.settings.ruleDisabled ?? []);
-      const r = await api.post<{ placements: Placement[]; covered: number; of: number; rationale: string | null; usedProfiles: number }>("/roadmap/ai-order", {});
-      // 1) the AI's proposal, 2) polished by the rule planner starting from it, so a higher-ranked rule is never left broken by a slip.
+      const dis = data.settings.ruleDisabled ?? [];
+      const before = countConflicts(dests, data.settings, data.pairings, dis);
+      const r = await api.post<{ placements: Placement[]; optimal: boolean; status: string; ms: number }>("/roadmap/optimize", {});
       const byId = new Map(r.placements.map((u) => [u.id, u]));
-      const proposal = dests.map((d) => (byId.has(d.id) ? { ...d, ...byId.get(d.id)! } : d));
-      const raw = countConflicts(proposal, data.settings, data.pairings, data.settings.ruleDisabled ?? []);
-      const start = new Map(r.placements.map((u) => [u.id, { year: u.planYear as number, season: u.planSeason }]));
-      const polish = arrangeDetailed(proposal, data.settings, data.pairings, data.settings.ruleOrder ?? [], data.settings.ruleDisabled ?? [], start);
-      const polished = new Map(polish.placements.map((u) => [u.id, u]));
-      const next = proposal.map((d) => (polished.has(d.id) ? { ...d, ...polished.get(d.id)! } : d));
-      const after = countConflicts(next, data.settings, data.pairings, data.settings.ruleDisabled ?? []);
-      const changed = next.filter((d) => { const o = dests.find((x) => x.id === d.id)!; return o.planYear !== d.planYear || o.planSeason !== d.planSeason || o.priority !== d.priority; })
+      const next = dests.map((d) => (byId.has(d.id) ? { ...d, planYear: byId.get(d.id)!.planYear, planSeason: byId.get(d.id)!.planSeason } : d));
+      const after = countConflicts(next, data.settings, data.pairings, dis);
+      const changed = next.filter((d) => { const o = dests.find((x) => x.id === d.id)!; return o.planYear !== d.planYear || o.planSeason !== d.planSeason; })
         .map((d) => ({ id: d.id, planYear: d.planYear, planSeason: d.planSeason, priority: d.priority }));
-      setDests(next);
-      if (changed.length) await api.post("/roadmap/reorder", changed);
-      setNote(`AI ordering applied: ${after} conflict${after === 1 ? "" : "s"} (${before} before; the AI's raw proposal had ${raw}, the planner polished it)${r.covered < r.of ? ` — ${r.of - r.covered} trip(s) kept their slot` : ""}${r.rationale ? ` — ${r.rationale}` : ""}`);
+      if (after > before) {
+        setNote(`Optimizer result (${after} conflicts) was no better than your current board (${before}), so nothing was changed`);
+      } else {
+        setDests(next);
+        if (changed.length) await api.post("/roadmap/reorder", changed);
+        setNote(`Optimized: ${after} conflict${after === 1 ? "" : "s"} (${before} before), ${changed.length} card${changed.length === 1 ? "" : "s"} moved — ${r.optimal ? "the solver proved this is the minimum" : "best found within the time limit"} (${(r.ms / 1000).toFixed(1)}s)`);
+      }
     } catch (e: any) { setError(e.message); load(); }
-    setArranging(false); setAiBusy(false);
+    setArranging(false); setOptBusy(false);
     setTimeout(() => setNote(""), 15000);
   };
   const markVisited = async (items: RoadmapDest[]) => {
@@ -686,11 +685,11 @@ export default function Dashboard() {
                 <span className="text-xs text-slate-500">finds the rule order with the fewest conflicts</span>
               </label>
               <div className="mb-3 flex flex-wrap items-center gap-2">
-                <Button variant="secondary" disabled={aiBusy || arranging || !!s.autoOrder} onClick={aiOrder}
-                  title={s.autoOrder ? "Turn off Auto order to use AI ordering" : "Ask Claude to order the trips using these rules and your traveler profiles"}>
-                  {aiBusy ? <Loader2 className="h-4 w-4 mr-1.5 animate-spin" /> : <Sparkles className="h-4 w-4 mr-1.5" />}AI ordering
+                <Button variant="secondary" disabled={optBusy || arranging || !!s.autoOrder} onClick={optimize}
+                  title={s.autoOrder ? "Turn off Auto order to use the optimizer" : "Find the arrangement with the fewest possible conflicts (exact solver)"}>
+                  {optBusy ? <Loader2 className="h-4 w-4 mr-1.5 animate-spin" /> : <Gauge className="h-4 w-4 mr-1.5" />}Optimize
                 </Button>
-                <span className="text-xs text-slate-500">Claude proposes the year and season of every unpinned trip from the rules above and your traveler profiles.</span>
+                <span className="text-xs text-slate-500">Exact solver: finds the arrangement with the fewest total conflicts (one per violation) for the unpinned trips.</span>
               </div>
               <p className="text-xs text-slate-500 mb-3">{s.autoOrder ? "Auto order is on: the list shows the best order found and re-runs when you pin a card or switch a rule. Switch it off to drag rules yourself." : "Drag the rules into the order that matters most — #1 wins conflicts. Unpinned cards re-arrange as soon as you drop."}</p>
               <RuleList checks={checks} locked={!!s.autoOrder} onReorder={reorderRules} onToggle={toggleRule} />
@@ -707,7 +706,7 @@ export default function Dashboard() {
               <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
                 className="absolute inset-0 z-20 flex items-start justify-center pt-24 bg-white/60 dark:bg-slate-950/60 backdrop-blur-[2px]">
                 <div className="sticky top-24 flex items-center gap-2 rounded-full bg-white dark:bg-slate-900 px-4 py-2 text-sm font-medium shadow-lg ring-1 ring-slate-200 dark:ring-slate-700">
-                  <Loader2 className="h-4 w-4 animate-spin text-brand-600" />{aiBusy ? "Asking the AI to order your trips… up to 2 minutes" : "Rearranging cards…"}
+                  <Loader2 className="h-4 w-4 animate-spin text-brand-600" />Rearranging cards…
                 </div>
               </motion.div>
             )}

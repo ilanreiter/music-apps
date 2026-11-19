@@ -6,6 +6,7 @@ import { metaFor } from "../lib/roadmapMeta";
 import { parseRoadmap, pairingMembers } from "../lib/roadmapImport";
 import { getAnthropicClient, AI_MODEL } from "../lib/anthropic";
 import { getHomeLocations, formatTravelerProfilesBlock } from "../lib/itineraryAi";
+import { optimizeBoard } from "../lib/optimizeBoard";
 
 const router = Router();
 
@@ -202,88 +203,29 @@ Return ONLY strict JSON, no prose:
   res.json({ ok: true, usedProfiles: ctx.travelers, rationale: e.rationale ?? null });
 });
 
-// Ask Claude to propose the order (year + season) of every unpinned, scheduled trip, following the
-// prioritization rules and the traveler profiles. The proposal is validated before it is returned.
-const RULE_TEXT: Record<string, (s: { cap: number; far: number; until: number | null }) => string> = {
-  far: (s) => `Long-haul trips: at most ${s.far} departures per year (a combined trip counts as one).`,
-  cap: () => "Each year's total cost must stay under the annual cap (costs below are given as a fraction of the cap; the fractions of a year's trips must sum to at most 1.0).",
-  mobility: (s) => `Harder trips (higher difficulty) go in earlier years, easing off toward easy trips later${s.until ? `; no demanding trips (difficulty Moderate-High or High) after ${s.until}` : ""}.`,
-  season: () => "Plan each trip in its best or 2nd-best season.",
-  quarter: () => "At most one trip (departure) per season of a year.",
-  gaps: () => "No empty seasons: fill every season from the first year onward before leaving gaps (empty seasons after the last trip are fine).",
-  pair: () => "Keep combined trips together (they are single units below).",
-  rank: () => "Prefer the existing rank order (lower rank number first) when nothing else decides.",
-};
-
-router.post("/ai-order", async (_req, res) => {
-  const client = getAnthropicClient();
-  if (!client) return res.status(503).json({ error: "AI is not configured. Set ANTHROPIC_API_KEY in the server environment to get an AI ordering." });
-  const [settings, pairings, all, ctx] = await Promise.all([
-    getSettings(), prisma.pairing.findMany(),
+// Exact optimizer: the lowest possible number of rule conflicts for the unpinned scheduled trips (mixed-integer program).
+router.post("/optimize", async (_req, res) => {
+  const [settings, rows] = await Promise.all([
+    getSettings(),
     prisma.destination.findMany({ where: { status: { not: "VISITED" }, planYear: { not: null } }, orderBy: { priority: "asc" } }),
-    travelerContext(),
   ]);
-  const years: number[] = [];
-  for (let y = settings.startYear; y <= settings.endYear; y++) years.push(y);
-  // Units: a combined trip moves as one.
-  const unitsMap = new Map<string, typeof all>();
-  for (const d of all) unitsMap.set(d.pairingId ?? d.id, [...(unitsMap.get(d.pairingId ?? d.id) ?? []), d]);
-  const units = [...unitsMap.values()];
-  const fixed = units.filter((u) => u.some((d) => d.pinned));
-  const movable = units.filter((u) => !u.some((d) => d.pinned));
-  const frac = (u: typeof all) => Math.round((u.reduce((t, d) => t + ((d.days ?? 0) * (d.dailyCost ?? 0) + (d.transitCost ?? 0)), 0) / settings.annualCap) * 100) / 100;
-  const label = (u: typeof all) => u.map((d) => d.name).join(" + ");
-  const desc = (u: typeof all) => {
-    const d = u[0];
-    const lvl = u.map((m) => m.mobility).sort((a, b) => MOBILITY.indexOf(b ?? "") - MOBILITY.indexOf(a ?? ""))[0];
-    return `${label(u)} | best: ${d.bestSeason ?? "?"}, 2nd: ${d.secondSeason ?? "?"} | ${u.reduce((t, m) => t + (m.days ?? 0), 0)} days | difficulty: ${lvl ?? "?"} | long-haul: ${u.some((m) => m.isFar) ? "yes" : "no"} | cost as fraction of annual cap: ${frac(u)}${d.seasonFactors ? ` | season cost multipliers: ${JSON.stringify(d.seasonFactors)}` : ""} | current rank: ${d.priority}`;
-  };
-  const order = [...(settings.ruleOrder ?? []), ...Object.keys(RULE_TEXT).filter((r) => !(settings.ruleOrder ?? []).includes(r))]
-    .filter((r) => RULE_TEXT[r] && !(settings.ruleDisabled ?? []).includes(r));
-  const rt = { cap: settings.annualCap, far: settings.maxFarPerYear, until: settings.highMobilityUntil };
-  const prompt = `Plan the order of retirement trips for a couple across ${settings.startYear}–${settings.endYear} (each year has Winter, Spring, Summer, Fall slots).
-${ctx.text}
-
-Prioritization rules, most important first (a higher rule always beats every lower one):
-${order.map((r, i) => `${i + 1}. ${RULE_TEXT[r](rt)}`).join("\\n")}
-
-Already fixed (pinned, do not move):
-${fixed.length ? fixed.map((u) => `- ${label(u)} in ${u[0].planYear} ${u[0].planSeason ?? "?"}`).join("\\n") : "(none)"}
-
-Trips to place (index: details):
-${movable.map((u, i) => `${i}: ${desc(u)}`).join("\\n")}
-
-Give EVERY listed trip one year (${settings.startYear}–${settings.endYear}) and one season. Return ONLY strict JSON:
-{"placements":[{"i":0,"year":${settings.startYear},"season":"Winter"}, ...],"rationale":"two short sentences on the main trade-offs"}`;
-  const response = await client.messages.create({
-    model: AI_MODEL, max_tokens: 16000, ...({ thinking: { type: "disabled" } } as object),
-    system: "You produce only valid JSON when asked to. No markdown fences, no commentary.",
-    messages: [{ role: "user", content: prompt }],
-  }, { timeout: 100_000, maxRetries: 0 }).catch((e: any) => { console.error("ai-order failed:", e?.status ?? "", String(e?.message ?? e).slice(0, 200)); return null; });
-  if (!response) return res.status(504).json({ error: "The AI took too long or was unavailable. Please try again in a moment." });
-  const block = response.content.find((b) => b.type === "text");
-  const text = block && "text" in block ? block.text : "";
-  let raw: any = null;
-  try { const m = text.match(/\{[\s\S]*\}/); raw = JSON.parse(m ? m[0] : text); } catch { raw = null; }
-  if (!raw || !Array.isArray(raw.placements)) {
-    console.error("ai-order parse failed:", response.stop_reason, text.slice(0, 200));
-    return res.status(502).json({ error: "The AI ordering could not be read. Try again." });
+  const started = Date.now();
+  try {
+    const r = await optimizeBoard(rows.map((d) => ({
+      id: d.id, name: d.name, planYear: d.planYear!, planSeason: d.planSeason, pinned: d.pinned, pairingId: d.pairingId,
+      isFar: d.isFar, days: d.days, dailyCost: d.dailyCost, transitCost: d.transitCost, mobility: d.mobility,
+      bestSeason: d.bestSeason, secondSeason: d.secondSeason, suggestedYear: d.suggestedYear, priority: d.priority,
+      seasonFactors: (d.seasonFactors as Record<string, number> | null) ?? null,
+    })), {
+      startYear: settings.startYear, endYear: settings.endYear, annualCap: settings.annualCap, maxFarPerYear: settings.maxFarPerYear,
+      highMobilityUntil: settings.highMobilityUntil, ruleDisabled: settings.ruleDisabled ?? [],
+    }, 40);
+    if (!r.placements.length) return res.status(422).json({ error: `The optimizer found no solution (${r.status}).` });
+    res.json({ ...r, ms: Date.now() - started });
+  } catch (e: any) {
+    console.error("optimize failed:", String(e?.message ?? e).slice(0, 300));
+    res.status(500).json({ error: "The optimizer failed. Try again." });
   }
-  // Validate: known unit, year in range, valid season. Anything else keeps its current slot.
-  const slot = new Map<number, { year: number; season: string }>();
-  for (const p of raw.placements) {
-    const i = Number(p?.i);
-    if (!Number.isInteger(i) || !movable[i] || !years.includes(Number(p.year)) || !SEASONS.includes(p.season)) continue;
-    slot.set(i, { year: Number(p.year), season: p.season });
-  }
-  const placements: { id: string; planYear: number; planSeason: string; priority: number }[] = [];
-  const entries: { u: typeof all; year: number; season: string }[] = movable.map((u, i) => ({ u, year: slot.get(i)?.year ?? u[0].planYear!, season: slot.get(i)?.season ?? u[0].planSeason ?? "Winter" }));
-  // Re-deal the moved cards' existing rank numbers in calendar order so ranks follow the new sequence.
-  const pool = entries.flatMap((e) => e.u.map((d) => d.priority)).sort((a, b) => a - b);
-  const seq = [...entries].sort((a, b) => a.year - b.year || SEASONS.indexOf(a.season) - SEASONS.indexOf(b.season));
-  let k = 0;
-  for (const e of seq) for (const d of e.u) placements.push({ id: d.id, planYear: e.year, planSeason: e.season, priority: pool[k++] });
-  res.json({ placements, covered: slot.size, of: movable.length, rationale: typeof raw.rationale === "string" ? raw.rationale : null, usedProfiles: ctx.travelers });
 });
 
 // Add a destination and let Claude estimate its trip attributes (season, duration, cost, difficulty, ...).
