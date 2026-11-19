@@ -162,12 +162,12 @@ export interface RoadmapSettings {
 }
 export interface Pairing { id: string; name: string; year: number | null; quarter: string | null; savings: number }
 export interface RoadmapDest {
-  id: string; name: string; status: DestinationStatus; priority: number; notes: string | null;
+  id: string; name: string; country?: string | null; countryCode?: string | null; status: DestinationStatus; priority: number; notes: string | null;
   planYear: number | null; planSeason: string | null; tier: string | null; isFar: boolean;
   days: number | null; dailyCost: number | null; transitCost: number | null; mobility: string | null;
   pairingId: string | null; bestSeason: string | null; secondSeason: string | null;
   weather: string | null; weatherAlt: string | null; lat: number | null; lng: number | null;
-  suggestedYear: number | null; suggestedSeason: string | null; suggestedPriority: number | null; pinned: boolean;
+  suggestedYear: number | null; suggestedSeason: string | null; suggestedPriority: number | null; pinned: boolean; seasonFactors?: Record<string, number> | null;
   _count: { trips: number }; trips: { id: string }[];
 }
 export interface RoadmapData { settings: RoadmapSettings; pairings: Pairing[]; destinations: RoadmapDest[] }

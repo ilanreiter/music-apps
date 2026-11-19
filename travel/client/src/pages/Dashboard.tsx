@@ -2,24 +2,31 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { Link, useNavigate } from "react-router-dom";
 import {
   DndContext, DragEndEvent, DragOverlay, DragStartEvent, KeyboardSensor, PointerSensor,
-  closestCorners, useDroppable, useSensor, useSensors,
+  closestCorners, pointerWithin, CollisionDetection, useDraggable, useDroppable, useSensor, useSensors,
 } from "@dnd-kit/core";
 import { SortableContext, arrayMove, sortableKeyboardCoordinates, useSortable, verticalListSortingStrategy } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 import { AnimatePresence, motion } from "framer-motion";
-import { AlertTriangle, CheckCircle2, GripVertical, Link2, Loader2, CloudSun, Flag, Info, Pin, Plane, RotateCcw, ScrollText, Unlink, Upload, Wallet, X } from "lucide-react";
+import { AlertTriangle, CheckCircle2, Check, Sparkles, GripVertical, Link2, Plus, Trash2, Undo2, Loader2, CloudSun, Flag, Info, Pin, Plane, RotateCcw, ScrollText, Unlink, Upload, Wallet, X } from "lucide-react";
 import { api } from "../lib/api";
 import { RoadmapData, RoadmapDest, RoadmapSettings } from "../types";
 import { Button, Card, Select, Skeleton } from "../components/ui";
+import PlaceInput from "../components/PlaceInput";
 import { MiniMap, WorldMapDefs } from "../components/WorldMap";
 import { NumCell } from "./Budget";
-import { MOBILITY, RuleCheck, SEASONS, cardConflicts, destCost, emptySlots, fmt, ruleChecks, summarize } from "../lib/roadmap";
+import { MOBILITY, RuleCheck, SEASONS, cardConflicts, dailyRate, destCost, emptySlots, seasonFactor, fmt, ruleChecks, summarize } from "../lib/roadmap";
 import { Flags } from "../components/Flags";
-import { arrange, arrangeDetailed, Placement } from "../lib/arrange";
+import { arrange, arrangeDetailed, countConflicts, Placement } from "../lib/arrange";
 import { destMeta } from "../lib/destMeta";
 import { SEASON_META } from "../lib/seasons";
 
 const NONE = "none";
+// The Already traveled strip sits right under Unscheduled, so honour it whenever the pointer is inside it.
+const boardCollision: CollisionDetection = (args) => {
+  const zone = args.droppableContainers.filter((c) => c.id === "cell:VISITED");
+  const hit = pointerWithin({ ...args, droppableContainers: zone });
+  return hit.length ? hit : closestCorners(args);
+};
 const keyOf = (d: RoadmapDest) =>
   d.planYear == null ? NONE : `${d.planYear}|${d.planSeason && SEASONS.includes(d.planSeason) ? d.planSeason : d.bestSeason ?? "Winter"}`;
 const isMoved = (d: RoadmapDest) =>
@@ -33,15 +40,15 @@ function SeasonLabel({ season }: { season: string | null }) {
 
 const difficultyLevel = (m: string | null) => Math.max(0, MOBILITY.indexOf(m ?? "")) + (m ? 1 : 0);
 
-function Card_({ d, rank, cellSeason, overlay, onPin, conflicts }: { d: RoadmapDest; rank: number; cellSeason: string | null; overlay?: boolean; onPin?: () => void; conflicts?: string[] }) {
+function Card_({ d, rank, cellSeason, overlay, onPin, conflicts, onVisited, onRemove, onEstimate, estimating }: { d: RoadmapDest; rank: number; cellSeason: string | null; overlay?: boolean; onPin?: () => void; conflicts?: string[]; onVisited?: () => void; onRemove?: () => void; onEstimate?: () => void; estimating?: boolean }) {
   const lvl = difficultyLevel(d.mobility);
   const off = cellSeason && d.bestSeason && cellSeason !== d.bestSeason && cellSeason !== d.secondSeason;
   const weather = !cellSeason || cellSeason === d.bestSeason ? d.weather : cellSeason === d.secondSeason ? d.weatherAlt : null;
-  const meta = destMeta(d.name);
+  const meta = destMeta(d.name, d);
   const Icon = meta.icon;
   return (
     <div style={d.bestSeason && SEASON_META[d.bestSeason] ? { borderColor: SEASON_META[d.bestSeason].color } : undefined}
-      className={`rounded-lg border-2 bg-white dark:bg-slate-900 p-3 text-xs shadow-sm select-none ${
+      className={`group rounded-lg border-2 bg-white dark:bg-slate-900 p-3 text-xs shadow-sm select-none ${
         d.bestSeason && SEASON_META[d.bestSeason] ? "" : "border-slate-200 dark:border-slate-700"} ${
         overlay ? "shadow-xl rotate-1" : d.pinned ? "ring-2 ring-offset-1 ring-brand-400/60 dark:ring-offset-slate-900" : ""}`}>
       <div className="flex items-start justify-between gap-2">
@@ -57,6 +64,21 @@ function Card_({ d, rank, cellSeason, overlay, onPin, conflicts }: { d: RoadmapD
           )}
           {d.pairingId && <span title="Combined with other cards into one trip" className="text-brand-600"><Link2 className="h-3.5 w-3.5" /></span>}
           {isMoved(d) && !d.pinned && <span title="Moved from the suggested slot" className="h-2 w-2 rounded-full bg-amber-500" />}
+          {onEstimate && (
+            <button type="button" onPointerDown={(e) => e.stopPropagation()} onClick={(e) => { e.stopPropagation(); onEstimate(); }} disabled={estimating}
+              title="Re-estimate duration and costs with AI (uses your traveler profiles)"
+              className={`rounded p-0.5 transition-opacity hover:bg-slate-100 dark:hover:bg-slate-800 hover:text-brand-600 ${estimating ? "opacity-100 text-brand-600" : "opacity-0 group-hover:opacity-100 focus:opacity-100"}`}>
+              {estimating ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Sparkles className="h-3.5 w-3.5" />}
+            </button>
+          )}
+          {onVisited && (
+            <button type="button" onPointerDown={(e) => e.stopPropagation()} onClick={(e) => { e.stopPropagation(); onVisited(); }} title="Mark as already traveled"
+              className="rounded p-0.5 opacity-0 transition-opacity group-hover:opacity-100 focus:opacity-100 hover:bg-slate-100 dark:hover:bg-slate-800 hover:text-green-600"><Check className="h-3.5 w-3.5" /></button>
+          )}
+          {onRemove && (
+            <button type="button" onPointerDown={(e) => e.stopPropagation()} onClick={(e) => { e.stopPropagation(); onRemove(); }} title="Remove from the roadmap"
+              className="rounded p-0.5 opacity-0 transition-opacity group-hover:opacity-100 focus:opacity-100 hover:bg-slate-100 dark:hover:bg-slate-800 hover:text-red-600"><Trash2 className="h-3.5 w-3.5" /></button>
+          )}
           <span className="tabular-nums">#{rank}</span>
           {onPin && (
             <button type="button" onPointerDown={(e) => e.stopPropagation()} onClick={(e) => { e.stopPropagation(); onPin(); }}
@@ -76,8 +98,8 @@ function Card_({ d, rank, cellSeason, overlay, onPin, conflicts }: { d: RoadmapD
         <div className="min-w-0 flex flex-col gap-1.5">
           <dl className="rounded-md bg-slate-50 dark:bg-slate-800/60 px-2 py-1.5 space-y-0.5 tabular-nums">
             <div className="flex justify-between"><dt className="text-slate-500">Ideal</dt><dd className="font-semibold">{d.days ?? "—"} days</dd></div>
-            <div className="flex justify-between"><dt className="text-slate-500">Per day</dt><dd className="font-semibold">{fmt(d.dailyCost ?? 0)}</dd></div>
-            <div className="flex justify-between"><dt className="text-slate-500">Total</dt><dd className="font-semibold">{fmt(destCost(d))}</dd></div>
+            <div className="flex justify-between"><dt className="text-slate-500">Per day</dt><dd className="font-semibold">{fmt(dailyRate(d))}</dd></div>
+            <div className="flex justify-between"><dt className="text-slate-500">Total{seasonFactor(d) !== 1 && <span title={`${d.planSeason} price vs. best season`} className={`ml-1 text-[10px] ${seasonFactor(d) > 1 ? "text-amber-600" : "text-green-600"}`}>{seasonFactor(d) > 1 ? "+" : ""}{Math.round((seasonFactor(d) - 1) * 100)}%</span>}</dt><dd className="font-semibold">{fmt(destCost(d))}</dd></div>
           </dl>
           <div>
             <span className="block text-slate-500"><Flag className="inline h-3 w-3 mr-1 -mt-0.5" />Difficulty: <b className="text-slate-700 dark:text-slate-200 font-medium">{d.mobility ?? "—"}</b></span>
@@ -97,11 +119,11 @@ function Card_({ d, rank, cellSeason, overlay, onPin, conflicts }: { d: RoadmapD
 }
 
 /** Several combined destinations shown as ONE card: totals are summed, one frame, one move. */
-function GroupCard({ members, name, overlay, onPin, onSplit, onOpenMember, conflicts }: {
-  members: RoadmapDest[]; name: string; overlay?: boolean; onPin?: () => void; onSplit?: () => void; onOpenMember?: (d: RoadmapDest) => void; conflicts?: string[];
+function GroupCard({ members, name, overlay, onPin, onSplit, onOpenMember, conflicts, onVisited, onEstimate, estimating }: {
+  members: RoadmapDest[]; name: string; overlay?: boolean; onPin?: () => void; onSplit?: () => void; onOpenMember?: (d: RoadmapDest) => void; conflicts?: string[]; onVisited?: () => void; onEstimate?: () => void; estimating?: boolean;
 }) {
   const lead = members[0];
-  const metas = members.map((m) => destMeta(m.name));
+  const metas = members.map((m) => destMeta(m.name, m));
   const days = members.reduce((t, m) => t + (m.days ?? 0), 0);
   const total = members.reduce((t, m) => t + destCost(m), 0);
   const level = Math.max(...members.map((m) => difficultyLevel(m.mobility)));
@@ -111,7 +133,7 @@ function GroupCard({ members, name, overlay, onPin, onSplit, onOpenMember, confl
   const frame = lead.bestSeason && SEASON_META[lead.bestSeason] ? SEASON_META[lead.bestSeason].color : undefined;
   return (
     <div style={frame ? { borderColor: frame } : undefined}
-      className={`rounded-lg border-2 bg-white dark:bg-slate-900 p-3 text-xs shadow-sm select-none ${frame ? "" : "border-slate-200 dark:border-slate-700"} ${
+      className={`group rounded-lg border-2 bg-white dark:bg-slate-900 p-3 text-xs shadow-sm select-none ${frame ? "" : "border-slate-200 dark:border-slate-700"} ${
         overlay ? "shadow-xl rotate-1" : pinned ? "ring-2 ring-offset-1 ring-brand-400/60 dark:ring-offset-slate-900" : ""}`}>
       <div className="flex items-start justify-between gap-2">
         <div className="flex items-center gap-2 min-w-0">
@@ -123,6 +145,17 @@ function GroupCard({ members, name, overlay, onPin, onSplit, onOpenMember, confl
             <span title={conflicts.join("\n")} className="flex items-center gap-0.5 rounded-full bg-red-50 dark:bg-red-950/50 px-1.5 py-0.5 text-red-600 font-medium">
               <AlertTriangle className="h-3 w-3" />{conflicts.length}
             </span>
+          )}
+          {onEstimate && (
+            <button type="button" onPointerDown={(e) => e.stopPropagation()} onClick={(e) => { e.stopPropagation(); onEstimate(); }} disabled={estimating}
+              title="Re-estimate duration and costs with AI (uses your traveler profiles)"
+              className={`rounded p-0.5 transition-opacity hover:bg-slate-100 dark:hover:bg-slate-800 hover:text-brand-600 ${estimating ? "opacity-100 text-brand-600" : "opacity-0 group-hover:opacity-100 focus:opacity-100"}`}>
+              {estimating ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Sparkles className="h-3.5 w-3.5" />}
+            </button>
+          )}
+          {onVisited && (
+            <button type="button" onPointerDown={(e) => e.stopPropagation()} onClick={(e) => { e.stopPropagation(); onVisited(); }} title="Mark all as already traveled"
+              className="rounded p-0.5 opacity-0 transition-opacity group-hover:opacity-100 focus:opacity-100 hover:bg-slate-100 dark:hover:bg-slate-800 hover:text-green-600"><Check className="h-3.5 w-3.5" /></button>
           )}
           {onSplit && (
             <button type="button" onPointerDown={(e) => e.stopPropagation()} onClick={(e) => { e.stopPropagation(); onSplit(); }}
@@ -169,19 +202,55 @@ function GroupCard({ members, name, overlay, onPin, onSplit, onOpenMember, confl
   );
 }
 
-function SortableCard({ d, rank, cellSeason, onOpen, onPin, conflicts, members, groupName, onSplit, onOpenMember }: { d: RoadmapDest; rank: number; cellSeason: string | null; onOpen: () => void; onPin: () => void; conflicts?: string[]; members?: RoadmapDest[]; groupName?: string; onSplit?: () => void; onOpenMember?: (d: RoadmapDest) => void }) {
+function VisitedChip({ d, overlay, onOpen, onAgain, onRemove }: { d: RoadmapDest; overlay?: boolean; onOpen?: () => void; onAgain?: () => void; onRemove?: () => void }) {
+  const meta = destMeta(d.name, d);
+  return (
+    <div onClick={onOpen} className={`group flex items-center gap-2 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm select-none ${overlay ? "shadow-xl rotate-1" : "cursor-grab"}`}>
+      <Flags codes={meta.flags} fallback={meta.icon} />
+      <span className="min-w-0 flex-1 truncate font-medium">{d.name}</span>
+      <Check className="h-3.5 w-3.5 shrink-0 text-green-600" aria-label="Traveled" />
+      {onAgain && <button type="button" onPointerDown={(e) => e.stopPropagation()} onClick={(e) => { e.stopPropagation(); onAgain(); }} title="Plan again (move back to Unscheduled)"
+        className="rounded p-0.5 text-slate-400 opacity-0 transition-opacity group-hover:opacity-100 focus:opacity-100 hover:text-brand-600"><Undo2 className="h-3.5 w-3.5" /></button>}
+      {onRemove && <button type="button" onPointerDown={(e) => e.stopPropagation()} onClick={(e) => { e.stopPropagation(); onRemove(); }} title="Remove"
+        className="rounded p-0.5 text-slate-400 opacity-0 transition-opacity group-hover:opacity-100 focus:opacity-100 hover:text-red-600"><Trash2 className="h-3.5 w-3.5" /></button>}
+    </div>
+  );
+}
+
+function VisitedDraggable({ d, ...rest }: { d: RoadmapDest; onOpen: () => void; onAgain: () => void; onRemove: () => void }) {
+  const { attributes, listeners, setNodeRef, isDragging } = useDraggable({ id: d.id });
+  return <div ref={setNodeRef} style={{ opacity: isDragging ? 0.35 : 1 }} className="touch-none" {...attributes} {...listeners}><VisitedChip d={d} {...rest} /></div>;
+}
+
+/** Places you've already been. Drop a card here to mark it as traveled; drag one out to plan it again. */
+function VisitedZone({ items, onOpen, onAgain, onRemove }: { items: RoadmapDest[]; onOpen: (d: RoadmapDest) => void; onAgain: (d: RoadmapDest) => void; onRemove: (d: RoadmapDest) => void }) {
+  const { setNodeRef, isOver } = useDroppable({ id: "cell:VISITED" });
+  return (
+    <div ref={setNodeRef} className={`min-h-[4.5rem] rounded-lg border border-dashed p-2 transition-colors ${isOver ? "border-green-500 bg-green-50 dark:bg-green-950/30" : "border-slate-200 dark:border-slate-800"}`}>
+      {items.length === 0
+        ? <div className="flex min-h-[3.5rem] items-center justify-center text-xs text-slate-400">Drop a card here (or use the ✓ on a card) to mark a place as already traveled</div>
+        : <div className="grid gap-2 grid-cols-[repeat(auto-fill,minmax(220px,1fr))]">
+            {items.map((d) => <VisitedDraggable key={d.id} d={d} onOpen={() => onOpen(d)} onAgain={() => onAgain(d)} onRemove={() => onRemove(d)} />)}
+          </div>}
+    </div>
+  );
+}
+
+function SortableCard({ d, rank, cellSeason, onOpen, onPin, conflicts, members, groupName, onSplit, onOpenMember, onVisited, onRemove, onEstimate, estimating }: { d: RoadmapDest; rank: number; cellSeason: string | null; onOpen: () => void; onPin: () => void; conflicts?: string[]; members?: RoadmapDest[]; groupName?: string; onSplit?: () => void; onOpenMember?: (d: RoadmapDest) => void; onVisited?: () => void; onRemove?: () => void; onEstimate?: () => void; estimating?: boolean }) {
   const pinned = members ? members.some((m) => m.pinned) : d.pinned;
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({ id: d.id, disabled: pinned });
   return (
     <div ref={setNodeRef} style={{ transform: CSS.Transform.toString(transform), transition, opacity: isDragging ? 0.35 : 1 }}
       className={`${pinned ? "cursor-pointer" : "cursor-grab active:cursor-grabbing"} touch-none`} onClick={onOpen} {...attributes} {...listeners}>
-      {members ? <GroupCard members={members} name={groupName ?? members.map((m) => m.name).join(" + ")} onPin={onPin} onSplit={onSplit} onOpenMember={onOpenMember} conflicts={conflicts} />
-        : <Card_ d={d} rank={rank} cellSeason={cellSeason} onPin={onPin} conflicts={conflicts} />}
+      {members ? <GroupCard members={members} name={groupName ?? members.map((m) => m.name).join(" + ")} onPin={onPin} onSplit={onSplit} onOpenMember={onOpenMember} conflicts={conflicts} onVisited={onVisited} onEstimate={onEstimate} estimating={estimating} />
+        : <Card_ d={d} rank={rank} cellSeason={cellSeason} onPin={onPin} conflicts={conflicts} onVisited={onVisited} onRemove={onRemove} onEstimate={onEstimate} estimating={estimating} />}
     </div>
   );
 }
 
-function Cell({ id, items, ranks, season, onOpen, onPin, wide, tint, conflicts, empty, onCombine, onSplit, onPinGroup, pairingName }: {
+function Cell({ id, items, ranks, season, onOpen, onPin, wide, tint, conflicts, empty, onCombine, onSplit, onPinGroup, pairingName, onVisited, onRemove, onEstimate, estimatingIds }: {
+  onEstimate?: (items: RoadmapDest[]) => void; estimatingIds?: Set<string>;
+  onVisited?: (items: RoadmapDest[]) => void; onRemove?: (d: RoadmapDest) => void;
   conflicts?: Map<string, string[]>; empty?: boolean; onCombine?: (items: RoadmapDest[]) => void; onSplit?: (items: RoadmapDest[]) => void; onPinGroup?: (items: RoadmapDest[]) => void; pairingName?: (id: string) => string | undefined;
   id: string; items: RoadmapDest[]; ranks: Map<string, number>; season: string | null; onOpen: (d: RoadmapDest) => void; onPin: (d: RoadmapDest) => void; wide?: boolean; tint?: string;
 }) {
@@ -216,9 +285,9 @@ function Cell({ id, items, ranks, season, onOpen, onPin, wide, tint, conflicts, 
           {entries.map((e) => e.length > 1 ? (
             <SortableCard key={e[0].id} d={e[0]} rank={ranks.get(e[0].id) ?? 0} cellSeason={season} members={e} groupName={pairingName?.(e[0].pairingId!)}
               conflicts={[...new Set(e.flatMap((m) => conflicts?.get(m.id) ?? []))]} onOpen={() => onOpen(e[0])} onPin={() => onPinGroup?.(e)}
-              onSplit={() => onSplit?.(e)} onOpenMember={onOpen} />
+              onSplit={() => onSplit?.(e)} onOpenMember={onOpen} onVisited={() => onVisited?.(e)} onEstimate={() => onEstimate?.(e)} estimating={e.some((m) => estimatingIds?.has(m.id))} />
           ) : (
-            <SortableCard key={e[0].id} d={e[0]} rank={ranks.get(e[0].id) ?? 0} cellSeason={season} onOpen={() => onOpen(e[0])} onPin={() => onPin(e[0])} conflicts={conflicts?.get(e[0].id)} />
+            <SortableCard key={e[0].id} d={e[0]} rank={ranks.get(e[0].id) ?? 0} cellSeason={season} onOpen={() => onOpen(e[0])} onPin={() => onPin(e[0])} conflicts={conflicts?.get(e[0].id)} onVisited={() => onVisited?.(e)} onRemove={() => onRemove?.(e[0])} onEstimate={() => onEstimate?.(e)} estimating={estimatingIds?.has(e[0].id)} />
           ))}
         </div>
       </SortableContext>
@@ -231,10 +300,17 @@ export default function Dashboard() {
   const nav = useNavigate();
   const [data, setData] = useState<RoadmapData | null>(null);
   const [dests, setDests] = useState<RoadmapDest[]>([]);
+  const [visited, setVisited] = useState<RoadmapDest[]>([]);
+  const [aiBusy, setAiBusy] = useState(false);
+  const [estimating, setEstimating] = useState<Set<string>>(new Set());
   const [error, setError] = useState("");
   const [dragId, setDragId] = useState<string | null>(null);
   const [selected, setSelected] = useState<string | null>(null);
   const [showRules, setShowRules] = useState(false);
+  const [adding, setAdding] = useState(false);
+  const [newName, setNewName] = useState("");
+  const [addBusy, setAddBusy] = useState(false);
+  const [addError, setAddError] = useState("");
   const [arranging, setArranging] = useState(false);
   const [note, setNote] = useState("");
   const enriched = useRef(false);
@@ -251,6 +327,7 @@ export default function Dashboard() {
       }
       setData(r);
       setDests(r.destinations.filter((d) => d.status !== "VISITED"));
+      setVisited(r.destinations.filter((d) => d.status === "VISITED").sort((a, b) => a.name.localeCompare(b.name)));
     } catch (e: any) { setError(e.message); }
   }, []);
   useEffect(() => { load(); }, [load]);
@@ -274,8 +351,23 @@ export default function Dashboard() {
     setDragId(null);
     const { active, over } = e;
     if (!over) return;
+    const overRaw = String(over.id);
+    // Dragging an already-traveled card back onto the board.
+    const vcard = visited.find((d) => d.id === active.id);
+    if (vcard) {
+      if (overRaw.startsWith("cell:") && overRaw !== "cell:VISITED") {
+        const k = overRaw.slice(5);
+        if (k === NONE) await planAgain(vcard); else { const [y, sn] = k.split("|"); await planAgain(vcard, { year: Number(y), season: sn }); }
+      }
+      return;
+    }
     const a = dests.find((d) => d.id === active.id);
     if (!a) return;
+    // Dropping on the Already traveled section.
+    if (overRaw === "cell:VISITED" || visited.some((d) => d.id === overRaw)) {
+      await markVisited(a.pairingId ? dests.filter((d) => d.pairingId === a.pairingId && keyOf(d) === keyOf(a)) : [a]);
+      return;
+    }
     // A combined card moves as one: every member of its pairing in this cell.
     const unit = a.pairingId ? dests.filter((d) => d.pairingId === a.pairingId && keyOf(d) === keyOf(a)) : [a];
     const unitIds = new Set(unit.map((d) => d.id));
@@ -381,6 +473,88 @@ export default function Dashboard() {
     setNote(updates.length ? `Rearranged ${updates.length} card${updates.length === 1 ? "" : "s"}` : "No cards needed to move for this order");
     setTimeout(() => setNote(""), 4000);
   };
+  const addDestination = async () => {
+    const name = newName.trim();
+    if (name.length < 2 || addBusy) return;
+    setAddBusy(true); setAddError("");
+    try {
+      const created = await api.post<{ id: string; name: string }>("/roadmap/destinations", { name });
+      await load();
+      setAdding(false); setNewName("");
+      setSelected(created.id);
+      setNote(`Added ${created.name} to Unscheduled with estimated details — review and edit them`);
+      setTimeout(() => setNote(""), 6000);
+    } catch (e: any) { setAddError(e.message); }
+    setAddBusy(false);
+  };
+  // Ask Claude to re-estimate duration and costs for existing cards, using the traveler profiles.
+  const estimateDest = async (items: RoadmapDest[]) => {
+    const ids = items.map((d) => d.id);
+    setEstimating((s) => new Set([...s, ...ids])); setNote(""); setError("");
+    let profiles = 0; let rationale: string | null = null;
+    try {
+      for (const d of items) {
+        const r = await api.post<{ usedProfiles: number; rationale: string | null }>(`/roadmap/destinations/${d.id}/estimate`, {});
+        profiles = r.usedProfiles; rationale = r.rationale;
+      }
+      await load();
+      setNote(`Updated duration and costs for ${items.map((d) => d.name).join(", ")} using ${profiles ? `${profiles} traveler profile${profiles === 1 ? "" : "s"}` : "no saved traveler profiles"}${rationale ? ` — ${rationale}` : ""}`);
+    } catch (e: any) { setError(e.message); }
+    setEstimating((s) => { const n = new Set(s); ids.forEach((i) => n.delete(i)); return n; });
+    setTimeout(() => setNote(""), 9000);
+  };
+  // Ask Claude to propose the trip order (year + season) from the rules and the traveler profiles.
+  const aiOrder = async () => {
+    if (!data || aiBusy) return;
+    setAiBusy(true); setArranging(true); setNote(""); setError("");
+    try {
+      const before = countConflicts(dests, data.settings, data.pairings, data.settings.ruleDisabled ?? []);
+      const r = await api.post<{ placements: Placement[]; covered: number; of: number; rationale: string | null; usedProfiles: number }>("/roadmap/ai-order", {});
+      // 1) the AI's proposal, 2) polished by the rule planner starting from it, so a higher-ranked rule is never left broken by a slip.
+      const byId = new Map(r.placements.map((u) => [u.id, u]));
+      const proposal = dests.map((d) => (byId.has(d.id) ? { ...d, ...byId.get(d.id)! } : d));
+      const raw = countConflicts(proposal, data.settings, data.pairings, data.settings.ruleDisabled ?? []);
+      const start = new Map(r.placements.map((u) => [u.id, { year: u.planYear as number, season: u.planSeason }]));
+      const polish = arrangeDetailed(proposal, data.settings, data.pairings, data.settings.ruleOrder ?? [], data.settings.ruleDisabled ?? [], start);
+      const polished = new Map(polish.placements.map((u) => [u.id, u]));
+      const next = proposal.map((d) => (polished.has(d.id) ? { ...d, ...polished.get(d.id)! } : d));
+      const after = countConflicts(next, data.settings, data.pairings, data.settings.ruleDisabled ?? []);
+      const changed = next.filter((d) => { const o = dests.find((x) => x.id === d.id)!; return o.planYear !== d.planYear || o.planSeason !== d.planSeason || o.priority !== d.priority; })
+        .map((d) => ({ id: d.id, planYear: d.planYear, planSeason: d.planSeason, priority: d.priority }));
+      setDests(next);
+      if (changed.length) await api.post("/roadmap/reorder", changed);
+      setNote(`AI ordering applied: ${after} conflict${after === 1 ? "" : "s"} (${before} before; the AI's raw proposal had ${raw}, the planner polished it)${r.covered < r.of ? ` — ${r.of - r.covered} trip(s) kept their slot` : ""}${r.rationale ? ` — ${r.rationale}` : ""}`);
+    } catch (e: any) { setError(e.message); load(); }
+    setArranging(false); setAiBusy(false);
+    setTimeout(() => setNote(""), 15000);
+  };
+  const markVisited = async (items: RoadmapDest[]) => {
+    try {
+      await Promise.all(items.map((d) => api.patch(`/roadmap/destinations/${d.id}`, { status: "VISITED" })));
+      await load();
+      setNote(`Moved ${items.map((d) => d.name).join(", ")} to Already traveled`);
+    } catch (e: any) { setError(e.message); }
+    setTimeout(() => setNote(""), 5000);
+  };
+  const planAgain = async (d: RoadmapDest, where?: { year: number; season: string }) => {
+    try {
+      await api.patch(`/roadmap/destinations/${d.id}`, where ? { status: "PLANNED", planYear: where.year, planSeason: where.season } : { status: "IDEA" });
+      await load();
+      setNote(where ? `Moved ${d.name} back onto the board` : `${d.name} is back in Unscheduled`);
+    } catch (e: any) { setError(e.message); }
+    setTimeout(() => setNote(""), 5000);
+  };
+  const removeDest = async (d: RoadmapDest) => {
+    const trips = d.trips?.length ? " Its trip plan is kept but no longer linked to this place." : "";
+    if (!window.confirm(`Remove “${d.name}” from your roadmap?${trips}`)) return;
+    try {
+      await api.delete(`/roadmap/destinations/${d.id}`);
+      setSelected(null);
+      await load();
+      setNote(`Removed ${d.name}`);
+    } catch (e: any) { setError(e.message); }
+    setTimeout(() => setNote(""), 5000);
+  };
   const pairingName = (id: string) => data?.pairings.find((p) => p.id === id)?.name;
   const pinGroup = async (members: RoadmapDest[]) => {
     const value = !members.every((m) => m.pinned);
@@ -453,7 +627,8 @@ export default function Dashboard() {
     return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib);
   });
   const dragging = dests.find((d) => d.id === dragId) ?? null;
-  const sel = dests.find((d) => d.id === selected) ?? null;
+  const sel = dests.find((d) => d.id === selected) ?? visited.find((d) => d.id === selected) ?? null;
+  const draggingVisited = visited.find((d) => d.id === dragId) ?? null;
   const backlog = cells.get(NONE) ?? [];
 
   if (!dests.length) {
@@ -476,6 +651,9 @@ export default function Dashboard() {
           <p className="text-sm text-slate-500 mt-1">Cards are placed by the prioritization rules — drag one anywhere to override.</p>
         </div>
         <div className="flex items-center gap-2">
+          <Button variant="secondary" onClick={() => { setAdding(true); setAddError(""); }}>
+            <Plus className="h-4 w-4 mr-1.5" />Add destination
+          </Button>
           <Button variant={showRules ? "primary" : "secondary"} onClick={() => setShowRules((v) => !v)}>
             <ScrollText className="h-4 w-4 mr-1.5" />Prioritization rules
           </Button>
@@ -489,7 +667,7 @@ export default function Dashboard() {
         </div>
       </div>
       {error && <p className="mb-3 text-sm text-red-600">{error}</p>}
-      <div aria-live="polite" className="h-5 mb-1 text-xs text-slate-500">{note}</div>
+      <div aria-live="polite" className="min-h-5 mb-1 text-xs text-slate-500">{note}</div>
 
       <AnimatePresence initial={false}>
         {showRules && (
@@ -507,6 +685,13 @@ export default function Dashboard() {
                 <span className="font-medium">Auto order</span>
                 <span className="text-xs text-slate-500">finds the rule order with the fewest conflicts</span>
               </label>
+              <div className="mb-3 flex flex-wrap items-center gap-2">
+                <Button variant="secondary" disabled={aiBusy || arranging || !!s.autoOrder} onClick={aiOrder}
+                  title={s.autoOrder ? "Turn off Auto order to use AI ordering" : "Ask Claude to order the trips using these rules and your traveler profiles"}>
+                  {aiBusy ? <Loader2 className="h-4 w-4 mr-1.5 animate-spin" /> : <Sparkles className="h-4 w-4 mr-1.5" />}AI ordering
+                </Button>
+                <span className="text-xs text-slate-500">Claude proposes the year and season of every unpinned trip from the rules above and your traveler profiles.</span>
+              </div>
               <p className="text-xs text-slate-500 mb-3">{s.autoOrder ? "Auto order is on: the list shows the best order found and re-runs when you pin a card or switch a rule. Switch it off to drag rules yourself." : "Drag the rules into the order that matters most — #1 wins conflicts. Unpinned cards re-arrange as soon as you drop."}</p>
               <RuleList checks={checks} locked={!!s.autoOrder} onReorder={reorderRules} onToggle={toggleRule} />
             </Card>
@@ -514,7 +699,7 @@ export default function Dashboard() {
         )}
       </AnimatePresence>
 
-      <DndContext sensors={sensors} collisionDetection={closestCorners}
+      <DndContext sensors={sensors} collisionDetection={boardCollision}
         onDragStart={(e: DragStartEvent) => setDragId(String(e.active.id))} onDragEnd={onDragEnd} onDragCancel={() => setDragId(null)}>
         <div className="relative overflow-x-auto pb-2">
           <AnimatePresence>
@@ -522,7 +707,7 @@ export default function Dashboard() {
               <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
                 className="absolute inset-0 z-20 flex items-start justify-center pt-24 bg-white/60 dark:bg-slate-950/60 backdrop-blur-[2px]">
                 <div className="sticky top-24 flex items-center gap-2 rounded-full bg-white dark:bg-slate-900 px-4 py-2 text-sm font-medium shadow-lg ring-1 ring-slate-200 dark:ring-slate-700">
-                  <Loader2 className="h-4 w-4 animate-spin text-brand-600" />Rearranging cards…
+                  <Loader2 className="h-4 w-4 animate-spin text-brand-600" />{aiBusy ? "Asking the AI to order your trips… up to 2 minutes" : "Rearranging cards…"}
                 </div>
               </motion.div>
             )}
@@ -541,18 +726,21 @@ export default function Dashboard() {
               <React.Fragment key={y.year}>
                 <RowHeader y={y} s={s} />
                 {SEASONS.map((sn) => (
-                  <Cell key={sn} id={`${y.year}|${sn}`} items={cells.get(`${y.year}|${sn}`) ?? []} ranks={ranks} season={sn} conflicts={conflicts} onCombine={combine} onSplit={split} onPinGroup={pinGroup} pairingName={pairingName} empty={gapOn && empties.has(`${y.year}|${sn}`)}
+                  <Cell key={sn} id={`${y.year}|${sn}`} items={cells.get(`${y.year}|${sn}`) ?? []} ranks={ranks} season={sn} conflicts={conflicts} onCombine={combine} onSplit={split} onPinGroup={pinGroup} pairingName={pairingName} onVisited={markVisited} onRemove={removeDest} onEstimate={estimateDest} estimatingIds={estimating} empty={gapOn && empties.has(`${y.year}|${sn}`)}
                     onOpen={(d) => setSelected(d.id)} onPin={togglePin} tint={`color-mix(in srgb, ${SEASON_META[sn].color} 6%, transparent)`} />
                 ))}
               </React.Fragment>
             ))}
             <div className="py-2 text-sm font-semibold text-slate-600 dark:text-slate-300">Unscheduled<div className="text-xs font-normal text-slate-400">{backlog.length} cards</div></div>
             <div className="col-span-4">
-              <Cell id={NONE} items={backlog} ranks={ranks} season={null} onOpen={(d) => setSelected(d.id)} onPin={togglePin} wide />
+              <Cell id={NONE} items={backlog} ranks={ranks} season={null} onOpen={(d) => setSelected(d.id)} onPin={togglePin} onVisited={markVisited} onRemove={removeDest} onEstimate={estimateDest} estimatingIds={estimating} wide />
             </div>
+            <div className="py-2 text-sm font-semibold text-slate-600 dark:text-slate-300">Already traveled<div className="text-xs font-normal text-slate-400">{visited.length} place{visited.length === 1 ? "" : "s"}</div></div>
+            <div className="col-span-4"><VisitedZone items={visited} onOpen={(d) => setSelected(d.id)} onAgain={planAgain} onRemove={removeDest} /></div>
           </div>
         </div>
         <DragOverlay dropAnimation={{ duration: 180 }}>
+          {draggingVisited && <div className="w-[240px]"><VisitedChip d={draggingVisited} overlay /></div>}
           {dragging && <div className="w-[275px]">{dragging.pairingId && dests.filter((d) => d.pairingId === dragging.pairingId && keyOf(d) === keyOf(dragging)).length > 1
             ? <GroupCard members={dests.filter((d) => d.pairingId === dragging.pairingId && keyOf(d) === keyOf(dragging))} name={pairingName(dragging.pairingId) ?? dragging.name} overlay />
             : <Card_ d={dragging} rank={ranks.get(dragging.id) ?? 0} cellSeason={null} overlay />}</div>}
@@ -560,7 +748,26 @@ export default function Dashboard() {
       </DndContext>
 
       <AnimatePresence>
-        {sel && <Drawer d={sel} s={s} onClose={() => setSelected(null)} patch={patch} openTrip={openTrip} />}
+        {adding && (
+          <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
+            className="fixed inset-0 z-50 flex items-start justify-center bg-slate-900/40 p-4 pt-[15vh]" onClick={() => !addBusy && setAdding(false)}>
+            <motion.form initial={{ y: 12, opacity: 0 }} animate={{ y: 0, opacity: 1 }} exit={{ y: 12, opacity: 0 }}
+              onClick={(e) => e.stopPropagation()} onSubmit={(e) => { e.preventDefault(); addDestination(); }}
+              className="w-full max-w-md rounded-xl bg-white dark:bg-slate-900 p-5 shadow-xl ring-1 ring-slate-200 dark:ring-slate-700">
+              <h2 className="font-display text-lg font-semibold">Add a destination</h2>
+              <p className="mt-1 text-xs text-slate-500">Name a place. Best and 2nd-best season, ideal duration, cost, difficulty, weather and location are estimated for you.</p>
+              <div className="mt-4"><PlaceInput value={newName} onChange={setNewName} existing={dests.map((d) => d.name)} placeholder="Start typing: Iceland, Patagonia, Kyoto…" disabled={addBusy} /></div>
+              {addError && <p className="mt-2 text-xs text-red-600">{addError}</p>}
+              <div className="mt-4 flex justify-end gap-2">
+                <Button type="button" variant="secondary" disabled={addBusy} onClick={() => setAdding(false)}>Cancel</Button>
+                <Button type="submit" disabled={addBusy || newName.trim().length < 2}>
+                  {addBusy ? <><Loader2 className="h-4 w-4 mr-1.5 animate-spin" />Estimating…</> : "Estimate & add"}
+                </Button>
+              </div>
+            </motion.form>
+          </motion.div>
+        )}
+        {sel && <Drawer d={sel} s={s} onClose={() => setSelected(null)} patch={patch} openTrip={openTrip} onRemove={() => removeDest(sel)} onVisited={() => { setSelected(null); markVisited([sel]); }} onPlanAgain={() => { setSelected(null); planAgain(sel); }} onEstimate={() => estimateDest([sel])} estimating={estimating.has(sel.id)} />}
       </AnimatePresence>
     </div>
   );
@@ -588,8 +795,8 @@ function RowHeader({ y, s }: { y: ReturnType<typeof summarize>[number]; s: Roadm
   );
 }
 
-function Drawer({ d, s, onClose, patch, openTrip }: {
-  d: RoadmapDest; s: RoadmapSettings; onClose: () => void;
+function Drawer({ d, s, onClose, patch, openTrip, onRemove, onVisited, onPlanAgain, onEstimate, estimating }: {
+  d: RoadmapDest; s: RoadmapSettings; onClose: () => void; onRemove: () => void; onVisited: () => void; onPlanAgain: () => void; onEstimate: () => void; estimating: boolean;
   patch: (id: string, b: Partial<RoadmapDest>) => void; openTrip: (d: RoadmapDest) => void;
 }) {
   const years = Array.from({ length: s.endYear - s.startYear + 1 }, (_, i) => s.startYear + i);
@@ -620,11 +827,31 @@ function Drawer({ d, s, onClose, patch, openTrip }: {
           <Field label="Difficulty"><Select value={d.mobility ?? ""} onChange={(e) => patch(d.id, { mobility: e.target.value || null })}>
             <option value="">—</option>{MOBILITY.map((x) => <option key={x}>{x}</option>)}</Select></Field>
         </div>
+        <div className="mt-3">
+          <div className="text-xs text-slate-500 mb-1">Seasonal price vs. best season (%) — applied to the planned season</div>
+          <div className="grid grid-cols-4 gap-2">
+            {SEASONS.map((sn) => (
+              <label key={sn} className={`block text-xs ${d.planSeason === sn ? "font-semibold text-brand-700 dark:text-brand-300" : "text-slate-500"}`}>{sn}
+                <div className="mt-1"><NumCell w="100%" value={Math.round(((d.seasonFactors?.[sn] ?? 1) - 1) * 100)}
+                  onSave={(n) => patch(d.id, { seasonFactors: { Winter: 1, Spring: 1, Summer: 1, Fall: 1, ...(d.seasonFactors ?? {}), [sn]: 1 + (n ?? 0) / 100 } })} /></div>
+              </label>
+            ))}
+          </div>
+        </div>
         <label className="mt-3 flex items-center gap-2 text-sm"><input type="checkbox" checked={d.pinned} onChange={(e) => patch(d.id, { pinned: e.target.checked })} />Pin in place (reset leaves it alone)</label>
         <label className="mt-2 flex items-center gap-2 text-sm"><input type="checkbox" checked={d.isFar} onChange={(e) => patch(d.id, { isFar: e.target.checked })} />Long-haul (counts toward the far-trip limit)</label>
         <div className="mt-4 rounded-md bg-slate-50 dark:bg-slate-800/60 p-3 text-sm">Total estimated cost <b className="float-right tabular-nums">{fmt(destCost(d))}</b></div>
         {d.notes && <p className="mt-4 text-sm text-slate-600 dark:text-slate-300">{d.notes}</p>}
         <Button className="mt-5 w-full" onClick={() => openTrip(d)}>{d.trips[0] ? "Open trip" : "Plan trip"}</Button>
+        <Button variant="secondary" className="mt-2 w-full" disabled={estimating} onClick={onEstimate} title="Uses your traveler profiles and preferences">
+          {estimating ? <Loader2 className="h-4 w-4 mr-1.5 animate-spin" /> : <Sparkles className="h-4 w-4 mr-1.5" />}Estimate duration &amp; costs with AI
+        </Button>
+        <div className="mt-2 grid grid-cols-2 gap-2">
+          {d.status === "VISITED"
+            ? <Button variant="secondary" onClick={onPlanAgain}><Undo2 className="h-4 w-4 mr-1.5" />Plan again</Button>
+            : <Button variant="secondary" onClick={onVisited}><Check className="h-4 w-4 mr-1.5" />Already traveled</Button>}
+          <Button variant="danger" onClick={onRemove}><Trash2 className="h-4 w-4 mr-1.5" />Remove</Button>
+        </div>
       </motion.aside>
     </>
   );

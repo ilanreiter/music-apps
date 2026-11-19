@@ -80,6 +80,7 @@ model Destination {
   id          String            @id @default(cuid())
   name        String
   country     String?
+  countryCode String?
   region      String?
   notes       String?
   status      DestinationStatus @default(IDEA)
@@ -106,6 +107,8 @@ model Destination {
   suggestedSeason String?
   suggestedPriority Int?
   pinned        Boolean  @default(false)
+  // Cost multiplier per season relative to the listed (best-season) cost, e.g. {"Summer":1.25,"Fall":0.9}
+  seasonFactors Json?
   pairingId     String?
   pairing       Pairing? @relation(fields: [pairingId], references: [id], onDelete: SetNull)
   createdAt   DateTime          @default(now())

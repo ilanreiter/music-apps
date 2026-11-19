@@ -61,13 +61,14 @@ export function arrange(dests: RoadmapDest[], s: RoadmapSettings, pairings: Pair
   return arrangeDetailed(dests, s, pairings, ruleOrder, disabled).placements;
 }
 
-export function arrangeDetailed(dests: RoadmapDest[], s: RoadmapSettings, pairings: Pairing[], ruleOrder: string[], disabled: string[] = []): Arranged {
+/** `start` (optional) replaces the plan's suggested slots as the starting point and the "stay close to" baseline, e.g. an AI proposal. */
+export function arrangeDetailed(dests: RoadmapDest[], s: RoadmapSettings, pairings: Pairing[], ruleOrder: string[], disabled: string[] = [], start?: Map<string, { year: number; season: string | null }>): Arranged {
   const order = [...ruleOrder, ...DEFAULT_RULE_ORDER.filter((r) => !ruleOrder.includes(r))];
 
   const cards = dests.filter((d) => d.status !== "VISITED" && d.suggestedYear != null);
-  const suggested = new Map(cards.map((d) => [d.id, d.suggestedYear!]));
+  const suggested = new Map(cards.map((d) => [d.id, start?.get(d.id)?.year ?? d.suggestedYear!]));
   const year = new Map<string, number>();
-  for (const d of cards) year.set(d.id, d.pinned ? d.planYear ?? d.suggestedYear! : d.suggestedYear!);
+  for (const d of cards) year.set(d.id, d.pinned ? d.planYear ?? d.suggestedYear! : start?.get(d.id)?.year ?? d.suggestedYear!);
 
   // Pairing members follow a pinned member; a group with a pinned member is fixed.
   const groups = new Map<string, RoadmapDest[]>();
@@ -80,7 +81,7 @@ export function arrangeDetailed(dests: RoadmapDest[], s: RoadmapSettings, pairin
   }
   units.sort((a, b) => Math.max(...b.map((d) => d.priority)) - Math.max(...a.map((d) => d.priority)));
 
-  const seasonOf = new Map(cards.map((d) => [d.id, d.pinned ? d.planSeason : d.suggestedSeason ?? d.planSeason]));
+  const seasonOf = new Map(cards.map((d) => [d.id, d.pinned ? d.planSeason : start?.get(d.id)?.season ?? d.suggestedSeason ?? d.planSeason]));
   const suggestedSeason = new Map(cards.map((d) => [d.id, d.suggestedSeason ?? d.planSeason]));
   const view = () => cards.map((d) => ({ d: { ...d, planSeason: d.pinned ? d.planSeason : seasonOf.get(d.id) ?? d.planSeason }, year: year.get(d.id)! }));
   const total = () => score(view(), s, pairings, order, disabled, suggested);
@@ -151,4 +152,11 @@ export function autoOrder(dests: RoadmapDest[], s: RoadmapSettings, pairings: Pa
     active.sort((x, y) => order.indexOf(x) - order.indexOf(y));
   }
   return { order, ...cur };
+}
+
+/** Total conflicts (one per violation, enabled rules only) of the board exactly as placed now. */
+export function countConflicts(dests: RoadmapDest[], s: RoadmapSettings, pairings: Pairing[], disabled: string[] = []): number {
+  const cards = dests.filter((d) => d.status !== "VISITED" && d.planYear != null).map((d) => ({ d, year: d.planYear! }));
+  const { plain } = metrics(cards, s, pairings, new Map());
+  return Object.entries(plain).reduce((n, [id, v]) => n + (disabled.includes(id) ? 0 : v), 0);
 }

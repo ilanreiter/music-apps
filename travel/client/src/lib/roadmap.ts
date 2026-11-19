@@ -14,7 +14,11 @@ export function seasonGaps(cells: { year: number; season: string | null }[], sta
 }
 export const MOBILITY = ["Easy", "Easy-Moderate", "Moderate", "Moderate-High", "High"];
 
-export const destCost = (d: RoadmapDest) => (d.days ?? 0) * (d.dailyCost ?? 0) + (d.transitCost ?? 0);
+/** Cost multiplier for the season a trip is planned in (1 = the listed best-season cost). */
+export const seasonFactor = (d: Pick<RoadmapDest, "planSeason" | "seasonFactors">) => (d.planSeason && d.seasonFactors?.[d.planSeason]) || 1;
+/** Trip cost: (days × cost per day + airfare), adjusted for the planned season. */
+export const destCost = (d: RoadmapDest) => ((d.days ?? 0) * (d.dailyCost ?? 0) + (d.transitCost ?? 0)) * seasonFactor(d);
+export const dailyRate = (d: RoadmapDest) => (d.dailyCost ?? 0) * seasonFactor(d);
 export const difficultyLevel = (m: string | null) => (m ? MOBILITY.indexOf(m) + 1 : 0);
 
 /**

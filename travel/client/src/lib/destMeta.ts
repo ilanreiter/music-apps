@@ -45,8 +45,10 @@ const META: Record<string, Meta> = {
   switzerland: { icon: TrainFront, countries: ["Switzerland"], flags: ["CH"] },
 };
 
-export function destMeta(name: string): Meta {
+export function destMeta(name: string, d?: { country?: string | null; countryCode?: string | null }): Meta {
   const n = name.toLowerCase();
   const k = Object.keys(META).find((x) => n.startsWith(x));
-  return k ? META[k] : { icon: MapPin, countries: [] };
+  if (k) return META[k];
+  // Added in-app: use the estimated country for the flag and the coloured map.
+  return { icon: MapPin, countries: d?.country ? [d.country] : [], flags: d?.countryCode ? [d.countryCode.toUpperCase()] : undefined };
 }
