@@ -15,6 +15,8 @@ RUN npm run build
 
 FROM base AS runtime
 ENV NODE_ENV=production
+# PDF reading: poppler for text PDFs, Tesseract (English + Hebrew) for scanned ones
+RUN apk add --no-cache poppler-utils tesseract-ocr tesseract-ocr-data-eng tesseract-ocr-data-heb
 COPY package.json package-lock.json* ./
 RUN npm install --omit=dev
 COPY --from=build /app/dist ./dist

@@ -3,7 +3,7 @@ import { FileText, Loader2, Mail, Plus, Trash2 } from "lucide-react";
 import { api } from "../../lib/api";
 import { BookingAgent, BookingStatus, Trip, TripItem, TripItemType } from "../../types";
 import { Badge, BadgeSelect, Button, Card, Input, Select, Textarea } from "../ui";
-import { BOOKING_STATUSES, BOOKING_TONE, dateToIso, daysFromNow, isBookable, isBooked, isoToDate, money, readFileText, shortDate } from "./shared";
+import { BOOKING_STATUSES, BOOKING_TONE, dateToIso, daysFromNow, isBookable, isBooked, isoToDate, money, readDocumentText, shortDate } from "./shared";
 
 interface Extracted {
   type: TripItemType; title: string; provider: string | null; confirmationNo: string | null; startAt: string | null; endAt: string | null;
@@ -145,13 +145,16 @@ function EmailImport({ trip, reload }: { trip: Trip; reload: () => void }) {
   const [text, setText] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const [note, setNote] = useState("");
   const [found, setFound] = useState<Extracted[] | null>(null);
   const [pick, setPick] = useState<Set<number>>(new Set());
 
   const onFile = async (file?: File) => {
     if (!file) return;
-    if (/\.pdf$/i.test(file.name)) { setError("PDFs can't be read here — open the PDF, copy its text and paste it below."); return; }
-    setText(await readFileText(file)); setError("");
+    setBusy(true); setError(""); setNote("");
+    try { const r = await readDocumentText(file); setText((prev) => (prev ? prev + "\n\n" : "") + r.text); if (r.note) setNote(r.note); }
+    catch (e: any) { setError(e.message); }
+    setBusy(false);
   };
   const parse = async () => {
     setBusy(true); setError(""); setFound(null);
@@ -179,14 +182,14 @@ function EmailImport({ trip, reload }: { trip: Trip; reload: () => void }) {
     <Card className="p-4 space-y-3">
       <div>
         <h3 className="text-sm font-semibold">Import bookings from email</h3>
-        <p className="text-xs text-slate-500">Paste one or more confirmation emails or receipts (or upload an .eml / .txt / .html file). The AI pulls out flights, hotels, cars and tours, with confirmation numbers, dates and prices. You review before anything is added.</p>
+        <p className="text-xs text-slate-500">Paste one or more confirmation emails or receipts (or upload a PDF, .eml, .txt or .html file; scanned PDFs are read with OCR). The AI pulls out flights, hotels, cars and tours, with confirmation numbers, dates and prices. You review before anything is added.</p>
       </div>
       {!found && (
         <>
           <Textarea rows={7} value={text} onChange={(e) => setText(e.target.value)} placeholder="Paste the email text here…" />
           <div className="flex flex-wrap items-center gap-2">
             <label className="inline-flex cursor-pointer items-center gap-1.5 rounded-md border border-slate-300 dark:border-slate-700 px-3 py-1.5 text-sm hover:bg-slate-50 dark:hover:bg-slate-800">
-              <FileText className="h-4 w-4" />Upload file<input type="file" accept=".eml,.txt,.html,.htm,.md,text/*" hidden onChange={(e) => { onFile(e.target.files?.[0]); e.target.value = ""; }} />
+              <FileText className="h-4 w-4" />Upload file<input type="file" accept=".pdf,.eml,.txt,.html,.htm,.md,application/pdf,text/*" hidden onChange={(e) => { onFile(e.target.files?.[0]); e.target.value = ""; }} />
             </label>
             <Button onClick={parse} disabled={busy || text.trim().length < 10}>{busy ? <Loader2 className="h-4 w-4 mr-1.5 animate-spin" /> : null}Find bookings</Button>
           </div>
@@ -213,6 +216,7 @@ function EmailImport({ trip, reload }: { trip: Trip; reload: () => void }) {
           </div>
         </>
       )}
+      {note && <p className="text-xs text-amber-600">{note}</p>}
       {error && <p className="text-xs text-red-600">{error}</p>}
     </Card>
   );

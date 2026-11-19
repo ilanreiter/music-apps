@@ -1,4 +1,5 @@
 import React, { useRef, useState } from "react";
+import { readDocumentText } from "./trip/shared";
 import { api } from "../lib/api";
 import { ProposedItem, ProposedItinerary, Trip, TripGoal, TripItemType, TripPlanningType } from "../types";
 import { Badge, Button, Card, Input, Label, Select, Textarea } from "../components/ui";
@@ -246,12 +247,16 @@ function BuildItinerary({
     onDismiss();
   }
 
-  function onFileChosen(e: React.ChangeEvent<HTMLInputElement>) {
+  async function onFileChosen(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0];
+    e.target.value = "";
     if (!file) return;
-    const reader = new FileReader();
-    reader.onload = () => setPastedText((prev) => (prev ? prev + "\n\n" : "") + String(reader.result || ""));
-    reader.readAsText(file);
+    setError(null);
+    try {
+      const r = await readDocumentText(file);
+      setPastedText((prev) => (prev ? prev + "\n\n" : "") + r.text);
+      if (r.note) setError(r.note);
+    } catch (err: any) { setError(err.message); }
   }
 
   async function runImport() {
@@ -412,7 +417,7 @@ function BuildItinerary({
           <Label>Paste itinerary text or an email you received</Label>
           <Textarea rows={6} value={pastedText} onChange={(e) => setPastedText(e.target.value)} placeholder="Paste booking confirmations, an itinerary from an agent, or an email here…" />
           <div className="flex items-center gap-3 mt-2">
-            <input ref={fileInputRef} type="file" accept=".txt,.md,.eml,text/plain" onChange={onFileChosen} className="text-xs" />
+            <input ref={fileInputRef} type="file" accept=".pdf,.txt,.md,.eml,application/pdf,text/plain" onChange={onFileChosen} className="text-xs" />
           </div>
           {error && <p className="text-sm text-red-600 mt-2">{error}</p>}
           <div className="flex gap-2 mt-4">
