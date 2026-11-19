@@ -1,5 +1,5 @@
 import { Pairing, RoadmapDest, RoadmapSettings } from "../types";
-import { destCost, difficultyInversions, difficultyLevel, isHighMobility, seasonGaps, SEASONS } from "./roadmap";
+import { autoFrom, destCost, difficultyInversions, difficultyLevel, isHighMobility, seasonGaps, SEASONS } from "./roadmap";
 
 export const DEFAULT_RULE_ORDER = ["far", "cap", "mobility", "season", "quarter", "gaps", "pair", "rank"];
 
@@ -32,7 +32,7 @@ export function metrics(
     quarters.set(k, (quarters.get(k) ?? new Set()).add(c.d.pairingId ?? c.d.id));
   }
   const quarter = [...quarters.values()].reduce((t, v) => t + Math.max(0, v.size - 1), 0);
-  const gaps = seasonGaps(cards.map((c) => ({ year: c.year, season: c.d.planSeason })), s.startYear);
+  const gaps = seasonGaps(cards.map((c) => ({ year: c.year, season: c.d.planSeason })), autoFrom(s));
   let drift = 0;
   for (const c of cards) drift += Math.abs(c.year - (suggested.get(c.d.id) ?? c.year));
   const vals: Record<string, number> = { far, cap, mobility, season, quarter, gaps, pair, rank: 0 };
@@ -61,8 +61,10 @@ export function arrange(dests: RoadmapDest[], s: RoadmapSettings, pairings: Pair
   return arrangeDetailed(dests, s, pairings, ruleOrder, disabled).placements;
 }
 
-export function arrangeDetailed(dests: RoadmapDest[], s: RoadmapSettings, pairings: Pairing[], ruleOrder: string[], disabled: string[] = []): Arranged {
+export function arrangeDetailed(allDests: RoadmapDest[], s: RoadmapSettings, pairings: Pairing[], ruleOrder: string[], disabled: string[] = []): Arranged {
   const order = [...ruleOrder, ...DEFAULT_RULE_ORDER.filter((r) => !ruleOrder.includes(r))];
+  // Cards in rows before the planner's first year (e.g. the current year) are treated as pinned.
+  const dests = allDests.map((d) => (d.planYear != null && d.planYear < autoFrom(s) ? { ...d, pinned: true } : d));
 
   const cards = dests.filter((d) => d.status !== "VISITED" && d.suggestedYear != null);
   const suggested = new Map(cards.map((d) => [d.id, d.suggestedYear!]));
@@ -86,7 +88,7 @@ export function arrangeDetailed(dests: RoadmapDest[], s: RoadmapSettings, pairin
   const total = () => score(view(), s, pairings, order, disabled, suggested);
   // True when vector a is lexicographically smaller than b (higher-ranked rules always win).
   const less = (a: number[], b: number[]) => { for (let i = 0; i < a.length; i++) { if (a[i] < b[i] - 1e-9) return true; if (a[i] > b[i] + 1e-9) return false; } return false; };
-  const yearsRange = Array.from({ length: s.endYear - s.startYear + 1 }, (_, i) => s.startYear + i);
+  const yearsRange = Array.from({ length: s.endYear - autoFrom(s) + 1 }, (_, i) => autoFrom(s) + i);
   const setUnit = (u: RoadmapDest[], y: number) => u.forEach((d) => year.set(d.id, y));
 
   let best = total();

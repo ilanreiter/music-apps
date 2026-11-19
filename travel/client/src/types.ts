@@ -65,6 +65,7 @@ export interface TripItem {
   userNotes?: string | null;
   freeCancelUntil?: string | null;
   paid?: boolean;
+  traveler?: string | null;
 }
 
 export interface ChecklistItem {
@@ -171,7 +172,7 @@ export interface ProposedItinerary {
 
 export interface RoadmapSettings {
   startYear: number; endYear: number; annualCap: number; maxFarPerYear: number;
-  ageA: number | null; ageB: number | null; highMobilityUntil: number | null; ruleOrder: string[]; ruleDisabled: string[]; autoOrder: boolean;
+  ageA: number | null; ageB: number | null; highMobilityUntil: number | null; ruleOrder: string[]; ruleDisabled: string[]; autoOrder: boolean; autoFromYear?: number | null;
 }
 export interface Pairing { id: string; name: string; year: number | null; quarter: string | null; savings: number }
 export interface RoadmapDest {

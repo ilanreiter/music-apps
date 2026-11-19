@@ -26,6 +26,7 @@ const itemSchema = z.object({
   userNotes: z.string().nullable().optional(),
   freeCancelUntil: z.string().datetime().nullable().optional(),
   paid: z.boolean().optional(),
+  traveler: z.string().nullable().optional(),
 });
 
 function toDate(v: string | null | undefined) {

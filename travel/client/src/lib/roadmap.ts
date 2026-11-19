@@ -3,9 +3,13 @@ import { Pairing, RoadmapDest, RoadmapSettings } from "../types";
 export const SEASONS = ["Winter", "Spring", "Summer", "Fall"];
 
 /** Empty season slots that sit before the last scheduled trip (gaps in the calendar). */
+/** First year the planner may use; earlier rows (e.g. the current year) are manual-only. */
+export const autoFrom = (s: { startYear: number; autoFromYear?: number | null }) => s.autoFromYear ?? s.startYear;
+
 export function seasonGaps(cells: { year: number; season: string | null }[], startYear: number) {
   const idx = new Set<number>();
   for (const c of cells) {
+    if (c.year < startYear) continue;
     const si = c.season ? SEASONS.indexOf(c.season) : -1;
     if (si >= 0) idx.add((c.year - startYear) * 4 + si);
   }
@@ -127,7 +131,7 @@ export function ruleChecks(years: YearSummary[], s: RoadmapSettings, pairings: P
     cells.set(k, (cells.get(k) ?? new Set()).add(d.pairingId ?? d.id));
   }
   const crowded = [...cells.values()].filter((v) => v.size > 1).length;
-  const gaps = seasonGaps(placed.map((d) => ({ year: d.planYear!, season: d.planSeason })), s.startYear);
+  const gaps = seasonGaps(placed.map((d) => ({ year: d.planYear!, season: d.planSeason })), autoFrom(s));
   const n = (c: number, unit: string) => (c === 0 ? "All good" : `${c} ${unit}`);
   const disabled = new Set(s.ruleDisabled ?? []);
   const raw: Omit<RuleCheck, "enabled">[] = [
@@ -185,11 +189,11 @@ export function emptySlots(dests: RoadmapDest[], s: RoadmapSettings): Set<string
   for (const d of dests) {
     if (d.planYear == null || d.status === "VISITED") continue;
     const si = d.planSeason ? SEASONS.indexOf(d.planSeason) : -1;
-    if (si >= 0) used.add((d.planYear - s.startYear) * 4 + si);
+    if (si >= 0 && d.planYear >= autoFrom(s)) used.add((d.planYear - autoFrom(s)) * 4 + si);
   }
   const out = new Set<string>();
   if (!used.size) return out;
   const last = Math.max(...used);
-  for (let i = 0; i < last; i++) if (!used.has(i)) out.add(`${s.startYear + Math.floor(i / 4)}|${SEASONS[i % 4]}`);
+  for (let i = 0; i < last; i++) if (!used.has(i)) out.add(`${autoFrom(s) + Math.floor(i / 4)}|${SEASONS[i % 4]}`);
   return out;
 }

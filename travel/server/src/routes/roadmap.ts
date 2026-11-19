@@ -37,7 +37,7 @@ const settingsSchema = z.object({
   startYear: z.number().int(), endYear: z.number().int(), annualCap: z.number().nonnegative(),
   maxFarPerYear: z.number().int().nonnegative(), ageA: z.number().int().nullable(),
   ageB: z.number().int().nullable(), highMobilityUntil: z.number().int().nullable(),
-  ruleOrder: z.array(z.string()), ruleDisabled: z.array(z.string()), autoOrder: z.boolean(),
+  ruleOrder: z.array(z.string()), ruleDisabled: z.array(z.string()), autoOrder: z.boolean(), autoFromYear: z.number().int().nullable(),
 }).partial();
 
 router.patch("/settings", async (req, res) => {
@@ -198,7 +198,7 @@ router.post("/optimize", async (_req, res) => {
       bestSeason: d.bestSeason, secondSeason: d.secondSeason, suggestedYear: d.suggestedYear, priority: d.priority,
       seasonFactors: (d.seasonFactors as Record<string, number> | null) ?? null,
     })), {
-      startYear: settings.startYear, endYear: settings.endYear, annualCap: settings.annualCap, maxFarPerYear: settings.maxFarPerYear,
+      startYear: settings.startYear, autoFromYear: settings.autoFromYear, endYear: settings.endYear, annualCap: settings.annualCap, maxFarPerYear: settings.maxFarPerYear,
       highMobilityUntil: settings.highMobilityUntil, ruleDisabled: settings.ruleDisabled ?? [],
     }, 40);
     if (!r.placements.length) return res.status(422).json({ error: `The optimizer found no solution (${r.status}).` });

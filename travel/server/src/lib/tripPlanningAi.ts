@@ -20,7 +20,7 @@ async function askJson(prompt: string, maxTokens = 8000): Promise<any> {
 export interface ExtractedBooking {
   type: "TRANSPORT" | "STAY" | "ACTIVITY" | "OTHER"; title: string; provider: string | null; confirmationNo: string | null;
   startAt: string | null; endAt: string | null; location: string | null; cost: number | null; currency: string | null;
-  freeCancelUntil: string | null; bookingUrl: string | null; notes: string | null; bookingStatus: "BOOKED" | "CONFIRMED";
+  freeCancelUntil: string | null; bookingUrl: string | null; notes: string | null; bookingStatus: "BOOKED" | "CONFIRMED"; traveler: string | null;
 }
 
 // Naive local date-times ("2027-03-14T10:30") become ISO instants the same way the rest of the app stores itinerary times.
@@ -35,11 +35,12 @@ function iso(input: unknown, defaultTime = "12:00", midnightMeansDateOnly = fals
 const str = (v: unknown) => (typeof v === "string" && v.trim() ? v.trim() : null);
 
 export async function extractBookings(rawText: string, tripName: string): Promise<ExtractedBooking[]> {
-  const j = await askJson(`Extract every travel booking from the text below (confirmation emails, receipts, itineraries) for a trip to ${tripName}.
+  const today = new Date().toISOString().slice(0, 10);
+  const j = await askJson(`Today is ${today}. Extract every travel booking from the text below (confirmation emails, receipts, itineraries) for a trip to ${tripName}.
 Return ONLY strict JSON: {"bookings":[{"type":"TRANSPORT|STAY|ACTIVITY|OTHER","title":"short title, e.g. 'Flight BOS→LIS TP208' or 'Hotel Avenida Palace'",
 "provider":"airline / hotel / company or null","confirmationNo":"booking reference or null","startAt":"YYYY-MM-DDTHH:MM (departure / check-in / start) or null","endAt":"YYYY-MM-DDTHH:MM (arrival / check-out / end) or null",
-"location":"city or address or null","cost":total price as a number or null,"currency":"USD or other ISO code or null","freeCancelUntil":"YYYY-MM-DD or null","bookingUrl":"link or null","notes":"seat, room type, baggage, check-in instructions, etc. or null","status":"BOOKED or CONFIRMED"}]}
-Use CONFIRMED when the text shows a confirmation number, otherwise BOOKED. Create one entry per flight leg, hotel stay, rental car, train, tour or activity. Never invent data that is not in the text.
+"location":"city or address or null","cost":total price as a number or null,"currency":"USD or other ISO code or null","freeCancelUntil":"YYYY-MM-DD or null","bookingUrl":"link or null","traveler":"passenger / guest name(s) this booking is for, or null","notes":"seat, room type, baggage, check-in instructions, etc. or null","status":"BOOKED or CONFIRMED"}]}
+When a date has no year, use the weekday if one is given to pick the right year; otherwise take the next occurrence of that date after today. Use CONFIRMED when the text shows a confirmation number, otherwise BOOKED. Create one entry per flight leg, hotel stay, rental car, train, tour or activity. Several emails may be for different travelers on the same trip: keep each as its own booking and record whose it is in \"traveler\". Never invent data that is not in the text.
 Text:
 """
 ${rawText.slice(0, 20000)}
@@ -52,7 +53,7 @@ ${rawText.slice(0, 20000)}
     startAt: iso(b.startAt, b.type === "STAY" ? "15:00" : "09:00", b.type === "STAY"), endAt: iso(b.endAt, b.type === "STAY" ? "11:00" : "09:00", b.type === "STAY"), location: str(b.location),
     cost: typeof b.cost === "number" && isFinite(b.cost) ? b.cost : null, currency: str(b.currency),
     freeCancelUntil: iso(b.freeCancelUntil), bookingUrl: str(b.bookingUrl), notes: str(b.notes),
-    bookingStatus: b.status === "CONFIRMED" ? "CONFIRMED" : "BOOKED",
+    bookingStatus: b.status === "CONFIRMED" ? "CONFIRMED" : "BOOKED", traveler: str(b.traveler),
   }));
 }
 

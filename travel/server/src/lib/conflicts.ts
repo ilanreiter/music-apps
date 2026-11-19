@@ -2,6 +2,7 @@ export interface ConflictCheckItem {
   id: string;
   title: string;
   type: string;
+  traveler?: string | null;
   startAt: Date | null;
   endAt: Date | null;
 }
@@ -47,6 +48,9 @@ export function detectConflicts(items: ConflictCheckItem[]): Conflict[] {
       const a = timed[i];
       const b = timed[j];
       if (!overlaps(a.startAt, a.endAt, b.startAt, b.endAt)) continue;
+      // The same flight/stay held by two travelers (one ticket each: identical window, or different named travelers) is one trip, not a clash.
+      if (a.traveler && b.traveler && a.traveler.trim().toLowerCase() !== b.traveler.trim().toLowerCase()) continue;
+      if (a.type === b.type && a.startAt.getTime() === b.startAt.getTime() && a.endAt.getTime() === b.endAt.getTime()) continue;
 
       const bothExclusive = EXCLUSIVE_TYPES.has(a.type) && EXCLUSIVE_TYPES.has(b.type);
       const oneExclusive = EXCLUSIVE_TYPES.has(a.type) || EXCLUSIVE_TYPES.has(b.type);

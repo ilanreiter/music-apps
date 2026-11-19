@@ -6,7 +6,7 @@ import { daysFromNow, isBookable, isBooked, money, shortDate } from "./shared";
 export type PlanTab = "Overview" | "Itinerary" | "Schedule" | "Bookings" | "Checklist" | "Route" | "Budget" | "Resources";
 
 /** Readiness at a glance: countdown, what's booked, what's due, and a place to keep key trip information. */
-export default function OverviewTab({ trip, goTo }: { trip: Trip; goTo: (t: PlanTab) => void }) {
+export default function OverviewTab({ trip, goTo, onImportBookings }: { trip: Trip; goTo: (t: PlanTab) => void; onImportBookings?: () => void }) {
   const bookable = trip.items.filter(isBookable);
   const booked = bookable.filter(isBooked);
   const todo = bookable.filter((i) => !isBooked(i) && i.bookingStatus !== "CANCELLED");
@@ -31,6 +31,17 @@ export default function OverviewTab({ trip, goTo }: { trip: Trip; goTo: (t: Plan
 
   return (
     <div className="space-y-4">
+      {!trip.startDate && (
+        <Card className="p-4 border-amber-300 dark:border-amber-800 bg-amber-50 dark:bg-amber-950/30">
+          <div className="flex flex-wrap items-center gap-3">
+            <div className="min-w-[14rem] flex-1 text-sm">
+              <div className="font-medium text-amber-800 dark:text-amber-300">This trip has no dates yet</div>
+              <div className="text-xs text-amber-700 dark:text-amber-400">Import your flight or hotel confirmation (paste, PDF or .eml) to fill in the real dates and update the itinerary, or set the dates yourself under “Edit trip basics”.</div>
+            </div>
+            {onImportBookings && <button type="button" onClick={onImportBookings} className="rounded-md bg-brand-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-brand-700">Import booking email / PDF</button>}
+          </div>
+        </Card>
+      )}
       <div className="grid grid-cols-1 gap-3 md:grid-cols-4">
         <Tile icon={CalendarClock} label="Departure" value={days == null ? "Dates not set" : days > 0 ? `In ${days} day${days === 1 ? "" : "s"}` : days === 0 ? "Today" : "Underway / past"} sub={trip.startDate ? shortDate(trip.startDate) : undefined} />
         <Tile icon={Plane} label="Bookings" value={`${booked.length} of ${bookable.length} booked`} sub={todo.length ? `${todo.length} still to book` : bookable.length ? "All booked" : undefined} onClick={() => goTo("Bookings")} />

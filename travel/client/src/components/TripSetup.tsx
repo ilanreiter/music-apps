@@ -206,11 +206,13 @@ function BuildItinerary({
   reload,
   onDismiss,
   isRegenerate = false,
+  onImportBookings,
 }: {
   trip: Trip;
   reload: () => void;
   onDismiss: () => void;
   isRegenerate?: boolean;
+  onImportBookings?: () => void;
 }) {
   const [mode, setMode] = useState<"choose" | "import" | "propose">("choose");
   const [pastedText, setPastedText] = useState("");
@@ -379,7 +381,7 @@ function BuildItinerary({
       </p>
 
       {mode === "choose" && (
-        <div className="grid grid-cols-3 gap-3">
+        <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
           <button
             onClick={startFromScratch}
             className="text-left p-4 rounded-lg border border-slate-200 dark:border-slate-700 hover:border-brand-400 transition-colors"
@@ -394,8 +396,17 @@ function BuildItinerary({
             className="text-left p-4 rounded-lg border border-slate-200 dark:border-slate-700 hover:border-brand-400 transition-colors"
           >
             <div className="font-medium mb-1 flex items-center gap-1.5"><DownloadIcon className="h-4 w-4 text-brand-600 dark:text-brand-400" /> Import existing itinerary</div>
-            <div className="text-xs text-slate-500 dark:text-slate-400">Paste text (or a booking/confirmation email), or upload a file — Claude will structure it.</div>
+            <div className="text-xs text-slate-500 dark:text-slate-400">Paste a day-by-day plan (text, PDF or file) — Claude will structure it into itinerary items.</div>
           </button>
+          {onImportBookings && (
+            <button
+              onClick={onImportBookings}
+              className="text-left p-4 rounded-lg border border-slate-200 dark:border-slate-700 hover:border-brand-400 transition-colors"
+            >
+              <div className="font-medium mb-1 flex items-center gap-1.5"><DownloadIcon className="h-4 w-4 text-brand-600 dark:text-brand-400" /> Import booking emails</div>
+              <div className="text-xs text-slate-500 dark:text-slate-400">Flight, hotel and tour confirmations (paste, PDF or .eml) become bookings, and set the trip dates.</div>
+            </button>
+          )}
           <button
             onClick={() => setMode("propose")}
             className="text-left p-4 rounded-lg border border-slate-200 dark:border-slate-700 hover:border-brand-400 transition-colors"
@@ -570,7 +581,7 @@ function ProposalReviewWrapper({
   );
 }
 
-export default function TripSetup({ trip, reload }: { trip: Trip; reload: () => void }) {
+export default function TripSetup({ trip, reload, onImportBookings }: { trip: Trip; reload: () => void; onImportBookings?: () => void }) {
   const [dismissed, setDismissed] = useState(false);
   const [regenerating, setRegenerating] = useState(false);
 
@@ -590,7 +601,7 @@ export default function TripSetup({ trip, reload }: { trip: Trip; reload: () => 
       <TripBasics trip={trip} reload={reload} />
       <TripNotes trip={trip} reload={reload} />
       {trip.items.length === 0 && !dismissed && (
-        <BuildItinerary trip={trip} reload={reload} onDismiss={() => setDismissed(true)} />
+        <BuildItinerary trip={trip} reload={reload} onDismiss={() => setDismissed(true)} onImportBookings={onImportBookings} />
       )}
       {trip.items.length > 0 && !regenerating && (
         <Card className="p-4 mb-6 flex items-center justify-between">

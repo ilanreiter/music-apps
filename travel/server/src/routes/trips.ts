@@ -67,6 +67,18 @@ router.patch("/:id", async (req, res) => {
   if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
 
   const { startDate, endDate, ...rest } = parsed.data;
+  // Items planned before the trip had dates sit on a placeholder calendar (Day 1 = 2000-01-01). When real dates are first
+  // set, move them onto the real calendar so Day 1 becomes the start date and times of day are preserved.
+  const before = startDate ? await prisma.trip.findUnique({ where: { id: req.params.id }, select: { startDate: true } }) : null;
+  if (startDate && before && !before.startDate) {
+    const s = new Date(startDate);
+    const delta = Date.UTC(s.getUTCFullYear(), s.getUTCMonth(), s.getUTCDate()) - Date.UTC(2000, 0, 1);
+    const placeholder = await prisma.tripItem.findMany({ where: { tripId: req.params.id, startAt: { lt: new Date(Date.UTC(2001, 0, 1)) } } });
+    await prisma.$transaction(placeholder.map((i) => prisma.tripItem.update({
+      where: { id: i.id },
+      data: { startAt: i.startAt ? new Date(i.startAt.getTime() + delta) : undefined, endAt: i.endAt ? new Date(i.endAt.getTime() + delta) : undefined },
+    })));
+  }
   const trip = await prisma.trip.update({
     where: { id: req.params.id },
     data: {
@@ -86,7 +98,7 @@ router.delete("/:id", async (req, res) => {
 router.get("/:id/conflicts", async (req, res) => {
   const items = await prisma.tripItem.findMany({
     where: { tripId: req.params.id },
-    select: { id: true, title: true, type: true, startAt: true, endAt: true },
+    select: { id: true, title: true, type: true, traveler: true, startAt: true, endAt: true },
   });
   res.json(detectConflicts(items));
 });

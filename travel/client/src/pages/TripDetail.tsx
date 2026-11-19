@@ -95,6 +95,8 @@ export default function TripDetail() {
   const [tab, setTab] = useState<Tab>("Overview");
   const [showItemForm, setShowItemForm] = useState(false);
   const [roadmap, setRoadmap] = useState<RoadmapData | null>(null);
+  const [bookingsPanel, setBookingsPanel] = useState<"" | "email">("");
+  const importBookings = () => { setBookingsPanel("email"); setTab("Bookings"); };
 
   function load() {
     if (!id) return;
@@ -154,7 +156,7 @@ export default function TripDetail() {
         </Card>
       )}
 
-      {(tab === "Overview" || tab === "Itinerary") && <TripSetup trip={trip} reload={load} />}
+      {(tab === "Overview" || tab === "Itinerary") && <TripSetup trip={trip} reload={load} onImportBookings={importBookings} />}
       </div>
       </div>
 
@@ -174,12 +176,12 @@ export default function TripDetail() {
         ))}
       </div>
 
-      {tab === "Overview" && <OverviewTab trip={trip} goTo={setTab} />}
+      {tab === "Overview" && <OverviewTab trip={trip} goTo={setTab} onImportBookings={importBookings} />}
       {tab === "Schedule" && <ScheduleTab trip={trip} conflicts={conflicts} />}
-      {tab === "Bookings" && <BookingsTab trip={trip} agents={agents} reload={load} />}
+      {tab === "Bookings" && <BookingsTab trip={trip} agents={agents} reload={load} openPanel={bookingsPanel} onPanelOpened={() => setBookingsPanel("")} />}
       {tab === "Checklist" && <ChecklistTab trip={trip} reload={load} />}
       {tab === "Itinerary" && (
-        <ItineraryTab trip={trip} agents={agents} reload={load} showForm={showItemForm} setShowForm={setShowItemForm} />
+        <ItineraryTab trip={trip} agents={agents} reload={load} showForm={showItemForm} setShowForm={setShowItemForm} onImportBookings={importBookings} />
       )}
       {tab === "Route" && <RouteTab trip={trip} reload={load} />}
       {tab === "Budget" && <BudgetTab tripId={trip.id} lines={trip.budgetLines} items={trip.items} reload={load} />}
@@ -326,12 +328,14 @@ function ItineraryTab({
   reload,
   showForm,
   setShowForm,
+  onImportBookings,
 }: {
   trip: Trip;
   agents: BookingAgent[];
   reload: () => void;
   showForm: boolean;
   setShowForm: (v: boolean) => void;
+  onImportBookings: () => void;
 }) {
   const [type, setType] = useState<TripItemType>("TRANSPORT");
   const [itemTitle, setItemTitle] = useState("");
@@ -397,7 +401,8 @@ function ItineraryTab({
   return (
     <div>
       <PlacesImport trip={trip} reload={reload} />
-      <div className="flex justify-end mb-4">
+      <div className="flex justify-end gap-2 mb-4">
+        <Button variant="secondary" onClick={onImportBookings}>Import booking email / PDF</Button>
         <Button onClick={() => setShowForm(!showForm)}>{showForm ? "Cancel" : "+ Add item"}</Button>
       </div>
 

@@ -177,6 +177,8 @@ model TripItem {
   // Booking management: last day to cancel for free, and whether it has been paid.
   freeCancelUntil DateTime?
   paid            Boolean       @default(false)
+  // Whose booking it is when several travelers each hold their own ticket for the same flight/stay.
+  traveler        String?
   createdAt       DateTime      @default(now())
   updatedAt       DateTime      @updatedAt
 }
@@ -280,6 +282,8 @@ model RoadmapSettings {
   ruleOrder           String[] @default([])
   ruleDisabled        String[] @default([])
   autoOrder           Boolean @default(false)
+  // First year the planner/optimizer may place trips in (earlier rows, e.g. the current year, stay manual). Null = startYear.
+  autoFromYear        Int?
 }
 
 // A pre-trip to-do (visa, insurance, packing, ...) in a trip's checklist.

@@ -14,7 +14,7 @@ export interface OptCard {
   seasonFactors: Record<string, number> | null;
 }
 export interface OptSettings {
-  startYear: number; endYear: number; annualCap: number; maxFarPerYear: number; highMobilityUntil: number | null; ruleDisabled: string[];
+  startYear: number; autoFromYear: number | null; endYear: number; annualCap: number; maxFarPerYear: number; highMobilityUntil: number | null; ruleDisabled: string[];
 }
 export interface OptResult {
   status: string; optimal: boolean; objective: number;
@@ -23,7 +23,11 @@ export interface OptResult {
 
 const level = (m: string | null) => (m ? MOBILITY.indexOf(m) + 1 : 0);
 
-export async function optimizeBoard(cards: OptCard[], s: OptSettings, timeLimitSec = 30): Promise<OptResult> {
+export async function optimizeBoard(allCards: OptCard[], s0: OptSettings, timeLimitSec = 30): Promise<OptResult> {
+  // Rows before autoFromYear (e.g. the current year) stay manual: the optimizer neither uses nor moves them.
+  const from = s0.autoFromYear ?? s0.startYear;
+  const s = { ...s0, startYear: from };
+  const cards = allCards.filter((c) => c.planYear >= from);
   const off = new Set(s.ruleDisabled);
   const on = (r: string) => !off.has(r);
   const years: number[] = [];
