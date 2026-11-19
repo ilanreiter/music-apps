@@ -155,3 +155,19 @@ export interface ProposedItinerary {
   summary?: string;
   items: ProposedItem[];
 }
+
+export interface RoadmapSettings {
+  startYear: number; endYear: number; annualCap: number; maxFarPerYear: number;
+  ageA: number | null; ageB: number | null; highMobilityUntil: number | null; ruleOrder: string[]; ruleDisabled: string[];
+}
+export interface Pairing { id: string; name: string; year: number | null; quarter: string | null; savings: number }
+export interface RoadmapDest {
+  id: string; name: string; status: DestinationStatus; priority: number; notes: string | null;
+  planYear: number | null; planSeason: string | null; tier: string | null; isFar: boolean;
+  days: number | null; dailyCost: number | null; transitCost: number | null; mobility: string | null;
+  pairingId: string | null; bestSeason: string | null; secondSeason: string | null;
+  weather: string | null; weatherAlt: string | null; lat: number | null; lng: number | null;
+  suggestedYear: number | null; suggestedSeason: string | null; suggestedPriority: number | null; pinned: boolean;
+  _count: { trips: number }; trips: { id: string }[];
+}
+export interface RoadmapData { settings: RoadmapSettings; pairings: Pairing[]; destinations: RoadmapDest[] }

@@ -88,6 +88,26 @@ model Destination {
   imageUrl    String?
   roughCostEstimate Float?
   bestSeason  String?
+  // Roadmap fields — planYear is null for unscheduled ideas and for visited places.
+  planYear      Int?
+  planSeason    String?
+  tier          String?
+  isFar         Boolean  @default(false)
+  days          Int?
+  dailyCost     Float?
+  transitCost   Float?
+  mobility      String?
+  secondSeason  String?
+  weather       String?
+  weatherAlt    String?
+  lat           Float?
+  lng           Float?
+  suggestedYear   Int?
+  suggestedSeason String?
+  suggestedPriority Int?
+  pinned        Boolean  @default(false)
+  pairingId     String?
+  pairing       Pairing? @relation(fields: [pairingId], references: [id], onDelete: SetNull)
   createdAt   DateTime          @default(now())
   updatedAt   DateTime          @updatedAt
   trips       Trip[]
@@ -228,4 +248,28 @@ model AiMessage {
   role      String
   content   String
   createdAt DateTime @default(now())
+}
+
+// A regional pairing: several destinations flown as one trip, saving airfare.
+model Pairing {
+  id           String        @id @default(cuid())
+  name         String
+  year         Int?
+  quarter      String?
+  savings      Float         @default(0)
+  destinations Destination[]
+}
+
+// Singleton (id is always "default") — roadmap horizon and guardrails.
+model RoadmapSettings {
+  id                  String @id @default("default")
+  startYear           Int    @default(2027)
+  endYear             Int    @default(2034)
+  annualCap           Float  @default(30000)
+  maxFarPerYear       Int    @default(2)
+  ageA                Int?
+  ageB                Int?
+  highMobilityUntil   Int?
+  ruleOrder           String[] @default([])
+  ruleDisabled        String[] @default([])
 }

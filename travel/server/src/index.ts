@@ -11,6 +11,7 @@ import resourcesRouter from "./routes/resources";
 import aiRouter from "./routes/ai";
 import preferencesRouter from "./routes/preferences";
 import travelersRouter from "./routes/travelers";
+import roadmapRouter from "./routes/roadmap";
 import { requireAuth } from "./middleware/auth";
 
 const app = express();
@@ -26,6 +27,7 @@ app.get("/api/health", (_req, res) => res.json({ ok: true }));
 app.use("/api/auth", authRouter);
 
 // Everything below requires a logged-in household member.
+app.use("/api/roadmap", requireAuth, roadmapRouter);
 app.use("/api/destinations", requireAuth, destinationsRouter);
 app.use("/api/trips/:tripId/items", requireAuth, tripItemsRouter);
 app.use("/api/trips/:tripId/budget", requireAuth, budgetRouter);

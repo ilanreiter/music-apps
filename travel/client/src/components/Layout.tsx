@@ -2,18 +2,21 @@ import React from "react";
 import { NavLink, Outlet } from "react-router-dom";
 import { useAuth } from "../lib/AuthContext";
 import { useTheme } from "../lib/ThemeContext";
+import { motion } from "framer-motion";
+import { Bot, BookOpen, LayoutGrid, PiggyBank, Handshake, MapPinned, Settings, Users, Wallet, Luggage } from "lucide-react";
 import { CompassIcon, MoonIcon, SunIcon } from "./icons";
 
 const navItems = [
-  { to: "/", label: "Dashboard", end: true, emoji: "🏠" },
-  { to: "/destinations", label: "Destinations", emoji: "🗺️" },
-  { to: "/trips", label: "Trips", emoji: "🧳" },
-  { to: "/travelers", label: "Travelers", emoji: "🧑‍🤝‍🧑" },
-  { to: "/finances", label: "Finances", emoji: "💰" },
-  { to: "/booking-agents", label: "Booking Agents", emoji: "🤝" },
-  { to: "/resources", label: "Resources", emoji: "📚" },
-  { to: "/assistant", label: "AI Assistant", emoji: "🤖" },
-  { to: "/preferences", label: "Preferences", emoji: "⚙️" },
+  { to: "/", label: "Dashboard", end: true, Icon: LayoutGrid },
+  { to: "/budget", label: "Budget", Icon: PiggyBank },
+  { to: "/destinations", label: "Destinations", Icon: MapPinned },
+  { to: "/trips", label: "Trips", Icon: Luggage },
+  { to: "/travelers", label: "Travelers", Icon: Users },
+  { to: "/finances", label: "Finances", Icon: Wallet },
+  { to: "/booking-agents", label: "Booking Agents", Icon: Handshake },
+  { to: "/resources", label: "Resources", Icon: BookOpen },
+  { to: "/assistant", label: "AI Assistant", Icon: Bot },
+  { to: "/preferences", label: "Preferences", Icon: Settings },
 ];
 
 export default function Layout() {
@@ -34,13 +37,24 @@ export default function Layout() {
               to={item.to}
               end={item.end}
               className={({ isActive }) =>
-                `flex items-center gap-2 rounded-md px-3 py-2 text-sm font-medium transition-colors ${
-                  isActive ? "bg-white/15 text-white" : "text-brand-100 hover:bg-white/10"
+                `relative flex items-center gap-2.5 rounded-md px-3 py-2 text-sm font-medium transition-colors ${
+                  isActive ? "text-white" : "text-brand-100 hover:bg-white/10"
                 }`
               }
             >
-              <span aria-hidden="true">{item.emoji}</span>
-              {item.label}
+              {({ isActive }) => (
+                <>
+                  {isActive && (
+                    <motion.span
+                      layoutId="nav-active"
+                      className="absolute inset-0 rounded-md bg-white/15 ring-1 ring-white/10"
+                      transition={{ type: "spring", stiffness: 500, damping: 40 }}
+                    />
+                  )}
+                  <item.Icon className="relative h-4 w-4 shrink-0" aria-hidden="true" />
+                  <span className="relative">{item.label}</span>
+                </>
+              )}
             </NavLink>
           ))}
         </nav>
@@ -65,7 +79,7 @@ export default function Layout() {
         </div>
       </aside>
       <main className="flex-1 overflow-y-auto bg-slate-50 dark:bg-slate-950 transition-colors">
-        <div className="max-w-6xl mx-auto px-6 py-8">
+        <div className="max-w-[1800px] mx-auto px-6 py-8">
           <Outlet />
         </div>
       </main>

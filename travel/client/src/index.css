@@ -9,3 +9,29 @@ html, body, #root {
 body {
   @apply bg-slate-50 text-slate-900 dark:bg-slate-950 dark:text-slate-100 transition-colors;
 }
+
+/* Roadmap data-viz tokens (validated palette: blue / aqua / yellow / orange, red for over-cap) */
+:root {
+  --viz-surface: #ffffff;
+  --viz-grid: #e5e7eb;
+  --viz-text: #0f172a;
+  --viz-muted: #64748b;
+  --viz-bar: #2a78d6;
+  --viz-bad: #e34948;
+  --season-winter: #2a78d6;
+  --season-spring: #1baf7a;
+  --season-summer: #eda100;
+  --season-fall: #eb6834;
+}
+.dark {
+  --viz-surface: #0f172a;
+  --viz-grid: #1e293b;
+  --viz-text: #f1f5f9;
+  --viz-muted: #94a3b8;
+  --viz-bar: #3987e5;
+  --viz-bad: #e66767;
+  --season-winter: #3987e5;
+  --season-spring: #199e70;
+  --season-summer: #c98500;
+  --season-fall: #d95926;
+}

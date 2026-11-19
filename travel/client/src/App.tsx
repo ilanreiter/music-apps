@@ -5,6 +5,7 @@ import { ThemeProvider } from "./lib/ThemeContext";
 import Layout from "./components/Layout";
 import Login from "./pages/Login";
 import Dashboard from "./pages/Dashboard";
+import Budget from "./pages/Budget";
 import Destinations from "./pages/Destinations";
 import Trips from "./pages/Trips";
 import TripDetail from "./pages/TripDetail";
@@ -35,6 +36,7 @@ function AppRoutes() {
         }
       >
         <Route index element={<Dashboard />} />
+        <Route path="budget" element={<Budget />} />
         <Route path="destinations" element={<Destinations />} />
         <Route path="trips" element={<Trips />} />
         <Route path="trips/:id" element={<TripDetail />} />

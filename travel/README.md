@@ -57,6 +57,7 @@ few sample destinations, so you're not staring at an empty app.
 
 | Area | Where |
 |---|---|
+| **Roadmap** (home page) | Multi-year portfolio plan: per-year spend vs. annual cap, far-trip limit, ages, demanding-trip cutoff, season fit and split-pairing warnings; inline-edit each destination's year/season/days/costs; regional pairings with airfare savings; visited history. **Import from markdown** loads a portfolio summary file (see `retirement_travel_portfolio_summary_2027_2034.md`) — re-importing updates by name |
 | Prioritized destination list | **Destinations** page — reorder with ▲/▼, track status (idea → researching → planned → booked → visited) |
 | Trip planning | **Trips → a trip** starts with high-level basics (dates or duration+season, planning type, goal/style), then the **Itinerary tab** for transport/stay/POI/activity items with dates, cost, provider, booking status |
 | Building an itinerary | Shown automatically for an empty trip: **start from scratch**, **paste/upload an existing itinerary** (including pasted email text — parsed into structured items by Claude), or **propose with AI** (Claude drafts a day-by-day plan from the trip's goal + your saved preferences). Proposals are reviewed/checked before anything is added |
@@ -95,6 +96,7 @@ The Vite dev server proxies `/api` to `http://localhost:4000` by default (see
 See `server/prisma/schema.prisma` for the full model. At a glance:
 
 - `Destination` — the wishlist, with `priority` for ordering
+- `Pairing` / `RoadmapSettings` — regional pairings (airfare savings) and the roadmap horizon/guardrails; roadmap slot fields live on `Destination` (`planYear`, `planSeason`, `days`, `dailyCost`, `transitCost`, `mobility`, `isFar`)
 - `Trip` — optionally linked to a `Destination`; carries high-level planning fields (`durationNights`/`travelSeason` for pre-date planning, `planningType`, `goal`)
 - `TripItem` — a polymorphic itinerary entry (`TRANSPORT`/`STAY`/`POI`/`ACTIVITY`/`OTHER`) carrying timing, cost, and booking status/confirmation/agent
 - `BudgetLine` — category-based estimated vs. actual spend per trip
