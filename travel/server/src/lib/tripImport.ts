@@ -128,7 +128,11 @@ function matchBooking(items: Item[], b: BookingData): Item | undefined {
   const sameThing = (e: Item) => {
     const sameDay = !b.startAt || !e.startAt || placeholder(e.startAt) || day(e.startAt.toISOString()) === day(b.startAt);
     if (norm(e.title) === norm(b.title) && sameDay) return true;
-    if (b.type === "TRANSPORT") { const n = nums(b.title); return [...nums(e.title)].some((x) => n.has(x)) && sameDay; }
+    if (b.type === "TRANSPORT") {
+      // same reference and the exact same departure time is the same booking even when the AI words the title differently (car rentals have no flight number)
+      if (b.startAt && b.startAt.length > 10 && e.startAt && !placeholder(e.startAt) && e.startAt.toISOString().slice(0, 16) === b.startAt.slice(0, 16)) return true;
+      const n = nums(b.title); return [...nums(e.title)].some((x) => n.has(x)) && sameDay;
+    }
     if (b.type === "STAY") { const w = words(b.title); return sameDay && [...words(e.title)].some((x) => w.has(x)); }
     return sameDay;
   };

@@ -1,13 +1,15 @@
-import React from "react";
-import { NavLink, Outlet } from "react-router-dom";
+import React, { useEffect, useState } from "react";
+import { api } from "../lib/api";
+import { NavLink, Outlet, useLocation } from "react-router-dom";
 import { useAuth } from "../lib/AuthContext";
 import { useTheme } from "../lib/ThemeContext";
 import { motion } from "framer-motion";
-import { Bot, BookOpen, LayoutGrid, PiggyBank, Handshake, Settings, Users } from "lucide-react";
+import { Bot, BookOpen, Inbox as InboxIcon, LayoutGrid, PiggyBank, Handshake, Settings, Users } from "lucide-react";
 import { CompassIcon, MoonIcon, SunIcon } from "./icons";
 
 const navItems = [
   { to: "/", label: "Dashboard", end: true, Icon: LayoutGrid },
+  { to: "/inbox", label: "Inbox", Icon: InboxIcon },
   { to: "/budget", label: "Budget", Icon: PiggyBank },
   { to: "/travelers", label: "Travelers", Icon: Users },
   { to: "/booking-agents", label: "Booking Agents", Icon: Handshake },
@@ -19,6 +21,9 @@ const navItems = [
 export default function Layout() {
   const { user, logout } = useAuth();
   const { theme, toggleTheme } = useTheme();
+  const [pending, setPending] = useState(0);
+  const loc = useLocation();
+  useEffect(() => { api.get<{ pending: number }>("/inbox/count").then((r) => setPending(r.pending)).catch(() => {}); }, [loc.pathname]);
 
   return (
     <div className="flex min-h-screen">
@@ -50,6 +55,7 @@ export default function Layout() {
                   )}
                   <item.Icon className="relative h-4 w-4 shrink-0" aria-hidden="true" />
                   <span className="relative">{item.label}</span>
+                  {item.to === "/inbox" && pending > 0 && <span className="relative ml-auto rounded-full bg-white/20 px-1.5 text-[11px]">{pending}</span>}
                 </>
               )}
             </NavLink>

@@ -318,3 +318,19 @@ model TripImport {
 
   @@unique([tripId, hash])
 }
+
+// Mail forwarded to the app's dedicated mailbox (see lib/inbox.ts), waiting to be filed into a trip.
+model InboxItem {
+  id              String    @id @default(cuid())
+  messageId       String    @unique
+  fromAddr        String
+  subject         String
+  receivedAt      DateTime
+  bodyText        String
+  attachments     Json      @default("[]")
+  status          String    @default("PENDING") // PENDING | FILED | DISMISSED
+  suggestedTripId String?
+  suggestionNote  String?
+  tripId          String?
+  createdAt       DateTime  @default(now())
+}

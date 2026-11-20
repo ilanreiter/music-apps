@@ -27,11 +27,12 @@ function detail(p: Proposal): string {
 const title = (p: Proposal) => p.data.title ?? p.data.text;
 
 /** One place to bring anything into a trip: files, screenshots, pasted text and emails, web addresses. */
-export default function ImportCard({ tripId, onClose, reload }: { tripId: string; onClose: () => void; reload: () => void }) {
-  const [sources, setSources] = useState<Source[]>([]);
+export default function ImportCard({ tripId, onClose, reload, initialSources, onApplied }: { tripId: string; onClose: () => void; reload: () => void; initialSources?: { name: string; text: string; note?: string }[]; onApplied?: () => void }) {
+  const [sources, setSources] = useState<Source[]>(() => (initialSources ?? []).map((x, i) => ({ id: -1 - i, name: x.name, kind: "text" as const, text: x.text, note: x.note })));
   const [text, setText] = useState("");
   const [url, setUrl] = useState("");
   const [over, setOver] = useState(false);
+  const [preview, setPreview] = useState<number | null>(null);
   const [busy, setBusy] = useState<"" | "reading" | "analyzing" | "applying">("");
   const [progress, setProgress] = useState("");
   const [error, setError] = useState("");
@@ -85,7 +86,7 @@ export default function ImportCard({ tripId, onClose, reload }: { tripId: string
         if (remember) { chosen.push(...mine); srcs.push({ hash: r.hash, name: r.name, category: r.category, summary: r.summary || null }); r.travelers.forEach((t) => names.add(t)); }
       });
       const a = await api.post<Applied>(`/trips/${tripId}/import/apply`, { proposals: chosen.map(({ kind, data, action }) => ({ kind, data, action })), sources: srcs, travelers: [...names] });
-      setApplied(a); setResults(null); setSources([]); reload();
+      setApplied(a); setResults(null); setSources([]); reload(); onApplied?.();
     } catch (e: any) { setError(e.message); }
     setBusy("");
   };
@@ -145,12 +146,14 @@ export default function ImportCard({ tripId, onClose, reload }: { tripId: string
               {sources.length > 0 && (
                 <ul className="divide-y divide-slate-100 dark:divide-slate-800 rounded-md border border-slate-200 dark:border-slate-800 text-sm">
                   {sources.map((s) => (
-                    <li key={s.id} className="flex items-center gap-2 px-3 py-1.5">
+                    <li key={s.id} className="flex flex-wrap items-center gap-2 px-3 py-1.5">
                       <span className="text-slate-400">{s.kind === "url" ? <Globe className="h-4 w-4" /> : <FileUp className="h-4 w-4" />}</span>
                       <span className="min-w-0 flex-1 truncate">{s.name}</span>
                       {s.note && <span className="text-[11px] text-amber-600" title={s.note}>OCR</span>}
                       {s.text && <span className="text-[11px] text-slate-400">{Math.round(s.text.length / 100) / 10}k chars</span>}
+                      {s.text && <button type="button" onClick={() => setPreview(preview === s.id ? null : s.id)} className="text-[11px] text-brand-600 hover:underline">{preview === s.id ? "Hide" : "Preview"}</button>}
                       <button type="button" onClick={() => setSources((l) => l.filter((x) => x.id !== s.id))} aria-label={`Remove ${s.name}`} className="text-slate-400 hover:text-red-600"><X className="h-4 w-4" /></button>
+                    {preview === s.id && s.text && <pre className="mt-1 max-h-64 w-full overflow-auto whitespace-pre-wrap rounded bg-slate-50 dark:bg-slate-900 p-2 text-[11px] text-slate-600 dark:text-slate-300">{s.text.slice(0, 20000)}{s.text.length > 20000 ? "\n… (preview cut; the full text is still read)" : ""}</pre>}
                     </li>
                   ))}
                 </ul>

@@ -15,6 +15,8 @@ import aiRouter from "./routes/ai";
 import preferencesRouter from "./routes/preferences";
 import travelersRouter from "./routes/travelers";
 import roadmapRouter from "./routes/roadmap";
+import inboxRouter from "./routes/inbox";
+import { startInboxPolling } from "./lib/inbox";
 import { requireAuth } from "./middleware/auth";
 
 const app = express();
@@ -36,6 +38,7 @@ app.use("/api/trips/:tripId/items", requireAuth, tripItemsRouter);
 app.use("/api/trips/:tripId/budget", requireAuth, budgetRouter);
 app.use("/api/trips/:tripId/checklist", requireAuth, checklistRouter);
 app.use("/api/trips/:tripId/import", requireAuth, tripImportRouter);
+app.use("/api/inbox", requireAuth, inboxRouter);
 app.use("/api/documents", requireAuth, documentsRouter);
 app.use("/api/trips", requireAuth, tripsRouter);
 app.use("/api/booking-agents", requireAuth, bookingAgentsRouter);
@@ -51,4 +54,5 @@ app.use((err: any, _req: express.Request, res: express.Response, _next: express.
 
 app.listen(PORT, () => {
   console.log(`Travel API listening on port ${PORT}`);
+  startInboxPolling();
 });
