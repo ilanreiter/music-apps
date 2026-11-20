@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#06b6d4"/>
+      <stop offset="0.55" stop-color="#3b82f6"/>
+      <stop offset="1" stop-color="#8b5cf6"/>
+    </linearGradient>
+    <linearGradient id="needle" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffb347"/>
+      <stop offset="1" stop-color="#ff5e62"/>
+    </linearGradient>
+  </defs>
+  <rect width="64" height="64" rx="15" fill="url(#bg)"/>
+  <circle cx="32" cy="32" r="21" fill="none" stroke="#fff" stroke-width="3.5" opacity="0.95"/>
+  <g stroke="#fff" stroke-width="3" stroke-linecap="round" opacity="0.9">
+    <path d="M32 8.5v3M32 52.5v3M8.5 32h3M52.5 32h3"/>
+  </g>
+  <path d="M43 21L36 36 21 43 28 28z" fill="url(#needle)"/>
+  <path d="M43 21L36 36 28 28z" fill="#fff" opacity="0.35"/>
+  <circle cx="32" cy="32" r="2.6" fill="#fff"/>
+</svg>

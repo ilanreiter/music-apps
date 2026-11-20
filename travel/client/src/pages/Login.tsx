@@ -2,7 +2,7 @@ import React, { useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { useAuth } from "../lib/AuthContext";
 import { Button, Card, Input, Label } from "../components/ui";
-import { CompassIcon } from "../components/icons";
+import { WanderLogo } from "../components/icons";
 
 export default function Login() {
   const { login, register } = useAuth();
@@ -36,10 +36,10 @@ export default function Login() {
     <div className="min-h-screen flex items-center justify-center bg-slate-50 dark:bg-slate-950 px-4">
       <Card className="w-full max-w-sm p-6">
         <h1 className="flex items-center justify-center gap-2 text-xl font-display font-semibold text-center mb-1">
-          <CompassIcon className="h-5 w-5 text-brand-600 dark:text-brand-400" />
+          <WanderLogo className="h-8 w-8" />
           Wander
         </h1>
-        <p className="text-sm text-slate-500 dark:text-slate-400 text-center mb-6">Plan your next trip together</p>
+        <p className="text-sm text-slate-500 dark:text-slate-400 text-center mb-6">Travel Planner</p>
         <form onSubmit={onSubmit} className="space-y-3">
           {mode === "register" && (
             <div>

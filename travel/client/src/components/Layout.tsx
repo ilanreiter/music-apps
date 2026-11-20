@@ -5,7 +5,7 @@ import { useAuth } from "../lib/AuthContext";
 import { useTheme } from "../lib/ThemeContext";
 import { motion } from "framer-motion";
 import { Bot, BookOpen, Inbox as InboxIcon, LayoutGrid, PiggyBank, Handshake, Settings, Users } from "lucide-react";
-import { CompassIcon, MoonIcon, SunIcon } from "./icons";
+import { MoonIcon, SunIcon, WanderLogo } from "./icons";
 
 const navItems = [
   { to: "/", label: "Dashboard", end: true, Icon: LayoutGrid },
@@ -29,8 +29,8 @@ export default function Layout() {
     <div className="flex min-h-screen">
       <aside className="w-60 shrink-0 sticky top-0 h-screen bg-brand-900 text-white flex flex-col">
         <div className="px-5 py-5 flex items-center gap-2 text-xl font-display font-semibold border-b border-white/10 shrink-0">
-          <CompassIcon className="h-5 w-5 shrink-0" />
-          Wander
+          <WanderLogo className="h-8 w-8 shrink-0" />
+          <span className="leading-tight">Wander<span className="block text-[11px] font-sans font-normal text-brand-200">Travel Planner</span></span>
         </div>
         <nav className="flex-1 min-h-0 overflow-y-auto px-2 py-4 space-y-1">
           {navItems.map((item) => (

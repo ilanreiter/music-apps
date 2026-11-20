@@ -63,3 +63,28 @@ export function AlertTriangleIcon({ className = "h-4 w-4" }: IconProps) {
     </svg>
   );
 }
+
+/** The Wander logo mark (same artwork as public/favicon.svg). */
+export function WanderLogo({ className = "h-6 w-6" }: IconProps) {
+  return (
+    <svg viewBox="0 0 64 64" className={className} aria-hidden="true">
+      <defs>
+        <linearGradient id="wl-bg" x1="0" y1="0" x2="1" y2="1">
+          <stop offset="0" stopColor="#06b6d4" />
+          <stop offset="0.55" stopColor="#3b82f6" />
+          <stop offset="1" stopColor="#8b5cf6" />
+        </linearGradient>
+        <linearGradient id="wl-needle" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0" stopColor="#ffb347" />
+          <stop offset="1" stopColor="#ff5e62" />
+        </linearGradient>
+      </defs>
+      <rect width="64" height="64" rx="15" fill="url(#wl-bg)" />
+      <circle cx="32" cy="32" r="21" fill="none" stroke="#fff" strokeWidth="3.5" opacity="0.95" />
+      <path d="M32 8.5v3M32 52.5v3M8.5 32h3M52.5 32h3" stroke="#fff" strokeWidth="3" strokeLinecap="round" opacity="0.9" />
+      <path d="M43 21L36 36 21 43 28 28z" fill="url(#wl-needle)" />
+      <path d="M43 21L36 36 28 28z" fill="#fff" opacity="0.35" />
+      <circle cx="32" cy="32" r="2.6" fill="#fff" />
+    </svg>
+  );
+}

@@ -1,4 +1,4 @@
-# Wander — Travel Planning App
+# Wander - Travel Planner
 
 A browser-based app for planning travel as a couple: a prioritized destination
 wishlist, detailed per-trip planning (transport, stays, points of interest,
