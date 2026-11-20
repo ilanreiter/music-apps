@@ -27,8 +27,8 @@ function detail(p: Proposal): string {
 const title = (p: Proposal) => p.data.title ?? p.data.text;
 
 /** One place to bring anything into a trip: files, screenshots, pasted text and emails, web addresses. */
-export default function ImportCard({ tripId, onClose, reload, initialSources, onApplied }: { tripId: string; onClose: () => void; reload: () => void; initialSources?: { name: string; text: string; note?: string }[]; onApplied?: () => void }) {
-  const [sources, setSources] = useState<Source[]>(() => (initialSources ?? []).map((x, i) => ({ id: -1 - i, name: x.name, kind: "text" as const, text: x.text, note: x.note })));
+export default function ImportCard({ tripId, onClose, reload, initialResults, onApplied }: { tripId: string; onClose: () => void; reload: () => void; initialResults?: Result[]; onApplied?: () => void }) {
+  const [sources, setSources] = useState<Source[]>([]);
   const [text, setText] = useState("");
   const [url, setUrl] = useState("");
   const [over, setOver] = useState(false);
@@ -36,8 +36,9 @@ export default function ImportCard({ tripId, onClose, reload, initialSources, on
   const [busy, setBusy] = useState<"" | "reading" | "analyzing" | "applying">("");
   const [progress, setProgress] = useState("");
   const [error, setError] = useState("");
-  const [results, setResults] = useState<Result[] | null>(null);
-  const [pick, setPick] = useState<Set<string>>(new Set());
+  const [results, setResults] = useState<Result[] | null>(initialResults ?? null);
+  // opened from the Inbox with the email already read: duplicates start unticked, same as after a fresh read
+  const [pick, setPick] = useState<Set<string>>(() => new Set((initialResults ?? []).flatMap((r, ri) => r.proposals.map((p, pi) => (p.action === "duplicate" ? null : `${ri}:${pi}`)).filter(Boolean) as string[])));
   const [applied, setApplied] = useState<Applied | null>(null);
   const idRef = useRef(1);
   const fileRef = useRef<HTMLInputElement>(null);

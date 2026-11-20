@@ -327,10 +327,13 @@ model InboxItem {
   subject         String
   receivedAt      DateTime
   bodyText        String
+  bodyHtml        String?
   attachments     Json      @default("[]")
   status          String    @default("PENDING") // PENDING | FILED | DISMISSED
+  dupOfId         String?   // earlier message with the same subject from the same sender
   suggestedTripId String?
   suggestionNote  String?
+  parsed          Json?     // { tripId, sources: [{ name, category, summary, travelers, alreadyImported, proposals: [{ kind, action, title, when, matchTitle }] }] }
   tripId          String?
   createdAt       DateTime  @default(now())
 }

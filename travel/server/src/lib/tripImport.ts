@@ -118,6 +118,21 @@ export async function loadTrip(id: string) {
 const travDiff = (a: string | null | undefined, b: string | null | undefined) => !!a && !!b && norm(a) !== norm(b);
 const nums = (s: string) => new Set(s.match(/\d{2,4}/g) ?? []);
 const words = (s: string) => new Set(norm(s).split(" ").filter((w) => w.length > 3 && !["hotel", "lodging", "stay", "flight", "resort", "booking", "reservation"].includes(w)));
+// The AI words the same to-do differently on each read, so compare by meaning-ish: same text, mostly the same words, or the same number (an amount, a time) plus a shared word.
+const todoTokens = (t: string) => new Set(norm(t).split(" ").filter((w) => w.length > 3 || /^\d{3,}$/.test(w)));
+function sameTodo(a: string, b: string): boolean {
+  if (norm(a) === norm(b)) return true;
+  const x = todoTokens(a), y = todoTokens(b); if (!x.size || !y.size) return false;
+  const common = [...x].filter((w) => y.has(w));
+  if (common.length / (x.size + y.size - common.length) >= 0.6) return true;
+  return common.some((w) => /^\d{3,}$/.test(w)) && common.length >= 2;
+}
+// The AI words the notes differently on every read; they only count as new when much of the content is missing from the existing notes.
+function notesCovered(existing: string | null | undefined, incoming: string): boolean {
+  if ((existing ?? "").includes(incoming)) return true;
+  const have = todoTokens(existing ?? ""), want = [...todoTokens(incoming)];
+  return want.length === 0 || want.filter((w) => have.has(w)).length / want.length >= 0.7;
+}
 const BOOKABLE = new Set(["TRANSPORT", "STAY", "ACTIVITY", "OTHER"]);
 
 function matchBooking(items: Item[], b: BookingData): Item | undefined {
@@ -168,7 +183,7 @@ function bookingPatch(e: Item, b: BookingData) {
   if (b.freeCancelUntil && !e.freeCancelUntil) patch.freeCancelUntil = new Date(b.freeCancelUntil);
   if (b.startAt && (!e.startAt || placeholder(e.startAt))) { patch.startAt = new Date(b.startAt); if (b.endAt) patch.endAt = new Date(b.endAt); }
   else if (b.endAt && !e.endAt) patch.endAt = new Date(b.endAt);
-  if (b.notes && !(e.notes ?? "").includes(b.notes)) patch.notes = [e.notes, b.notes].filter(Boolean).join(" · ");
+  if (b.notes && !notesCovered(e.notes, b.notes)) patch.notes = [e.notes, b.notes].filter(Boolean).join(" · ");
   if (STATUS_RANK[b.bookingStatus] > STATUS_RANK[e.bookingStatus]) patch.bookingStatus = b.bookingStatus;
   if (b.title && STATUS_RANK[e.bookingStatus] < 3 && norm(b.title) !== norm(e.title)) patch.title = b.title;
   return patch;
@@ -195,7 +210,7 @@ export async function annotate(tripId: string, proposals: Proposal[]): Promise<P
       const e = trip.resources.find((r) => (p.data.url && r.url === p.data.url) || norm(r.title) === norm(p.data.title));
       if (e) out = { ...p, action: "duplicate", matchTitle: e.title };
     } else if (p.kind === "checklist") {
-      const e = trip.checklist.find((c) => norm(c.text) === norm(p.data.text));
+      const e = trip.checklist.find((c) => sameTodo(c.text, p.data.text));
       if (e) out = { ...p, action: "duplicate", matchTitle: e.text };
     }
     // the same thing twice inside one upload

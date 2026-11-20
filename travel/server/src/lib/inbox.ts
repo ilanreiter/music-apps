@@ -5,6 +5,7 @@ import { simpleParser, ParsedMail } from "mailparser";
 import { prisma } from "../db";
 import { bytesToText, htmlToText } from "./sourceText";
 import { askJson } from "./tripPlanningAi";
+import { analyzeSource, annotate } from "./tripImport";
 
 const env = process.env;
 export const inboxConfigured = () => !!(env.IMAP_USER && env.IMAP_PASSWORD);
@@ -88,8 +89,12 @@ export async function pollInbox(): Promise<{ added: number; skipped: number }> {
         const subject = (mail.subject || "(no subject)").slice(0, 300);
         if (body.length < 15 && !attachments.length) continue;
         const sg = await suggestTrip(subject, body || attachments[0].text);
-        await prisma.inboxItem.create({ data: { messageId, fromAddr: from, subject, receivedAt: mail.date ?? new Date(), bodyText: body.slice(0, 400_000), attachments: attachments as any, suggestedTripId: sg.tripId, suggestionNote: sg.note } });
+        const baseSubject = subject.replace(/^((fwd?|re)\s*:\s*)+/i, "").trim().toLowerCase();
+        const earlier = (await prisma.inboxItem.findMany({ where: { fromAddr: from, createdAt: { gte: new Date(Date.now() - 30 * 86400_000) } }, select: { id: true, subject: true } }))
+          .find((x) => x.subject.replace(/^((fwd?|re)\s*:\s*)+/i, "").trim().toLowerCase() === baseSubject);
+        const created = await prisma.inboxItem.create({ data: { dupOfId: earlier?.id ?? null, messageId, fromAddr: from, subject, receivedAt: mail.date ?? new Date(), bodyText: body.slice(0, 400_000), bodyHtml: typeof mail.html === "string" && mail.html.length < 1_500_000 ? mail.html : null, attachments: attachments as any, suggestedTripId: sg.tripId, suggestionNote: sg.note } });
         added++;
+        if (sg.tripId) await parseInboxItem(created.id, sg.tripId).catch((e) => console.error("inbox: parse failed:", String(e?.message ?? e).slice(0, 120)));
       }
     } finally { lock.release(); }
     await client.logout();
@@ -107,4 +112,31 @@ export function startInboxPolling() {
   const tick = () => pollInbox().then((r) => r.added && console.log(`inbox: ${r.added} new message(s)`)).catch(() => {});
   setTimeout(tick, 10_000);
   setInterval(tick, every);
+}
+
+/** Reads the email and each attachment with the trip importer and stores a compact summary of what is in them (nothing is filed). */
+export async function parseInboxItem(id: string, tripId: string) {
+  const item = await prisma.inboxItem.findUniqueOrThrow({ where: { id } });
+  const trip = await prisma.trip.findUniqueOrThrow({ where: { id: tripId }, include: { destination: true } });
+  const profiles = await prisma.traveler.findMany({ select: { name: true } });
+  const known = [...new Set([...trip.travelers, ...profiles.map((p) => p.name)])];
+  const sources = [{ name: `${item.subject} (email)`, text: item.bodyText }, ...(item.attachments as unknown as InboxAttachment[]).map((a) => ({ name: a.name, text: a.text }))];
+  const out = [];
+  for (const s of sources) {
+    if (s.text.trim().length < 15) continue;
+    try {
+      const r = await analyzeSource(trip, s.name, s.text, null, known);
+      const proposals = (await annotate(trip.id, r.proposals)).map((p) => {
+        const d: any = p.data;
+        const when = [d.startAt ? String(d.startAt).slice(0, 10) : d.day ? `Day ${d.day}` : d.dueDate ? String(d.dueDate).slice(0, 10) : null, d.location].filter(Boolean).join(" · ");
+        return { kind: p.kind, action: p.action, title: d.title ?? d.text, when: when || null, matchTitle: p.matchTitle ?? null, data: p.data };
+      });
+      out.push({ name: s.name, hash: r.hash, category: r.category, summary: r.summary, reason: r.reason, travelers: r.travelers, alreadyImported: r.alreadyImported, proposals });
+    } catch (e: any) {
+      out.push({ name: s.name, hash: "", category: "irrelevant", summary: "", reason: "", travelers: [], alreadyImported: false, proposals: [], error: String(e?.message ?? "Could not read this item.").slice(0, 200) });
+    }
+  }
+  const parsed = { tripId, sources: out };
+  await prisma.inboxItem.update({ where: { id }, data: { parsed: parsed as any } });
+  return parsed;
 }
