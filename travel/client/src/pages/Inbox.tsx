@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { Loader2, Paperclip, RefreshCw, Trash2, X } from "lucide-react";
+import { Loader2, ChevronDown, ChevronRight, Paperclip, RefreshCw, Trash2, X } from "lucide-react";
 import { api } from "../lib/api";
 import { Trip } from "../types";
 import ImportCard from "../components/trip/ImportCard";
@@ -20,14 +20,18 @@ export default function Inbox() {
   const [review, setReview] = useState<Review | null>(null);
   const [checking, setChecking] = useState(false);
   const [error, setError] = useState("");
+  const [showFiltered, setShowFiltered] = useState(false);
+  const [filteredCount, setFilteredCount] = useState(0);
+  const [filtered, setFiltered] = useState<{ items: { id: string; fromAddr: string; subject: string; receivedAt: string; filterReason: string | null }[]; blocked: { id: string; addr: string }[] } | null>(null);
+  const [busyId, setBusyId] = useState<string | null>(null);
   const [reading, setReading] = useState<string | null>(null);
   const [original, setOriginal] = useState<{ subject: string; fromAddr: string; html: string | null; sources: { name: string; text: string }[] } | null>(null);
   const [view, setView] = useState<"formatted" | "text">("formatted");
   const [images, setImages] = useState(false);
 
   const load = useCallback(() => {
-    api.get<{ configured: boolean; address: string | null; items: Item[] }>("/inbox").then((r) => {
-      setItems(r.items); setInfo({ configured: r.configured, address: r.address });
+    api.get<{ configured: boolean; address: string | null; filteredCount: number; items: Item[] }>("/inbox").then((r) => {
+      setItems(r.items); setFilteredCount(r.filteredCount); setInfo({ configured: r.configured, address: r.address });
       setChoice((c) => { const n = { ...c }; r.items.forEach((i) => { if (!n[i.id] && i.suggestedTripId) n[i.id] = i.suggestedTripId; }); return n; });
     }).catch((e) => setError(e.message));
   }, []);
@@ -66,6 +70,10 @@ export default function Inbox() {
     try { const r = await api.get<{ html: string | null; sources: { name: string; text: string }[] }>(`/inbox/${i.id}`); setView("formatted"); setImages(false); setOriginal({ subject: i.subject, fromAddr: i.fromAddr, html: r.html, sources: r.sources }); }
     catch (e: any) { setError(e.message); }
   };
+  const loadFiltered = useCallback(() => { api.get<NonNullable<typeof filtered>>("/inbox/filtered").then(setFiltered).catch((e) => setError(e.message)); }, []);
+  useEffect(() => { if (showFiltered) loadFiltered(); }, [showFiltered, loadFiltered, filteredCount]);
+  const act = async (id: string, fn: () => Promise<unknown>) => { setBusyId(id); setError(""); try { await fn(); } catch (e: any) { setError(e.message); } setBusyId(null); load(); if (showFiltered) loadFiltered(); };
+  const ignoreSender = (i: Item) => { if (window.confirm(`Ignore all future mail from this sender? Their emails will go to Filtered instead of the Inbox.`)) act(i.id, () => api.post(`/inbox/${i.id}/block-sender`)); };
   const dismiss = async (id: string) => { await api.post(`/inbox/${id}/dismiss`).catch(() => {}); load(); };
 
   return (
@@ -129,7 +137,7 @@ export default function Inbox() {
               </div>
             </div>
             <div className="mt-3 flex flex-wrap items-center gap-2">
-              <span className="order-last ml-auto"><Button variant="secondary" onClick={() => dismiss(i.id)}><Trash2 className="h-4 w-4 mr-1.5" />Discard</Button></span>
+              <span className="order-last ml-auto flex gap-2"><Button variant="secondary" onClick={() => ignoreSender(i)} disabled={busyId === i.id}>Ignore sender</Button><Button variant="secondary" onClick={() => dismiss(i.id)}><Trash2 className="h-4 w-4 mr-1.5" />Discard</Button></span>
               <Select value={choice[i.id] ?? ""} onChange={(e) => pick(i.id, e.target.value)} className="max-w-xs">
                 <option value="">Choose a trip…</option>
                 {trips.map((t) => <option key={t.id} value={t.id}>{t.title}</option>)}
@@ -141,6 +149,39 @@ export default function Inbox() {
           </Card>
         ))}
       </div>
+      {(filteredCount > 0 || showFiltered) && (
+        <div className="pt-2">
+          <button type="button" onClick={() => setShowFiltered((v) => !v)} className="flex items-center gap-1 text-sm text-slate-500 hover:text-slate-700">
+            {showFiltered ? <ChevronDown className="h-4 w-4" /> : <ChevronRight className="h-4 w-4" />}Filtered ({filteredCount})
+          </button>
+          {showFiltered && (
+            <Card className="mt-2 divide-y divide-slate-100 dark:divide-slate-800">
+              <p className="px-4 py-2 text-xs text-slate-500">Newsletters, promotions, mail that isn't about a trip, and blocked senders. Kept for 30 days, then deleted.</p>
+              {filtered?.items.map((f) => (
+                <div key={f.id} className="flex flex-wrap items-center gap-2 px-4 py-2 text-sm">
+                  <div className="min-w-0 flex-1">
+                    <div className="truncate">{f.subject}</div>
+                    <div className="truncate text-xs text-slate-500">{f.fromAddr} · {new Date(f.receivedAt).toLocaleDateString()}{f.filterReason ? ` · ${f.filterReason}` : ""}</div>
+                  </div>
+                  <Button variant="secondary" disabled={busyId === f.id} onClick={() => act(f.id, () => api.post(`/inbox/${f.id}/restore`))}>{busyId === f.id ? <Loader2 className="h-4 w-4 animate-spin" /> : "Not noise, move to Inbox"}</Button>
+                </div>
+              ))}
+              {filtered && !filtered.items.length && <p className="px-4 py-3 text-xs text-slate-400">Nothing filtered.</p>}
+              {filtered && filtered.blocked.length > 0 && (
+                <div className="px-4 py-2">
+                  <div className="mb-1 text-[11px] font-semibold uppercase tracking-wide text-slate-400">Ignored senders</div>
+                  <ul className="space-y-1">
+                    {filtered.blocked.map((b) => (
+                      <li key={b.id} className="flex items-center gap-2 text-xs"><span className="min-w-0 flex-1 truncate">{b.addr}</span>
+                        <button type="button" onClick={() => act(b.id, () => api.delete(`/inbox/blocked/${b.id}`))} className="text-brand-600 hover:underline">Stop ignoring</button></li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+            </Card>
+          )}
+        </div>
+      )}
       {original && (
         <div className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-slate-900/40 p-4 pt-[6vh]" onClick={() => setOriginal(null)}>
           <div onClick={(e) => e.stopPropagation()} className="w-full max-w-3xl">

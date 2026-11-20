@@ -2,7 +2,7 @@ import { Router } from "express";
 import { z } from "zod";
 import { prisma } from "../db";
 import { annotate } from "../lib/tripImport";
-import { inboxConfigured, parseInboxItem, pollInbox } from "../lib/inbox";
+import { inboxConfigured, originalSender, parseInboxItem, pollInbox, suggestTrip } from "../lib/inbox";
 
 const router = Router();
 function forwardAddress() {
@@ -31,9 +31,39 @@ router.get("/", async (_req, res) => {
     } catch { /* trip deleted etc.: show the stored parse */ }
   }
   res.json({
+    filteredCount: await prisma.inboxItem.count({ where: { status: "FILTERED" } }),
     configured: inboxConfigured(), address: forwardAddress(),
     items: items.map((i) => ({ id: i.id, fromAddr: i.fromAddr, subject: i.subject, receivedAt: i.receivedAt, preview: i.bodyText.slice(0, 1500), attachmentNames: (i.attachments as any[]).map((a) => a.name), suggestedTripId: i.suggestedTripId, suggestionNote: i.suggestionNote, parsed: fresh.get(i.id) ?? i.parsed, legacyParse: !!(i.parsed as any)?.sources?.some((x: any) => x.proposals?.some((p: any) => !p.data)), duplicateOf: i.dupOfId ? (orig.get(i.dupOfId) ?? "GONE") : null })),
   });
+});
+
+router.get("/filtered", async (_req, res) => {
+  const items = await prisma.inboxItem.findMany({ where: { status: "FILTERED" }, orderBy: { receivedAt: "desc" }, take: 200, select: { id: true, fromAddr: true, subject: true, receivedAt: true, filterReason: true } });
+  const blocked = await prisma.inboxBlockedSender.findMany({ orderBy: { addr: "asc" } });
+  res.json({ items, blocked });
+});
+
+router.delete("/blocked/:id", async (req, res) => { await prisma.inboxBlockedSender.deleteMany({ where: { id: req.params.id } }); res.json({ ok: true }); });
+
+router.post("/:id/restore", async (req, res) => {
+  const i = await prisma.inboxItem.findUnique({ where: { id: req.params.id } });
+  if (!i) return res.status(404).json({ error: "Not found" });
+  const sg = await suggestTrip(i.subject, i.bodyText);
+  await prisma.inboxItem.update({ where: { id: i.id }, data: { status: "PENDING", filterReason: null, suggestedTripId: sg.tripId, suggestionNote: sg.note } });
+  if (sg.tripId) await parseInboxItem(i.id, sg.tripId).catch(() => {});
+  res.json({ ok: true });
+});
+
+// Filters this sender (and, for mail you forwarded by hand, the original sender) from now on, and sweeps their pending mail into Filtered.
+router.post("/:id/block-sender", async (req, res) => {
+  const i = await prisma.inboxItem.findUnique({ where: { id: req.params.id } });
+  if (!i) return res.status(404).json({ error: "Not found" });
+  const addr = originalSender(i.fromAddr, i.bodyText);
+  const mine = (process.env.INBOX_ALLOWED_SENDERS ?? "").toLowerCase().split(",").map((x) => x.trim());
+  if (mine.includes(addr)) return res.status(400).json({ error: "This email was forwarded by you and the original sender could not be found, so nothing was blocked. Use Discard instead." });
+  await prisma.inboxBlockedSender.upsert({ where: { addr }, create: { addr }, update: {} });
+  const swept = await prisma.inboxItem.updateMany({ where: { status: "PENDING", OR: [{ fromAddr: addr }, { id: i.id }] }, data: { status: "FILTERED", filterReason: "Blocked sender" } });
+  res.json({ addr, moved: swept.count });
 });
 
 router.get("/count", async (_req, res) => res.json({ pending: await prisma.inboxItem.count({ where: { status: "PENDING" } }) }));
