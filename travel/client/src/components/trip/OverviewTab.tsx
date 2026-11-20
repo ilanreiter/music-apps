@@ -1,12 +1,17 @@
-import { AlertTriangle, CalendarClock, CheckSquare, Plane, Wallet } from "lucide-react";
+import React from "react";
+import { AlertTriangle, BookOpen, CalendarClock, CheckSquare, ExternalLink, MapPin, Plane, Wallet } from "lucide-react";
+import type { MapPoint } from "../RouteMap";
+import ResourceThumb from "../ResourceThumb";
 import { Trip } from "../../types";
 import { Badge, Card } from "../ui";
 import { daysFromNow, isBookable, isBooked, money, shortDate } from "./shared";
 
+const RouteMap = React.lazy(() => import("../RouteMap"));
+
 export type PlanTab = "Overview" | "Itinerary" | "Schedule" | "Bookings" | "Checklist" | "Route" | "Budget" | "Resources";
 
 /** Readiness at a glance: countdown, what's booked, what's due, and a place to keep key trip information. */
-export default function OverviewTab({ trip, goTo, onImportBookings }: { trip: Trip; goTo: (t: PlanTab) => void; onImportBookings?: () => void }) {
+export default function OverviewTab({ trip, goTo, onImportBookings, mapPoints = [] }: { trip: Trip; goTo: (t: PlanTab) => void; onImportBookings?: () => void; mapPoints?: MapPoint[] }) {
   const bookable = trip.items.filter(isBookable);
   const booked = bookable.filter(isBooked);
   const todo = bookable.filter((i) => !isBooked(i) && i.bookingStatus !== "CANCELLED");
@@ -88,6 +93,42 @@ export default function OverviewTab({ trip, goTo, onImportBookings }: { trip: Tr
               </li>
             ))}
           </ul>
+        </Card>
+      </div>
+
+      <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+        <Card className="p-4">
+          <div className="mb-2 flex items-center justify-between">
+            <h3 className="flex items-center gap-1.5 text-sm font-semibold"><MapPin className="h-4 w-4" />Map</h3>
+            <button type="button" onClick={() => goTo("Route")} className="text-xs text-brand-600 hover:underline">Open route</button>
+          </div>
+          {mapPoints.length === 0 ? (
+            <p className="text-sm text-slate-500">No places with map locations yet. Add stays and activities, then fill in map locations on the Route tab.</p>
+          ) : (
+            <React.Suspense fallback={<div className="flex h-[260px] items-center justify-center text-sm text-slate-400">Loading map…</div>}>
+              <RouteMap points={mapPoints} height={260} />
+            </React.Suspense>
+          )}
+        </Card>
+
+        <Card className="p-4">
+          <div className="mb-2 flex items-center justify-between">
+            <h3 className="flex items-center gap-1.5 text-sm font-semibold"><BookOpen className="h-4 w-4" />Resources</h3>
+            <button type="button" onClick={() => goTo("Resources")} className="text-xs text-brand-600 hover:underline">{(trip.resources ?? []).length ? `See all ${(trip.resources ?? []).length}` : "Add"}</button>
+          </div>
+          {!(trip.resources ?? []).length ? <p className="text-sm text-slate-500">No guides or links yet. Use Import to file a web page or document here.</p> : (
+            <ul className="space-y-2">
+              {(trip.resources ?? []).slice(0, 5).map((r) => (
+                <li key={r.id} className="flex items-center gap-3">
+                  <ResourceThumb src={r.imageUrl} className="!h-12 !w-16" />
+                  <div className="min-w-0 flex-1 text-sm">
+                    {r.url ? <a href={r.url} target="_blank" rel="noreferrer" className="inline-flex max-w-full items-center gap-1 text-brand-600 hover:underline"><span className="truncate">{r.title}</span><ExternalLink className="h-3 w-3 shrink-0" /></a> : <span className="block truncate">{r.title}</span>}
+                    {r.category && <div className="text-xs text-slate-500">{r.category}</div>}
+                  </div>
+                </li>
+              ))}
+            </ul>
+          )}
         </Card>
       </div>
     </div>

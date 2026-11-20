@@ -1,6 +1,7 @@
 import { Router } from "express";
 import { z } from "zod";
 import { prisma } from "../db";
+import { geocodeTrip } from "../lib/geocodeTrip";
 import { detectConflicts } from "../lib/conflicts";
 import { optimizeRoute } from "../lib/routeOptimize";
 import { proposeItinerary, proposeItineraryGemini, importItinerary, geocodeItems, buildProposePrompt } from "../lib/itineraryAi";
@@ -247,25 +248,10 @@ router.post("/:id/import-places", async (req, res) => {
 });
 
 router.post("/:id/geocode-items", async (req, res) => {
-  const trip = await prisma.trip.findUnique({
-    where: { id: req.params.id },
-    include: { destination: true, items: true },
-  });
-  if (!trip) return res.status(404).json({ error: "Not found" });
-
-  const missing = trip.items.filter((i) => i.lat == null || i.lng == null);
-  if (missing.length === 0) return res.json({ updated: 0 });
-
   try {
-    const results = await geocodeItems(
-      trip.destination?.name || trip.title,
-      missing.map((i) => ({ id: i.id, title: i.title, location: i.location }))
-    );
-    const resolved = results.filter((r) => r.lat != null && r.lng != null);
-    await prisma.$transaction(
-      resolved.map((r) => prisma.tripItem.update({ where: { id: r.id }, data: { lat: r.lat, lng: r.lng } }))
-    );
-    res.json({ updated: resolved.length, checked: missing.length });
+    const r = await geocodeTrip(req.params.id);
+    if (!r) return res.status(404).json({ error: "Not found" });
+    res.json(r);
   } catch (err: any) {
     res.status(503).json({ error: err.message || "Geocoding failed" });
   }

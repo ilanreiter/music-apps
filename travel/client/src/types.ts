@@ -49,6 +49,8 @@ export interface TripItem {
   location?: string | null;
   lat?: number | null;
   lng?: number | null;
+  fromLat?: number | null;
+  fromLng?: number | null;
   startAt?: string | null;
   endAt?: string | null;
   cost?: number | null;

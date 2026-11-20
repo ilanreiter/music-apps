@@ -73,6 +73,23 @@ function formatDuration(startAt?: string | null, endAt?: string | null): string 
 // planned before exact dates are known); falls back to a "Day N" prefix left
 // in notes by the AI propose/import flow (used when neither the trip nor any
 // item has a real date yet). Returns null when none of that is available.
+const isRouteLike = (i: TripItem) => i.type === "TRANSPORT" && /→|->|\bto\b/i.test(i.title);
+
+/** Map steps in time order, one per itinerary item that has a location. A flight or drive also carries where it departs from. Per-traveler copies of the same leg count once. */
+function mapStops(trip: Trip, items: TripItem[]): MapPoint[] {
+  const seen = new Set<string>();
+  const sorted = [...items].sort((a, b) => (a.startAt ?? "").localeCompare(b.startAt ?? "") || a.sortOrder - b.sortOrder);
+  const out: MapPoint[] = [];
+  for (const i of sorted) {
+    if (i.lat == null || i.lng == null || /rental|car hire/i.test(i.title)) continue; // a rental car is held, not a place
+    const key = `${i.title.toLowerCase()}|${i.startAt ?? ""}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({ id: i.id, title: i.title, lat: i.lat, lng: i.lng, day: dayNumberFor(trip, i), from: isRouteLike(i) && i.fromLat != null && i.fromLng != null ? { lat: i.fromLat, lng: i.fromLng } : null });
+  }
+  return out;
+}
+
 function dayNumberFor(trip: Trip, item: TripItem): number | null {
   if (trip.startDate && item.startAt) {
     return Math.round((startOfDay(item.startAt) - startOfDay(trip.startDate)) / 86_400_000) + 1;
@@ -128,6 +145,10 @@ export default function TripDetail() {
   const rank = planned && roadmap ? [...roadmap.destinations].sort((a, b) => a.priority - b.priority).findIndex((x) => x.id === planned.id) + 1 : 0;
   const pairingName = planned?.pairingId ? roadmap?.pairings.find((p) => p.id === planned.pairingId)?.name : undefined;
 
+  // Places for the Overview map: itinerary items with coordinates in time order, else the destination itself.
+  const overviewPoints: MapPoint[] = mapStops(trip, trip.items);
+  if (!overviewPoints.length && planned?.lat != null && planned.lng != null) overviewPoints.push({ id: "dest", title: planned.name, lat: planned.lat, lng: planned.lng });
+
 
   return (
     <div>
@@ -180,7 +201,7 @@ export default function TripDetail() {
         ))}
       </div>
 
-      {tab === "Overview" && <OverviewTab trip={trip} goTo={setTab} onImportBookings={importBookings} />}
+      {tab === "Overview" && <OverviewTab trip={trip} goTo={setTab} onImportBookings={importBookings} mapPoints={overviewPoints} />}
       {tab === "Schedule" && <ScheduleTab trip={trip} conflicts={conflicts} />}
       {tab === "Bookings" && <BookingsTab trip={trip} agents={agents} reload={load} openPanel={bookingsPanel} onPanelOpened={() => setBookingsPanel("")} />}
       {tab === "Checklist" && <ChecklistTab trip={trip} reload={load} />}
@@ -208,11 +229,9 @@ function RouteTab({ trip, reload }: { trip: Trip; reload: () => void }) {
 
   const dayFilteredItems = trip.items.filter((i) => dayFilter === "ALL" || dayNumberFor(trip, i) === dayFilter);
 
-  const itineraryPoints: MapPoint[] = dayFilteredItems
-    .filter((i): i is TripItem & { lat: number; lng: number } => i.lat != null && i.lng != null)
-    .map((i) => ({ id: i.id, title: i.title, lat: i.lat, lng: i.lng, day: dayNumberFor(trip, i) }));
+  const itineraryPoints: MapPoint[] = mapStops(trip, dayFilteredItems);
 
-  const missingCount = dayFilteredItems.filter((i) => i.lat == null || i.lng == null).length;
+  const missingCount = dayFilteredItems.filter((i) => i.lat == null || i.lng == null || (isRouteLike(i) && i.fromLat == null)).length;
 
   async function optimizeRoute() {
     setOptimizing(true);

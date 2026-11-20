@@ -153,6 +153,9 @@ model TripItem {
   location        String?
   lat             Float?
   lng             Float?
+  // Where a transport item (flight, drive) departs from; lat/lng is where it arrives.
+  fromLat         Float?
+  fromLng         Float?
   startAt         DateTime?
   endAt           DateTime?
   cost            Float?

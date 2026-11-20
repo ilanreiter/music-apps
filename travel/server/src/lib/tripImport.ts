@@ -2,6 +2,7 @@
 // extracts everything useful, and files it into the trip's sections. Every item is matched against what the trip
 // already holds first, so importing the same thing twice never duplicates or conflicts.
 import { pageImage } from "./sourceText";
+import { geocodeTrip } from "./geocodeTrip";
 import crypto from "crypto";
 import { prisma } from "../db";
 import { askJson, iso, str } from "./tripPlanningAi";
@@ -295,6 +296,7 @@ export async function applyProposals(tripId: string, proposals: Proposal[], sour
     }
   }
   await reconcileStayEdges(tripId);
+  geocodeTrip(tripId).catch(() => {}); // best effort: place new bookings on the map
   // travelers named in the material join the trip
   const fresh = await prisma.trip.findUniqueOrThrow({ where: { id: tripId }, select: { travelers: true } });
   const known = new Set(fresh.travelers.map(norm));

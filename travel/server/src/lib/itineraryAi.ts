@@ -413,10 +413,14 @@ export interface GeocodeInputItem {
   id: string;
   title: string;
   location?: string | null;
+  /** A flight/drive/transfer: also locate where it departs from. */
+  needsFrom?: boolean;
+  /** Already has an arrival point; only the departure is wanted. */
+  hasTo?: boolean;
 }
 
 const geocodeResultSchema = z.array(
-  z.object({ id: z.string(), lat: z.number().nullable(), lng: z.number().nullable() })
+  z.object({ id: z.string(), lat: z.number().nullable(), lng: z.number().nullable(), fromLat: z.number().nullable().optional(), fromLng: z.number().nullable().optional() })
 );
 export type GeocodeResultItem = z.infer<typeof geocodeResultSchema>[number];
 
@@ -430,15 +434,18 @@ export async function geocodeItems(destinationName: string, items: GeocodeInputI
 
   const prompt = `For a trip to ${destinationName}, identify approximate real-world coordinates (decimal degrees) for each itinerary item below, using your knowledge of actual places. If an item has no single identifiable place (e.g. "Drive home", "Free time", a vague activity), return null for both lat and lng rather than guessing.
 
+For a flight, drive or transfer that goes from one place to another, "lat"/"lng" is where it ARRIVES (the arrival airport or destination) and "fromLat"/"fromLng" is where it DEPARTS from (e.g. "Flight BOS→AUS" arrives at Austin-Bergstrom airport, departs from Boston Logan). Use airport locations for flights. Items marked (departure only) already have their arrival: return null for lat/lng and give only fromLat/fromLng. Other items have no departure point: omit fromLat/fromLng.
+
 Respond ONLY with strict JSON: an array of exactly ${items.length} objects, one per item below, ids matching exactly, in this shape:
-[{"id": "string", "lat": number|null, "lng": number|null}]
+[{"id": "string", "lat": number|null, "lng": number|null, "fromLat": number|null, "fromLng": number|null}]
 
 Items:
-${items.map((i) => `- id="${i.id}" title="${i.title}"${i.location ? ` location="${i.location}"` : ""}`).join("\n")}`;
+${items.map((i) => `- id="${i.id}" title="${i.title}"${i.location ? ` location="${i.location}"` : ""}${i.hasTo ? " (departure only)" : i.needsFrom ? " (transport: arrival and departure)" : ""}`).join("\n")}`;
 
   const geoResponse = await client.messages.create({
     model: AI_MODEL,
-    max_tokens: 2048,
+    max_tokens: 4096,
+    ...({ thinking: { type: "disabled" } } as object),
     system: "You produce only valid JSON when asked to. No markdown fences, no commentary.",
     messages: [{ role: "user", content: prompt }],
   });
