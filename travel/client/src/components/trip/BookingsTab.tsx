@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { FileText, Loader2, Mail, Plus, Trash2 } from "lucide-react";
 import { api } from "../../lib/api";
-import { BookingAgent, BookingStatus, Trip, TripItem, TripItemType } from "../../types";
+import { BookingAgent, BookingStatus, Traveler, Trip, TripItem, TripItemType } from "../../types";
 import { Badge, BadgeSelect, Button, Card, Input, Select, Textarea } from "../ui";
 import { BOOKING_STATUSES, BOOKING_TONE, dateToIso, daysFromNow, isBookable, isBooked, isoToDate, money, readDocumentText, shortDate } from "./shared";
 
@@ -64,7 +64,9 @@ function duplicateIds(items: TripItem[]): string[] {
 
 export default function BookingsTab({ trip, agents, reload, openPanel, onPanelOpened }: { trip: Trip; agents: BookingAgent[]; reload: () => void; openPanel?: "" | "email"; onPanelOpened?: () => void }) {
   const items = trip.items.filter(isBookable);
-  const [show, setShow] = useState<"" | "add" | "email">(openPanel ?? "");
+  const [show, setShow] = useState<"" | "add" | "email">(openPanel || "email");
+  const [people, setPeople] = useState<string[]>([]);
+  useEffect(() => { api.get<Traveler[]>("/travelers").then((l) => setPeople(l.map((t) => t.name))).catch(() => {}); }, []);
   useEffect(() => { if (openPanel) { setShow(openPanel); onPanelOpened?.(); } }, [openPanel]);
   const [filter, setFilter] = useState<"all" | "todo" | "booked">("all");
   const base = `/trips/${trip.id}/items`;
@@ -99,6 +101,7 @@ export default function BookingsTab({ trip, agents, reload, openPanel, onPanelOp
         <Button onClick={() => setShow(show === "add" ? "" : "add")}><Plus className="h-4 w-4 mr-1" />Add booking</Button>
       </div>
 
+      <datalist id="trip-travelers">{people.map((n) => <option key={n} value={n} />)}</datalist>
       {dupes.length > 0 && (
         <Card className="p-3 border-amber-300 dark:border-amber-800 bg-amber-50 dark:bg-amber-950/30">
           <div className="flex flex-wrap items-center gap-3 text-sm">
@@ -125,7 +128,10 @@ export default function BookingsTab({ trip, agents, reload, openPanel, onPanelOp
                   <tr key={i.id} className={i.bookingStatus === "CANCELLED" ? "opacity-50" : ""}>
                     <td className="p-3 align-top">
                       <div className="font-medium">{i.title}</div>
-                      <div className="text-xs text-slate-500">{[i.type[0] + i.type.slice(1).toLowerCase(), i.traveler && `for ${i.traveler}`, i.provider, i.bookingAgent?.name, i.location].filter(Boolean).join(" · ")}</div>
+                      <div className="text-xs text-slate-500">{[i.type[0] + i.type.slice(1).toLowerCase(), i.provider, i.bookingAgent?.name, i.location].filter(Boolean).join(" · ")}</div>
+                      <div className="mt-0.5 flex items-center gap-1 text-xs text-slate-500">for
+                        <RefInput value={i.traveler ?? ""} onSave={(v) => patch(i, { traveler: v || null })} placeholder="Add traveler name" label="Traveler" list="trip-travelers" wide />
+                      </div>
                       {i.bookingUrl && <a href={i.bookingUrl} target="_blank" rel="noreferrer" className="text-xs text-brand-600 hover:underline">Open booking</a>}
                     </td>
                     <td className="p-3 align-top whitespace-nowrap text-slate-600 dark:text-slate-300">{when(i, !!trip.startDate)}</td>
@@ -160,10 +166,12 @@ function Stat({ label, value, sub, tone }: { label: string; value: string; sub?:
   );
 }
 
-function RefInput({ value, onSave }: { value: string; onSave: (v: string) => void }) {
+function RefInput({ value, onSave, placeholder = "Add reference", label = "Confirmation number", list, wide }: { value: string; onSave: (v: string) => void; placeholder?: string; label?: string; list?: string; wide?: boolean }) {
   const [v, setV] = useState(value);
+  useEffect(() => setV(value), [value]);
   return <input value={v} onChange={(e) => setV(e.target.value)} onBlur={() => v !== value && onSave(v.trim())} onKeyDown={(e) => e.key === "Enter" && (e.target as HTMLInputElement).blur()}
-    placeholder="Add reference" aria-label="Confirmation number" className="w-32 rounded border border-transparent hover:border-slate-200 dark:hover:border-slate-700 bg-transparent px-1.5 py-0.5 text-sm font-mono focus:border-brand-500 focus:outline-none" />;
+    placeholder={placeholder} aria-label={label} list={list}
+    className={`${wide ? "w-40" : "w-32 font-mono"} rounded border border-transparent hover:border-slate-200 dark:hover:border-slate-700 bg-transparent px-1.5 py-0.5 text-sm focus:border-brand-500 focus:outline-none`} />;
 }
 
 function AddBooking({ trip, agents, done }: { trip: Trip; agents: BookingAgent[]; done: () => void }) {

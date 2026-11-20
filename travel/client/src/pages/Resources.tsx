@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from "react";
 import { api } from "../lib/api";
 import { Destination, Resource } from "../types";
+import ResourceThumb from "../components/ResourceThumb";
 import { Badge, Button, Card, Input, Label, PageHeader, Select, Textarea } from "../components/ui";
 
 export default function Resources() {
@@ -84,6 +85,7 @@ export default function Resources() {
       <div className="space-y-2">
         {resources.map((r) => (
           <Card key={r.id} className="p-4 flex items-center gap-4">
+            <ResourceThumb src={r.imageUrl} />
             {r.category && <Badge>{r.category}</Badge>}
             <div className="flex-1">
               <div className="font-medium">

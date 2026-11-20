@@ -21,12 +21,13 @@ export default function OverviewTab({ trip, goTo, onImportBookings }: { trip: Tr
   ].sort((a, b) => a.at.localeCompare(b.at)).slice(0, 8);
 
   const days = trip.startDate ? daysFromNow(trip.startDate) : null;
-  const steps: { text: string; cta: string; go: PlanTab }[] = [];
+  const steps: { text: string; cta: string; go: PlanTab; action?: () => void }[] = [];
   if (!trip.items.length) steps.push({ text: "Build the itinerary: let the AI propose one, paste an existing plan, or import places from Google Maps.", cta: "Itinerary", go: "Itinerary" });
   if (!bookable.length) steps.push({ text: "Add the bookings you already have, e.g. paste a confirmation email.", cta: "Bookings", go: "Bookings" });
   else if (todo.length) steps.push({ text: `${todo.length} item${todo.length === 1 ? " is" : "s are"} not booked yet.`, cta: "Bookings", go: "Bookings" });
   if (!check.length) steps.push({ text: "Get a checklist (visa, insurance, packing) tailored to your traveler profiles.", cta: "Checklist", go: "Checklist" });
   else if (check.some((c) => !c.done && c.dueDate && daysFromNow(c.dueDate) < 0)) steps.push({ text: "Some checklist tasks are overdue.", cta: "Checklist", go: "Checklist" });
+  if (bookable.length && onImportBookings) steps.push({ text: "Have another confirmation (another traveler, a hotel, a tour)? Import it.", cta: "Import", go: "Bookings", action: onImportBookings });
   if (trip.items.length) steps.push({ text: "Review the day-by-day schedule for gaps and overlaps.", cta: "Schedule", go: "Schedule" });
 
   return (
@@ -83,7 +84,7 @@ export default function OverviewTab({ trip, goTo, onImportBookings }: { trip: Tr
             {steps.map((s) => (
               <li key={s.text} className="flex items-center gap-3">
                 <span className="flex-1">{s.text}</span>
-                <button type="button" onClick={() => goTo(s.go)} className="shrink-0 rounded-md border border-slate-200 dark:border-slate-700 px-2.5 py-1 text-xs hover:border-brand-400 hover:text-brand-600">{s.cta}</button>
+                <button type="button" onClick={() => (s.action ? s.action() : goTo(s.go))} className="shrink-0 rounded-md border border-slate-200 dark:border-slate-700 px-2.5 py-1 text-xs hover:border-brand-400 hover:text-brand-600">{s.cta}</button>
               </li>
             ))}
           </ul>

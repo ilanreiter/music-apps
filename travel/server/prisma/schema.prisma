@@ -140,6 +140,7 @@ model Trip {
   resources     Resource[]
   aiMessages    AiMessage[]
   checklist     ChecklistItem[]
+  imports       TripImport[]
 }
 
 model TripItem {
@@ -213,6 +214,8 @@ model Resource {
   url           String?
   category      String?
   notes         String?
+  // Preview picture taken from the page (og:image). Null = not looked up yet, "" = looked up, none found.
+  imageUrl      String?
   destinationId String?
   destination   Destination? @relation(fields: [destinationId], references: [id], onDelete: SetNull)
   tripId        String?
@@ -297,4 +300,18 @@ model ChecklistItem {
   done      Boolean   @default(false)
   sortOrder Int       @default(0)
   createdAt DateTime  @default(now())
+}
+
+// Every source (file, pasted text, URL) imported into a trip, by content hash, so importing the same thing twice is recognised.
+model TripImport {
+  id        String   @id @default(cuid())
+  tripId    String
+  trip      Trip     @relation(fields: [tripId], references: [id], onDelete: Cascade)
+  hash      String
+  name      String
+  category  String
+  summary   String?
+  createdAt DateTime @default(now())
+
+  @@unique([tripId, hash])
 }

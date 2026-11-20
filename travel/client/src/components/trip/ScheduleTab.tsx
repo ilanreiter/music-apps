@@ -39,7 +39,7 @@ export default function ScheduleTab({ trip, conflicts }: { trip: Trip; conflicts
                 <span className="w-20 shrink-0 tabular-nums text-xs text-slate-500 pt-0.5">{timeOf(i.startAt!)}{i.endAt ? <><br /><span className="text-slate-400">→ {timeOf(i.endAt)}</span></> : null}</span>
                 <div className="min-w-0 flex-1">
                   <div className="font-medium">{i.title}</div>
-                  <div className="text-xs text-slate-500">{[i.type[0] + i.type.slice(1).toLowerCase(), i.provider, i.location, i.confirmationNo && `ref ${i.confirmationNo}`].filter(Boolean).join(" · ")}</div>
+                  <div className="text-xs text-slate-500">{[i.type[0] + i.type.slice(1).toLowerCase(), i.traveler && `for ${i.traveler}`, i.provider, i.location, i.confirmationNo && `ref ${i.confirmationNo}`].filter(Boolean).join(" · ")}</div>
                 </div>
                 {i.type !== "POI" && <Badge tone={BOOKING_TONE[i.bookingStatus]}>{label(i.bookingStatus)}</Badge>}
               </li>

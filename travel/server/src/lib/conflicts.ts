@@ -29,13 +29,17 @@ const EXCLUSIVE_TYPES = new Set(["TRANSPORT", "STAY"]);
 // "can't be in two places at once".
 const NON_CONFLICTING_TITLE = /^gas\s*\/\s*fuel/i;
 
+// A rental car / campervan is held for the whole trip, alongside the flights and drives it is used for,
+// so its pick-up-to-return window is expected to overlap them.
+const HELD_VEHICLE_TITLE = /rental|car hire|rent[- ]a[- ]car|campervan|motorhome|\bRV\b/i;
+
 function overlaps(aStart: Date, aEnd: Date, bStart: Date, bEnd: Date) {
   return aStart < bEnd && bStart < aEnd;
 }
 
 export function detectConflicts(items: ConflictCheckItem[]): Conflict[] {
   const timed = items.filter(
-    (i) => i.startAt && i.endAt && !NON_CONFLICTING_TITLE.test(i.title)
+    (i) => i.startAt && i.endAt && !NON_CONFLICTING_TITLE.test(i.title) && !HELD_VEHICLE_TITLE.test(i.title)
   ) as (ConflictCheckItem & {
     startAt: Date;
     endAt: Date;

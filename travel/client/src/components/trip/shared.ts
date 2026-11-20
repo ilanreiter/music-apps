@@ -9,13 +9,14 @@ export const isBooked = (i: TripItem) => i.bookingStatus === "BOOKED" || i.booki
 /** Things you book: everything except plain points of interest. */
 export const isBookable = (i: TripItem) => i.type !== "POI";
 
-/** Text of an uploaded document: PDFs are read on the server (text layer, or OCR for scans); anything else is read as text. */
+/** Text of an uploaded file: PDFs and images are read on the server (text layer, or OCR for scans and screenshots); anything else as text. */
 export async function readDocumentText(f: File): Promise<{ text: string; note?: string }> {
-  if (!/\.pdf$/i.test(f.name) && f.type !== "application/pdf") return { text: await readFileText(f) };
-  const res = await fetch("/api/documents/pdf-text", { method: "POST", credentials: "include", headers: { "Content-Type": "application/pdf" }, body: f });
+  const binary = /\.(pdf|png|jpe?g|webp|gif)$/i.test(f.name) || /^(application\/pdf|image\/)/.test(f.type);
+  if (!binary) return { text: await readFileText(f) };
+  const res = await fetch("/api/documents/file-text", { method: "POST", credentials: "include", headers: { "Content-Type": "application/octet-stream" }, body: f });
   const body = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(body.error || `Could not read the PDF (${res.status})`);
-  return { text: body.text, note: body.method === "ocr" ? `Read ${body.pages} page${body.pages === 1 ? "" : "s"} with OCR (scanned PDF) — check the text for misreads.` : undefined };
+  if (!res.ok) throw new Error(body.error || `Could not read the file (${res.status})`);
+  return { text: body.text, note: /ocr/.test(body.method ?? "") ? "Read with OCR (scanned or image) — check the text for misreads." : undefined };
 }
 
 export const readFileText = (f: File) => new Promise<string>((resolve, reject) => {

@@ -1,4 +1,5 @@
 import React, { useEffect, useState } from "react";
+import ResourceThumb from "../components/ResourceThumb";
 import { useNavigate, useParams } from "react-router-dom";
 import { api } from "../lib/api";
 import { BookingAgent, BookingStatus, BudgetLine, Conflict, RoadmapData, RoadmapDest, Trip, TripItem, TripItemType } from "../types";
@@ -9,6 +10,7 @@ import ScheduleTab from "../components/trip/ScheduleTab";
 import BookingsTab from "../components/trip/BookingsTab";
 import ChecklistTab from "../components/trip/ChecklistTab";
 import PlacesImport from "../components/trip/PlacesImport";
+import ImportCard from "../components/trip/ImportCard";
 import { WorldMapDefs } from "../components/WorldMap";
 import { Card_, GroupCard } from "./Dashboard";
 import { AlertTriangleIcon } from "../components/icons";
@@ -95,6 +97,7 @@ export default function TripDetail() {
   const [tab, setTab] = useState<Tab>("Overview");
   const [showItemForm, setShowItemForm] = useState(false);
   const [roadmap, setRoadmap] = useState<RoadmapData | null>(null);
+  const [importOpen, setImportOpen] = useState(false);
   const [bookingsPanel, setBookingsPanel] = useState<"" | "email">("");
   const importBookings = () => { setBookingsPanel("email"); setTab("Bookings"); };
 
@@ -131,7 +134,7 @@ export default function TripDetail() {
       <PageHeader
         title={trip.title}
         subtitle={`${trip.destination?.name || "No destination"} · ${trip.status}`}
-        actions={<Button variant="danger" onClick={deleteTrip}>Delete trip</Button>}
+        actions={<div className="flex gap-2"><Button onClick={() => setImportOpen(true)}>Import</Button><Button variant="danger" onClick={deleteTrip}>Delete trip</Button></div>}
       />
 
       <div className={planned ? "grid grid-cols-1 gap-4 lg:grid-cols-[minmax(320px,440px)_1fr] mb-2 items-start" : ""}>
@@ -145,6 +148,7 @@ export default function TripDetail() {
         </div>
       )}
       <div>
+      {importOpen && <ImportCard tripId={trip.id} onClose={() => setImportOpen(false)} reload={load} />}
       {conflicts.length > 0 && (
         <Card className="p-4 mb-4 border-red-300 dark:border-red-800 bg-red-50 dark:bg-red-950/40">
           <div className="font-medium text-red-700 dark:text-red-300 mb-1 text-sm flex items-center gap-1.5">
@@ -605,6 +609,7 @@ function ItineraryItemRow({
         <div className="min-w-0">
           <div className="font-medium">{item.title}</div>
           <div className="text-xs text-slate-500">
+            {item.traveler && `for ${item.traveler} · `}
             {item.provider && `${item.provider} · `}
             {item.location && `${item.location} · `}
             {item.startAt && formatItemTime(trip, item.startAt)}
@@ -859,6 +864,14 @@ function BudgetTab({
 }
 
 function ResourcesTab({ tripId, resources, reload }: { tripId: string; resources: Trip["resources"]; reload: () => void }) {
+  // Older resources have no preview yet: asking for the list makes the server look them up, then we refresh once.
+  useEffect(() => {
+    if (!resources.some((r) => r.url && r.imageUrl == null)) return;
+    api.get(`/resources?tripId=${tripId}`).catch(() => {});
+    const t = setTimeout(reload, 5000);
+    return () => clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tripId]);
   const [title, setTitle] = useState("");
   const [url, setUrl] = useState("");
   const [category, setCategory] = useState("");
@@ -905,6 +918,7 @@ function ResourcesTab({ tripId, resources, reload }: { tripId: string; resources
       <div className="space-y-2">
         {resources.map((r) => (
           <Card key={r.id} className="p-3 flex items-center gap-4">
+            <ResourceThumb src={r.imageUrl} />
             {r.category && <Badge>{r.category}</Badge>}
             <div className="flex-1 text-sm">
               {r.url ? <a href={r.url} target="_blank" rel="noreferrer" className="text-brand-600 hover:underline">{r.title}</a> : r.title}

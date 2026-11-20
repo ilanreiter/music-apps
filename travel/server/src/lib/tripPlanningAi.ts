@@ -3,7 +3,7 @@ import { getAnthropicClient, AI_MODEL } from "./anthropic";
 // The SDK's types lag the API; extended reasoning is switched off so short JSON answers are not starved of tokens.
 const NO_THINKING = { thinking: { type: "disabled" } } as object;
 
-async function askJson(prompt: string, maxTokens = 8000): Promise<any> {
+export async function askJson(prompt: string, maxTokens = 8000): Promise<any> {
   const client = getAnthropicClient();
   if (!client) throw new Error("AI is not configured. Set ANTHROPIC_API_KEY in the server environment.");
   const response = await client.messages.create({
@@ -24,7 +24,7 @@ export interface ExtractedBooking {
 }
 
 // Naive local date-times ("2027-03-14T10:30") become ISO instants the same way the rest of the app stores itinerary times.
-function iso(input: unknown, defaultTime = "12:00", midnightMeansDateOnly = false): string | null {
+export function iso(input: unknown, defaultTime = "12:00", midnightMeansDateOnly = false): string | null {
   if (typeof input !== "string" || !input.trim()) return null;
   let v: string = input;
   // Models often fill an unknown time with 00:00; for hotels treat that as "date only".
@@ -32,7 +32,7 @@ function iso(input: unknown, defaultTime = "12:00", midnightMeansDateOnly = fals
   const d = new Date(/[zZ]|[+-]\d\d:?\d\d$/.test(v) ? v : v.length <= 10 ? `${v}T${defaultTime}:00` : v);
   return isNaN(d.getTime()) ? null : d.toISOString();
 }
-const str = (v: unknown) => (typeof v === "string" && v.trim() ? v.trim() : null);
+export const str = (v: unknown) => (typeof v === "string" && v.trim() ? v.trim() : null);
 
 export async function extractBookings(rawText: string, tripName: string): Promise<ExtractedBooking[]> {
   const today = new Date().toISOString().slice(0, 10);

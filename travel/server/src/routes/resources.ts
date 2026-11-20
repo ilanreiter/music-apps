@@ -1,6 +1,7 @@
 import { Router } from "express";
 import { z } from "zod";
 import { prisma } from "../db";
+import { pageImage } from "../lib/sourceText";
 
 const router = Router();
 
@@ -23,12 +24,17 @@ router.get("/", async (req, res) => {
     orderBy: { createdAt: "desc" },
   });
   res.json(resources);
+  // Fill in missing preview pictures in the background (a few per request) so older resources get one too.
+  for (const r of resources.filter((x) => x.url && x.imageUrl === null).slice(0, 6)) {
+    pageImage(r.url!).then((img) => prisma.resource.update({ where: { id: r.id }, data: { imageUrl: img ?? "" } })).catch(() => {});
+  }
 });
 
 router.post("/", async (req, res) => {
   const parsed = resourceSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
-  const resource = await prisma.resource.create({ data: parsed.data });
+  const imageUrl = parsed.data.url ? (await pageImage(parsed.data.url)) ?? "" : undefined;
+  const resource = await prisma.resource.create({ data: { ...parsed.data, imageUrl } });
   res.status(201).json(resource);
 });
 

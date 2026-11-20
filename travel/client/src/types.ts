@@ -94,6 +94,7 @@ export interface Resource {
   url?: string | null;
   category?: string | null;
   notes?: string | null;
+  imageUrl?: string | null;
   destinationId?: string | null;
   tripId?: string | null;
 }
