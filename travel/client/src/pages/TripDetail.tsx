@@ -12,6 +12,7 @@ import BookingsTab from "../components/trip/BookingsTab";
 import ChecklistTab from "../components/trip/ChecklistTab";
 import PlacesImport from "../components/trip/PlacesImport";
 import ImportCard from "../components/trip/ImportCard";
+import DocumentsTab from "../components/trip/DocumentsTab";
 import { WorldMapDefs } from "../components/WorldMap";
 import { Card_, GroupCard } from "./Dashboard";
 import { AlertTriangleIcon } from "../components/icons";
@@ -20,7 +21,7 @@ import { colorForDay } from "../lib/dayColors";
 
 const RouteMap = lazyWithReload(() => import("../components/RouteMap"));
 
-const TABS: PlanTab[] = ["Overview", "Itinerary", "Schedule", "Bookings", "Checklist", "Route", "Budget", "Resources"];
+const TABS: PlanTab[] = ["Overview", "Itinerary", "Schedule", "Bookings", "Checklist", "Route", "Budget", "Resources", "Documents"];
 type Tab = PlanTab;
 
 const BOOKING_TONE: Record<BookingStatus, string> = {
@@ -117,7 +118,7 @@ export default function TripDetail() {
   const [roadmap, setRoadmap] = useState<RoadmapData | null>(null);
   const [importOpen, setImportOpen] = useState(false);
   const [bookingsPanel, setBookingsPanel] = useState<"" | "email">("");
-  const importBookings = () => { setBookingsPanel("email"); setTab("Bookings"); };
+  const importBookings = () => navigate(`/import?trip=${id}`);
 
   function load() {
     if (!id) return;
@@ -156,7 +157,7 @@ export default function TripDetail() {
       <PageHeader
         title={trip.title}
         subtitle={`${trip.destination?.name || "No destination"} · ${trip.status}`}
-        actions={<div className="flex gap-2"><Button onClick={() => setImportOpen(true)}>Import</Button><Button variant="danger" onClick={deleteTrip}>Delete trip</Button></div>}
+        actions={<div className="flex gap-2"><Button onClick={importBookings}>Import</Button><Button variant="danger" onClick={deleteTrip}>Delete trip</Button></div>}
       />
 
       <div className={planned ? "grid grid-cols-1 gap-4 lg:grid-cols-[minmax(320px,440px)_1fr] mb-2 items-start" : ""}>
@@ -210,6 +211,7 @@ export default function TripDetail() {
         <ItineraryTab trip={trip} agents={agents} reload={load} showForm={showItemForm} setShowForm={setShowItemForm} onImportBookings={importBookings} />
       )}
       {tab === "Route" && <RouteTab trip={trip} reload={load} />}
+      {tab === "Documents" && <DocumentsTab tripId={trip.id} />}
       {tab === "Budget" && <BudgetTab tripId={trip.id} lines={trip.budgetLines} items={trip.items} reload={load} />}
       {tab === "Resources" && <ResourcesTab tripId={trip.id} resources={trip.resources} reload={load} />}
     </div>

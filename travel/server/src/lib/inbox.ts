@@ -6,16 +6,19 @@ import { prisma } from "../db";
 import { bytesToText, htmlToText } from "./sourceText";
 import { askJson } from "./tripPlanningAi";
 import { analyzeSource, annotate } from "./tripImport";
+import { saveIncoming } from "./docStore";
 
 const env = process.env;
 export const inboxConfigured = () => !!(env.IMAP_USER && env.IMAP_PASSWORD);
 const allowed = () => (env.INBOX_ALLOWED_SENDERS ?? "").split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
 
 export interface InboxAttachment { name: string; text: string; note?: string }
+/** Originals worth keeping as files (the text goes into the card; the file goes to the NAS). */
+export interface KeptFile { name: string; mime: string; buf: Buffer }
 
 const TEXT_TYPES = /^(text\/(plain|calendar|csv|html)|application\/(ics|json))/i;
 
-async function attachmentTexts(mail: ParsedMail): Promise<InboxAttachment[]> {
+async function attachmentTexts(mail: ParsedMail, keep: KeptFile[] = []): Promise<InboxAttachment[]> {
   const out: InboxAttachment[] = [];
   for (const a of mail.attachments.slice(0, 10)) {
     const name = a.filename || "attachment";
@@ -31,6 +34,7 @@ async function attachmentTexts(mail: ParsedMail): Promise<InboxAttachment[]> {
         text = r.text; if (r.method !== "text") note = r.method;
       } else continue;
       if (text.trim().length >= 15) out.push({ name, text: text.slice(0, 200_000), note });
+      keep.push({ name, mime: a.contentType || "application/octet-stream", buf: a.content });
     } catch (e: any) {
       console.error("inbox: attachment skipped:", name, String(e?.message ?? e).slice(0, 120));
     }
@@ -38,7 +42,8 @@ async function attachmentTexts(mail: ParsedMail): Promise<InboxAttachment[]> {
   return out;
 }
 
-export interface Suggestion { tripId: string | null; note: string | null; relevant: boolean; reason: string | null }
+export interface NewTripHint { title: string; place: string | null; startDate: string | null; endDate: string | null }
+export interface Suggestion { tripId: string | null; note: string | null; relevant: boolean; reason: string | null; newTrip?: NewTripHint | null }
 
 // One call decides two things: is this mail about a trip at all (booking, ticket, itinerary, travel document) and which trip is it.
 // Failure or doubt means "relevant, unsorted", so nothing real is filtered out by accident.
@@ -48,10 +53,14 @@ export async function suggestTrip(subject: string, body: string): Promise<Sugges
   if (tagged) return { tripId: tagged.id, note: "Matched the trip tag in the subject", relevant: true, reason: null };
   try {
     const list = trips.length ? trips.map((t) => `${t.id} | ${t.title}${t.destination ? ` | ${t.destination.name}` : ""} | ${t.startDate?.toISOString().slice(0, 10) ?? "no dates"} to ${t.endDate?.toISOString().slice(0, 10) ?? "?"}`).join("\n") : "(no trips yet)";
-    const j = await askJson(`Classify an email forwarded to a trip planner. Trips (id | title | destination | dates):\n${list}\n\nReturn ONLY JSON {"relevant":true or false,"tripId":"an id from the list, or null if unsure or no trip fits","reason":"one short sentence"}.\n"relevant" is true for a booking confirmation, ticket, reservation, itinerary, travel document, visa/insurance/check-in notice, or a message about a specific trip, including for a trip that is not in the list yet. It is false for promotions, newsletters, marketing, deals, loyalty-program news, surveys, receipts unrelated to travel, and anything not about travel. When unsure, answer true.\n\nSubject: ${subject}\n"""\n${body.slice(0, 6000)}\n"""`, 300);
+    const j = await askJson(`Classify an email forwarded to a trip planner. Trips (id | title | destination | dates):\n${list}\n\nReturn ONLY JSON {"relevant":true or false,"tripId":"an id from the list, or null if unsure or no trip fits","reason":"one short sentence","newTrip":{"title":"Trip to <main destination>","place":"main country/region/city","startDate":"YYYY-MM-DD or null","endDate":"YYYY-MM-DD or null"} or null}.\n"newTrip" is filled only when the material is relevant and no listed trip fits; take the dates from the material (first and last day of the travel it describes) and never invent them.\n"relevant" is true for a booking confirmation, ticket, reservation, itinerary, travel document, visa/insurance/check-in notice, or a message about a specific trip, including for a trip that is not in the list yet. It is false for promotions, newsletters, marketing, deals, loyalty-program news, surveys, receipts unrelated to travel, and anything not about travel. When unsure, answer true.\n\nSubject: ${subject}\n"""\n${body.slice(0, 6000)}\n"""`, 300);
     const t = trips.find((x) => x.id === j.tripId);
     const reason = typeof j.reason === "string" ? j.reason.slice(0, 200) : null;
-    return { tripId: j.relevant === false ? null : t?.id ?? null, note: t ? reason : null, relevant: j.relevant !== false, reason };
+    const nt = !t && j.relevant !== false && j.newTrip && typeof j.newTrip.title === "string" ? {
+      title: String(j.newTrip.title).slice(0, 120), place: typeof j.newTrip.place === "string" ? j.newTrip.place.slice(0, 120) : null,
+      startDate: /^\d{4}-\d{2}-\d{2}$/.test(j.newTrip.startDate ?? "") ? j.newTrip.startDate : null, endDate: /^\d{4}-\d{2}-\d{2}$/.test(j.newTrip.endDate ?? "") ? j.newTrip.endDate : null,
+    } : null;
+    return { tripId: j.relevant === false ? null : t?.id ?? null, note: t ? reason : null, relevant: j.relevant !== false, reason, newTrip: nt };
   } catch { return { tripId: null, note: null, relevant: true, reason: null }; }
 }
 
@@ -98,7 +107,8 @@ export async function pollInbox(): Promise<{ added: number; skipped: number }> {
         const messageId = mail.messageId || `${from}-${mail.date?.toISOString()}-${mail.subject}`;
         if (await prisma.inboxItem.findUnique({ where: { messageId } })) continue;
         const body = (mail.text || (mail.html ? htmlToText(mail.html).text : "")).trim();
-        const attachments = await attachmentTexts(mail);
+        const keep: KeptFile[] = [];
+        const attachments = await attachmentTexts(mail, keep);
         const subject = (mail.subject || "(no subject)").slice(0, 300);
         if (body.length < 15 && !attachments.length) continue;
         const blocked = await prisma.inboxBlockedSender.findFirst({ where: { addr: { in: [from, originalSender(from, body)] } } });
@@ -111,8 +121,8 @@ export async function pollInbox(): Promise<{ added: number; skipped: number }> {
         const baseSubject = subject.replace(/^((fwd?|re)\s*:\s*)+/i, "").trim().toLowerCase();
         const earlier = (await prisma.inboxItem.findMany({ where: { fromAddr: from, createdAt: { gte: new Date(Date.now() - 30 * 86400_000) } }, select: { id: true, subject: true } }))
           .find((x) => x.subject.replace(/^((fwd?|re)\s*:\s*)+/i, "").trim().toLowerCase() === baseSubject);
-        const created = await prisma.inboxItem.create({ data: { status: filterReason ? "FILTERED" : "PENDING", filterReason, dupOfId: earlier?.id ?? null, messageId, fromAddr: from, subject, receivedAt: mail.date ?? new Date(), bodyText: body.slice(0, 400_000), bodyHtml: typeof mail.html === "string" && mail.html.length < 1_500_000 ? mail.html : null, attachments: attachments as any, suggestedTripId: sg.tripId, suggestionNote: sg.note } });
-        if (!filterReason) added++;
+        const created = await prisma.inboxItem.create({ data: { status: filterReason ? "FILTERED" : "PENDING", filterReason, dupOfId: earlier?.id ?? null, messageId, fromAddr: from, subject, receivedAt: mail.date ?? new Date(), bodyText: body.slice(0, 400_000), bodyHtml: typeof mail.html === "string" && mail.html.length < 1_500_000 ? mail.html : null, attachments: attachments as any, suggestedTripId: sg.tripId, suggestionNote: sg.note, newTripHint: (sg.newTrip ?? undefined) as any } });
+        if (!filterReason) { added++; for (const f of keep) await saveIncoming(f.buf, f.name, f.mime, created.id).catch((e) => console.error("inbox: could not keep", f.name, String(e?.message ?? e).slice(0, 120))); }
         if (!filterReason && sg.tripId) await parseInboxItem(created.id, sg.tripId).catch((e) => console.error("inbox: parse failed:", String(e?.message ?? e).slice(0, 120)));
       }
     } finally { lock.release(); }
@@ -139,7 +149,7 @@ export async function parseInboxItem(id: string, tripId: string) {
   const trip = await prisma.trip.findUniqueOrThrow({ where: { id: tripId }, include: { destination: true } });
   const profiles = await prisma.traveler.findMany({ select: { name: true } });
   const known = [...new Set([...trip.travelers, ...profiles.map((p) => p.name)])];
-  const sources = [{ name: `${item.subject} (email)`, text: item.bodyText }, ...(item.attachments as unknown as InboxAttachment[]).map((a) => ({ name: a.name, text: a.text }))];
+  const sources = [{ name: item.source === "upload" ? item.subject : `${item.subject} (email)`, text: item.bodyText }, ...(item.attachments as unknown as InboxAttachment[]).map((a) => ({ name: a.name, text: a.text }))];
   const out = [];
   for (const s of sources) {
     if (s.text.trim().length < 15) continue;

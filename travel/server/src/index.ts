@@ -16,6 +16,7 @@ import preferencesRouter from "./routes/preferences";
 import travelersRouter from "./routes/travelers";
 import roadmapRouter from "./routes/roadmap";
 import inboxRouter from "./routes/inbox";
+import docsRouter from "./routes/docs";
 import { startInboxPolling } from "./lib/inbox";
 import { requireAuth } from "./middleware/auth";
 
@@ -39,6 +40,7 @@ app.use("/api/trips/:tripId/budget", requireAuth, budgetRouter);
 app.use("/api/trips/:tripId/checklist", requireAuth, checklistRouter);
 app.use("/api/trips/:tripId/import", requireAuth, tripImportRouter);
 app.use("/api/inbox", requireAuth, inboxRouter);
+app.use("/api/docs", requireAuth, docsRouter);
 app.use("/api/documents", requireAuth, documentsRouter);
 app.use("/api/trips", requireAuth, tripsRouter);
 app.use("/api/booking-agents", requireAuth, bookingAgentsRouter);

@@ -34,7 +34,8 @@ function AppRoutes() {
         }
       >
         <Route index element={<Dashboard />} />
-        <Route path="inbox" element={<Inbox />} />
+        <Route path="import" element={<Inbox />} />
+        <Route path="inbox" element={<Navigate to="/import" replace />} />
         <Route path="budget" element={<Budget />} />
         {/* Removed tabs: old links land on the Dashboard. Trip detail pages are still opened from a card. */}
         <Route path="destinations" element={<Navigate to="/" replace />} />

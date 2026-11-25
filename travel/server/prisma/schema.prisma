@@ -141,6 +141,7 @@ model Trip {
   aiMessages    AiMessage[]
   checklist     ChecklistItem[]
   imports       TripImport[]
+  documents     TripDocument[]
 }
 
 model TripItem {
@@ -253,6 +254,9 @@ model Preferences {
   pace        String?
   budgetStyle String?
   notes       String?
+  // Where original documents are kept: a folder under the mounted NAS root (DOCS_ROOT), and how trip folders are named.
+  docsFolder  String?
+  docsNaming  String   @default("month") // month = "Vietnam - February 2027" | title = "Trip to Vietnam"
   updatedAt   DateTime @updatedAt
 }
 
@@ -330,6 +334,8 @@ model InboxItem {
   bodyHtml        String?
   attachments     Json      @default("[]")
   status          String    @default("PENDING") // PENDING | FILED | DISMISSED | FILTERED
+  source          String    @default("email") // email | upload
+  newTripHint     Json?     // { title, place, startDate, endDate } when no existing trip fits
   filterReason    String?   // set when status is FILTERED (newsletter / not about a trip / blocked sender)
   dupOfId         String?   // earlier message with the same subject from the same sender
   suggestedTripId String?
@@ -344,4 +350,20 @@ model InboxBlockedSender {
   id        String   @id @default(cuid())
   addr      String   @unique
   createdAt DateTime @default(now())
+}
+
+// An original file (PDF, photo, attachment) kept on the NAS. Before it is filed it sits in "<docsFolder>/Wander Inbox".
+model TripDocument {
+  id          String   @id @default(cuid())
+  tripId      String?
+  trip        Trip?    @relation(fields: [tripId], references: [id], onDelete: SetNull)
+  inboxItemId String?
+  name        String
+  relPath     String   // relative to DOCS_ROOT
+  size        Int
+  mime        String
+  createdAt   DateTime @default(now())
+
+  @@index([tripId])
+  @@index([inboxItemId])
 }

@@ -1,3 +1,4 @@
+import { useNavigate } from "react-router-dom";
 import { useEffect, useState } from "react";
 import { FileText, Loader2, Mail, Plus, Trash2 } from "lucide-react";
 import { api } from "../../lib/api";
@@ -64,7 +65,8 @@ function duplicateIds(items: TripItem[]): string[] {
 
 export default function BookingsTab({ trip, agents, reload, openPanel, onPanelOpened }: { trip: Trip; agents: BookingAgent[]; reload: () => void; openPanel?: "" | "email"; onPanelOpened?: () => void }) {
   const items = trip.items.filter(isBookable);
-  const [show, setShow] = useState<"" | "add" | "email">(openPanel || "email");
+  const [show, setShow] = useState<"" | "add" | "email">("");
+  const navigate = useNavigate();
   const [people, setPeople] = useState<string[]>([]);
   useEffect(() => { api.get<Traveler[]>("/travelers").then((l) => setPeople(l.map((t) => t.name))).catch(() => {}); }, []);
   useEffect(() => { if (openPanel) { setShow(openPanel); onPanelOpened?.(); } }, [openPanel]);
@@ -97,7 +99,7 @@ export default function BookingsTab({ trip, agents, reload, openPanel, onPanelOp
           ))}
         </div>
         <div className="flex-1" />
-        <Button variant="secondary" onClick={() => setShow(show === "email" ? "" : "email")}><Mail className="h-4 w-4 mr-1.5" />Import from email</Button>
+        <Button variant="secondary" onClick={() => navigate(`/import?trip=${trip.id}`)}><Mail className="h-4 w-4 mr-1.5" />Import from email</Button>
         <Button onClick={() => setShow(show === "add" ? "" : "add")}><Plus className="h-4 w-4 mr-1" />Add booking</Button>
       </div>
 

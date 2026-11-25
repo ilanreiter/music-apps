@@ -2,6 +2,7 @@ import React, { useEffect, useState } from "react";
 import { api } from "../lib/api";
 import { Preferences as PreferencesType } from "../types";
 import { Button, Card, Input, Label, PageHeader, Select, Textarea } from "../components/ui";
+import DocsFolderSetting from "../components/DocsFolderSetting";
 
 const PACE_OPTIONS = ["Relaxed", "Moderate", "Packed"];
 const BUDGET_OPTIONS = ["Budget-conscious", "Mid-range", "Splurge on a few things", "Luxury"];
@@ -87,6 +88,7 @@ export default function Preferences() {
           </div>
         </form>
       </Card>
+      <DocsFolderSetting />
     </div>
   );
 }

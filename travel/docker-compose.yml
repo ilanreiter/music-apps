@@ -18,8 +18,13 @@ services:
       INBOX_POLL_MINUTES: ${INBOX_POLL_MINUTES:-5}
       CLIENT_ORIGIN: ${CLIENT_ORIGIN:-http://localhost:8080}
       COOKIE_SECURE: ${COOKIE_SECURE:-false}
+      DOCS_ROOT: /nas
+      DOCS_ROOT_LABEL: ${DOCS_NAS_ROOT:-/mnt/ugreen-ssd1}
       NODE_ENV: production
       PORT: 4000
+    volumes:
+      # NAS share where original trip documents are kept (pick the exact folder in the app's Preferences)
+      - ${DOCS_NAS_ROOT:-/mnt/ugreen-ssd1}:/nas
     expose:
       - "4000"
 

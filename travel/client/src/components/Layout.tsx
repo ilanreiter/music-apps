@@ -9,7 +9,7 @@ import { MoonIcon, SunIcon, WanderLogo } from "./icons";
 
 const navItems = [
   { to: "/", label: "Dashboard", end: true, Icon: LayoutGrid },
-  { to: "/inbox", label: "Inbox", Icon: InboxIcon },
+  { to: "/import", label: "Import", Icon: InboxIcon },
   { to: "/budget", label: "Budget", Icon: PiggyBank },
   { to: "/travelers", label: "Travelers", Icon: Users },
   { to: "/booking-agents", label: "Booking Agents", Icon: Handshake },
@@ -55,7 +55,7 @@ export default function Layout() {
                   )}
                   <item.Icon className="relative h-4 w-4 shrink-0" aria-hidden="true" />
                   <span className="relative">{item.label}</span>
-                  {item.to === "/inbox" && pending > 0 && <span className="relative ml-auto rounded-full bg-white/20 px-1.5 text-[11px]">{pending}</span>}
+                  {item.to === "/import" && pending > 0 && <span className="relative ml-auto rounded-full bg-white/20 px-1.5 text-[11px]">{pending}</span>}
                 </>
               )}
             </NavLink>
