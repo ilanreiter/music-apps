@@ -9,7 +9,7 @@ import { daysFromNow, isBookable, isBooked, money, shortDate } from "./shared";
 
 const RouteMap = lazyWithReload(() => import("../RouteMap"));
 
-export type PlanTab = "Overview" | "Itinerary" | "Schedule" | "Bookings" | "Checklist" | "Route" | "Budget" | "Resources" | "Documents";
+export type PlanTab = "Overview" | "Itinerary" | "Schedule" | "Bookings" | "Checklist" | "Route" | "Budget" | "Resources" | "Documents" | "Insurance";
 
 /** Readiness at a glance: countdown, what's booked, what's due, and a place to keep key trip information. */
 export default function OverviewTab({ trip, goTo, onImportBookings, mapPoints = [] }: { trip: Trip; goTo: (t: PlanTab) => void; onImportBookings?: () => void; mapPoints?: MapPoint[] }) {

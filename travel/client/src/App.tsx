@@ -12,6 +12,7 @@ import Resources from "./pages/Resources";
 import Assistant from "./pages/Assistant";
 import Preferences from "./pages/Preferences";
 import Inbox from "./pages/Inbox";
+import Documents from "./pages/Documents";
 import Travelers from "./pages/Travelers";
 
 function RequireAuth({ children }: { children: React.ReactNode }) {
@@ -35,6 +36,7 @@ function AppRoutes() {
       >
         <Route index element={<Dashboard />} />
         <Route path="import" element={<Inbox />} />
+        <Route path="documents" element={<Documents />} />
         <Route path="inbox" element={<Navigate to="/import" replace />} />
         <Route path="budget" element={<Budget />} />
         {/* Removed tabs: old links land on the Dashboard. Trip detail pages are still opened from a card. */}

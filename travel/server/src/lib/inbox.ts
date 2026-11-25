@@ -157,8 +157,8 @@ export async function parseInboxItem(id: string, tripId: string) {
       const r = await analyzeSource(trip, s.name, s.text, null, known);
       const proposals = (await annotate(trip.id, r.proposals)).map((p) => {
         const d: any = p.data;
-        const when = [d.startAt ? String(d.startAt).slice(0, 10) : d.day ? `Day ${d.day}` : d.dueDate ? String(d.dueDate).slice(0, 10) : null, d.location].filter(Boolean).join(" · ");
-        return { kind: p.kind, action: p.action, title: d.title ?? d.text, when: when || null, matchTitle: p.matchTitle ?? null, data: p.data };
+        const when = [d.startAt ? String(d.startAt).slice(0, 10) : d.day ? `Day ${d.day}` : d.dueDate ? String(d.dueDate).slice(0, 10) : d.coverageStart ? `${String(d.coverageStart).slice(0, 10)} → ${String(d.coverageEnd ?? "").slice(0, 10)}` : null, d.location].filter(Boolean).join(" · ");
+        return { kind: p.kind, action: p.action, title: d.title ?? d.text ?? [d.provider, d.planName].filter(Boolean).join(" · "), when: when || null, matchTitle: p.matchTitle ?? null, data: p.data };
       });
       out.push({ name: s.name, hash: r.hash, category: r.category, summary: r.summary, reason: r.reason, travelers: r.travelers, alreadyImported: r.alreadyImported, mismatch: r.mismatch ?? null, proposals });
     } catch (e: any) {

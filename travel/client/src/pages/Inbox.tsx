@@ -4,6 +4,7 @@ import { Loader2, ChevronDown, ChevronRight, FileUp, Globe, Mail, Paperclip, Plu
 import { api } from "../lib/api";
 import { Trip } from "../types";
 import ImportCard from "../components/trip/ImportCard";
+import DocViewer, { ViewDoc } from "../components/DocViewer";
 import { Badge, Button, Card, Input, PageHeader, Select, Textarea } from "../components/ui";
 import { Link } from "react-router-dom";
 
@@ -12,7 +13,7 @@ interface Item { id: string; source?: string; documents?: { id: string; name: st
 interface PSource { name: string; category: string; summary: string; reason: string; travelers: string[]; alreadyImported: boolean; error?: string; mismatch?: { place: string | null; otherTrip: { id: string; title: string } | null } | null; proposals: { kind: string; action: string; title: string; when: string | null; matchTitle: string | null; data?: any }[] }
 interface Parsed { tripId: string; sources: PSource[] }
 const CAT: Record<string, { label: string; tone: string }> = { booking: { label: "Booking", tone: "green" }, itinerary: { label: "Itinerary", tone: "blue" }, schedule: { label: "Schedule", tone: "blue" }, general: { label: "General material", tone: "purple" }, irrelevant: { label: "Not relevant", tone: "slate" } };
-const KIND: Record<string, string> = { booking: "Booking", itinerary: "Itinerary", resource: "Resource", checklist: "To-do" };
+const KIND: Record<string, string> = { booking: "Booking", itinerary: "Itinerary", resource: "Resource", checklist: "To-do", insurance: "Insurance" };
 interface Review { id: string; tripId: string; results: any[] }
 
 export default function Inbox() {
@@ -31,6 +32,7 @@ export default function Inbox() {
   const [original, setOriginal] = useState<{ subject: string; fromAddr: string; html: string | null; sources: { name: string; text: string }[] } | null>(null);
   const [view, setView] = useState<"formatted" | "text">("formatted");
   const [images, setImages] = useState(false);
+  const [viewing, setViewing] = useState<ViewDoc | null>(null);
   const [params] = useSearchParams();
   const presetTrip = params.get("trip") || "";
   const [newTrip, setNewTrip] = useState<Record<string, NewTripHint>>({});   // open "New trip…" forms, by card
@@ -235,7 +237,7 @@ export default function Inbox() {
                 })()}
                 <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px]">
                   <button type="button" onClick={() => viewOriginal(i)} className="text-brand-600 hover:underline">{i.source === "upload" ? "View text" : "View original"}</button>
-                  {i.documents?.map((d) => <a key={d.id} href={`/api/docs/${d.id}/file`} target="_blank" rel="noreferrer" className="flex items-center gap-1 text-brand-600 hover:underline"><Paperclip className="h-3 w-3" />{d.name}</a>)}
+                  {i.documents?.map((d) => <button type="button" key={d.id} onClick={() => setViewing(d)} className="flex items-center gap-1 text-brand-600 hover:underline"><Paperclip className="h-3 w-3" />{d.name}</button>)}
                 </div>
                 <div className="mt-2 rounded-md bg-slate-50 dark:bg-slate-900 px-3 py-2 text-xs">
                   {choice[i.id] && mismatchOf(i) ? (
@@ -344,6 +346,7 @@ export default function Inbox() {
           </div>
         </div>
       )}
+      <DocViewer doc={viewing} onClose={() => setViewing(null)} />
       {review && (
         <ImportCard tripId={review.tripId} initialResults={review.results} reload={() => {}} onClose={() => { setReview(null); load(); }}
           onApplied={() => { api.post(`/inbox/${review.id}/filed`, { tripId: review.tripId }).catch(() => {}); }} />

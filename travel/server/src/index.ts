@@ -18,6 +18,7 @@ import roadmapRouter from "./routes/roadmap";
 import inboxRouter from "./routes/inbox";
 import docsRouter from "./routes/docs";
 import searchRouter from "./routes/search";
+import insuranceRouter from "./routes/insurance";
 import { startInboxPolling } from "./lib/inbox";
 import { requireAuth } from "./middleware/auth";
 
@@ -39,6 +40,7 @@ app.use("/api/destinations", requireAuth, destinationsRouter);
 app.use("/api/trips/:tripId/items", requireAuth, tripItemsRouter);
 app.use("/api/trips/:tripId/budget", requireAuth, budgetRouter);
 app.use("/api/trips/:tripId/checklist", requireAuth, checklistRouter);
+app.use("/api/trips/:tripId/insurance", requireAuth, insuranceRouter);
 app.use("/api/trips/:tripId/import", requireAuth, tripImportRouter);
 app.use("/api/inbox", requireAuth, inboxRouter);
 app.use("/api/docs", requireAuth, docsRouter);

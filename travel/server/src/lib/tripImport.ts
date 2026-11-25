@@ -21,12 +21,14 @@ export interface ItineraryData {
 }
 export interface ResourceData { title: string; url: string | null; category: string | null; notes: string | null }
 export interface ChecklistData { text: string; category: string | null; dueDate: string | null }
+export interface InsuranceData { provider: string; planName: string | null; policyNumber: string | null; coverageStart: string | null; coverageEnd: string | null; travelers: string[]; emergencyPhone: string | null; claimsContact: string | null; url: string | null; notes: string | null }
 
 export type Proposal =
   | { kind: "booking"; data: BookingData; action: Action; matchTitle?: string }
   | { kind: "itinerary"; data: ItineraryData; action: Action; matchTitle?: string }
   | { kind: "resource"; data: ResourceData; action: Action; matchTitle?: string }
-  | { kind: "checklist"; data: ChecklistData; action: Action; matchTitle?: string };
+  | { kind: "checklist"; data: ChecklistData; action: Action; matchTitle?: string }
+  | { kind: "insurance"; data: InsuranceData; action: Action; matchTitle?: string };
 
 export interface SourceResult {
   name: string; hash: string; category: Category; reason: string; summary: string; travelers: string[];
@@ -62,12 +64,14 @@ Read the material and decide what it is, then extract EVERYTHING useful. Return 
 "itinerary":[{"type":"POI|ACTIVITY|TRANSPORT|STAY|OTHER","title":"","date":"YYYY-MM-DD or null","day":day number of the trip or null,"time":"HH:MM or null","durationHours":number or null,"location":null,"notes":null,"cost":number or null,"currency":null,"traveler":null}],
 "checklist":[{"text":"a to-do the material implies, e.g. 'Check in online 24h before the flight'","category":"Documents|Health & insurance|Money|Bookings|Packing|Home & other","dueDate":"YYYY-MM-DD or null"}],
 "resource":{"title":"short title","category":"Guide|Visa & entry|Insurance|Transport|Accommodation|Food|Other","notes":"the key facts worth keeping, as short bullet lines (max about 1500 characters)"} or null,
+"insurance":[{"provider":"insurer / plan administrator","planName":null,"policyNumber":null,"coverageStart":"YYYY-MM-DD or null","coverageEnd":"YYYY-MM-DD or null","travelers":["insured people named"],"emergencyPhone":"24/7 assistance number or null","claimsContact":"claims phone/email/site or null","notes":"the key coverage facts and conditions as short bullet lines (max about 1500 characters)"}],
 "tripMatch":"yes|no|unsure","materialPlace":"the main country/region/city this material's travel is in, or null","tripMatchReason":"one short sentence"}
 Rules:
 - tripMatch = "no" only when the material is clearly about travel to a different destination than this trip (e.g. a tour of another country), or clearly about dates far outside this trip's dates. A layover city, a flight home, or a trip with no destination/dates set is not a mismatch; use "unsure" when in doubt.
 - booking = a confirmation, ticket, reservation, receipt or invoice for something already booked; fill "bookings" (one entry per flight leg, stay, car, tour, per traveler when tickets are per person).
   An invoice, receipt or payment record from a travel agency, tour operator, airline, hotel, car-rental or booking site is a booking even when it shows only a package or service name, a reference, dates and payment lines; extract the booked service(s) from it. A payment record for travel is never irrelevant.
 - itinerary or schedule = a plan of places/activities/days; fill "itinerary" (use "date" when given, else "day").
+- insurance = a travel-insurance policy, certificate, confirmation of coverage or plan document: fill "insurance" (one entry per policy) instead of "resource", and set category to "booking".
 - general = useful reference (guide, article, visa rules, policy, packing list, map notes); fill "resource".
 - irrelevant = contains no travel information at all (e.g. a recipe or a bill for something that is not travel, such as utilities or groceries); leave all lists empty. Never call material irrelevant because a name does not match the known travelers (guests and companions vary) or because it mentions another city; classify it by what it is and let the user decide.
 - A document may contain several kinds: fill every list that applies, and set category to the main one.
@@ -122,7 +126,15 @@ ${text.slice(0, 28000)}
     if (!str(c?.text)) continue;
     props.push({ kind: "checklist", action: "new", data: { text: String(c.text).trim().slice(0, 200), category: str(c.category), dueDate: iso(c.dueDate) } });
   }
-  if (j.resource && str(j.resource.title) && cat !== "irrelevant") {
+  for (const x of Array.isArray(j.insurance) ? j.insurance : []) {
+    if (!str(x?.provider)) continue;
+    props.push({ kind: "insurance", action: "new", data: {
+      provider: str(x.provider)!, planName: str(x.planName), policyNumber: str(x.policyNumber), coverageStart: iso(x.coverageStart), coverageEnd: iso(x.coverageEnd),
+      travelers: (Array.isArray(x.travelers) ? x.travelers : []).map(str).filter(Boolean) as string[], emergencyPhone: str(x.emergencyPhone), claimsContact: str(x.claimsContact),
+      url, notes: str(x.notes),
+    } });
+  }
+  if (j.resource && str(j.resource.title) && cat !== "irrelevant" && !(Array.isArray(j.insurance) && j.insurance.length)) {
     props.push({ kind: "resource", action: "new", data: { title: String(j.resource.title).trim().slice(0, 160), url, category: str(j.resource.category), notes: str(j.resource.notes)?.slice(0, 3000) ?? null } });
   }
   out.proposals = props;
@@ -134,7 +146,7 @@ ${text.slice(0, 28000)}
 type Item = Awaited<ReturnType<typeof loadTrip>>["items"][number];
 
 export async function loadTrip(id: string) {
-  return prisma.trip.findUniqueOrThrow({ where: { id }, include: { destination: true, items: true, resources: true, checklist: true } });
+  return prisma.trip.findUniqueOrThrow({ where: { id }, include: { destination: true, items: true, resources: true, checklist: true, insurance: true } });
 }
 
 const travDiff = (a: string | null | undefined, b: string | null | undefined) => !!a && !!b && norm(a) !== norm(b);
@@ -154,6 +166,11 @@ function notesCovered(existing: string | null | undefined, incoming: string): bo
   if ((existing ?? "").includes(incoming)) return true;
   const have = todoTokens(existing ?? ""), want = [...todoTokens(incoming)];
   return want.length === 0 || want.filter((w) => have.has(w)).length / want.length >= 0.7;
+}
+// the same policy: same policy number, or the same insurer when either side has no number
+function sameInsurance<T extends { provider: string; policyNumber: string | null }>(list: T[], d: { provider: string; policyNumber: string | null }) {
+  const num = (x: string | null) => norm(x).replace(/ /g, "");
+  return list.find((e) => (num(e.policyNumber) && num(e.policyNumber) === num(d.policyNumber)) || ((!e.policyNumber || !d.policyNumber) && (norm(e.provider).includes(norm(d.provider)) || norm(d.provider).includes(norm(e.provider)))));
 }
 const BOOKABLE = new Set(["TRANSPORT", "STAY", "ACTIVITY", "OTHER"]);
 
@@ -234,6 +251,9 @@ export async function annotate(tripId: string, proposals: Proposal[]): Promise<P
     } else if (p.kind === "checklist") {
       const e = trip.checklist.find((c) => sameTodo(c.text, p.data.text));
       if (e) out = { ...p, action: "duplicate", matchTitle: e.text };
+    } else if (p.kind === "insurance") {
+      const e = sameInsurance(trip.insurance, p.data);
+      if (e) out = { ...p, action: "duplicate", matchTitle: e.provider + (e.policyNumber ? ` (${e.policyNumber})` : "") };
     }
     // the same thing twice inside one upload
     const key = JSON.stringify([out.kind, norm((out.data as any).title ?? (out.data as any).text), (out.data as any).startAt ?? (out.data as any).day ?? "", norm((out.data as any).traveler), norm((out.data as any).confirmationNo)]);
@@ -329,6 +349,11 @@ export async function applyProposals(tripId: string, proposals: Proposal[], sour
       if (trip.resources.some((r) => (p.data.url && r.url === p.data.url) || norm(r.title) === norm(p.data.title))) { res.skipped++; continue; }
       const imageUrl = p.data.url ? (await pageImage(p.data.url)) ?? "" : undefined;
       await prisma.resource.create({ data: { tripId, imageUrl, title: p.data.title, url: p.data.url, category: p.data.category, notes: p.data.notes, destinationId: trip.destinationId } });
+      res.created++;
+    } else if (p.kind === "insurance") {
+      if (sameInsurance(trip.insurance, p.data)) { res.skipped++; continue; }
+      const d = p.data;
+      await prisma.insurancePolicy.create({ data: { tripId, provider: d.provider, planName: d.planName, policyNumber: d.policyNumber, coverageStart: d.coverageStart ? new Date(d.coverageStart) : null, coverageEnd: d.coverageEnd ? new Date(d.coverageEnd) : null, travelers: d.travelers, emergencyPhone: d.emergencyPhone, claimsContact: d.claimsContact, url: d.url, notes: d.notes } });
       res.created++;
     } else if (p.kind === "checklist") {
       if (trip.checklist.some((c) => norm(c.text) === norm(p.data.text))) { res.skipped++; continue; }

@@ -13,6 +13,7 @@ import ChecklistTab from "../components/trip/ChecklistTab";
 import PlacesImport from "../components/trip/PlacesImport";
 import ImportCard from "../components/trip/ImportCard";
 import DocumentsTab from "../components/trip/DocumentsTab";
+import InsuranceTab from "../components/trip/InsuranceTab";
 import { WorldMapDefs } from "../components/WorldMap";
 import { Card_, GroupCard } from "./Dashboard";
 import { AlertTriangleIcon } from "../components/icons";
@@ -21,7 +22,7 @@ import { colorForDay } from "../lib/dayColors";
 
 const RouteMap = lazyWithReload(() => import("../components/RouteMap"));
 
-const TABS: PlanTab[] = ["Overview", "Itinerary", "Schedule", "Bookings", "Checklist", "Route", "Budget", "Resources", "Documents"];
+const TABS: PlanTab[] = ["Overview", "Itinerary", "Schedule", "Bookings", "Insurance", "Checklist", "Route", "Budget", "Resources", "Documents"];
 type Tab = PlanTab;
 
 const BOOKING_TONE: Record<BookingStatus, string> = {
@@ -216,6 +217,7 @@ export default function TripDetail() {
       )}
       {tab === "Route" && <RouteTab trip={trip} reload={load} />}
       {tab === "Documents" && <DocumentsTab tripId={trip.id} />}
+      {tab === "Insurance" && <InsuranceTab tripId={trip.id} />}
       {tab === "Budget" && <BudgetTab tripId={trip.id} lines={trip.budgetLines} items={trip.items} reload={load} />}
       {tab === "Resources" && <ResourcesTab tripId={trip.id} resources={trip.resources} reload={load} />}
     </div>

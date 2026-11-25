@@ -4,13 +4,14 @@ import { NavLink, Outlet, useLocation } from "react-router-dom";
 import { useAuth } from "../lib/AuthContext";
 import { useTheme } from "../lib/ThemeContext";
 import { motion } from "framer-motion";
-import { Bot, BookOpen, Inbox as InboxIcon, LayoutGrid, PiggyBank, Handshake, Settings, Users } from "lucide-react";
+import { Bot, BookOpen, FolderOpen, Inbox as InboxIcon, LayoutGrid, PiggyBank, Handshake, Settings, Users } from "lucide-react";
 import { MoonIcon, SunIcon, WanderLogo } from "./icons";
 import GlobalSearch from "./GlobalSearch";
 
 const navItems = [
   { to: "/", label: "Dashboard", end: true, Icon: LayoutGrid },
   { to: "/import", label: "Import", Icon: InboxIcon },
+  { to: "/documents", label: "Documents", Icon: FolderOpen },
   { to: "/budget", label: "Budget", Icon: PiggyBank },
   { to: "/travelers", label: "Travelers", Icon: Users },
   { to: "/booking-agents", label: "Booking Agents", Icon: Handshake },

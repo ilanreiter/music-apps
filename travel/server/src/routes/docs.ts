@@ -34,6 +34,12 @@ router.post("/mkdir", async (req, res) => {
   catch (e: any) { res.status(400).json({ error: e?.message?.includes("outside") ? e.message : "Could not create that folder." }); }
 });
 
+// Every kept file: filed ones with their trip, and ones still waiting on an Import card.
+router.get("/", async (_req, res) => {
+  const docs = await prisma.tripDocument.findMany({ include: { trip: { select: { id: true, title: true, startDate: true } } }, orderBy: { createdAt: "desc" } });
+  res.json(docs.map((d) => ({ id: d.id, name: d.name, size: d.size, mime: d.mime, createdAt: d.createdAt, trip: d.trip ? { id: d.trip.id, title: d.trip.title, startDate: d.trip.startDate } : null, waiting: !d.tripId })));
+});
+
 router.get("/trip/:tripId", async (req, res) => {
   const docs = await prisma.tripDocument.findMany({ where: { tripId: req.params.tripId }, orderBy: { createdAt: "desc" } });
   res.json(docs.map((d) => ({ id: d.id, name: d.name, size: d.size, mime: d.mime, createdAt: d.createdAt, folder: d.relPath.split("/").slice(0, -1).join("/") })));

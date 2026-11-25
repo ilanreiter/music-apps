@@ -6,7 +6,7 @@ import { money, readDocumentText, shortDate } from "./shared";
 
 type Category = "booking" | "itinerary" | "schedule" | "general" | "irrelevant";
 type Action = "new" | "update" | "duplicate";
-interface Proposal { kind: "booking" | "itinerary" | "resource" | "checklist"; action: Action; matchTitle?: string; data: any }
+interface Proposal { kind: "booking" | "itinerary" | "resource" | "checklist" | "insurance"; action: Action; matchTitle?: string; data: any }
 interface Result { name: string; hash: string; category: Category; reason: string; summary: string; travelers: string[]; alreadyImported: boolean; proposals: Proposal[]; error?: string; mismatch?: { place: string | null; reason: string; otherTrip: { id: string; title: string } | null } | null }
 interface Source { id: number; name: string; kind: "text" | "url"; text?: string; url?: string; note?: string }
 interface Applied { created: number; updated: number; skipped: number; travelers: string[]; datesSet: boolean }
@@ -15,16 +15,17 @@ const CAT: Record<Category, { label: string; tone: string }> = {
   booking: { label: "Booking", tone: "green" }, itinerary: { label: "Itinerary", tone: "blue" }, schedule: { label: "Schedule", tone: "blue" },
   general: { label: "General material", tone: "purple" }, irrelevant: { label: "Not relevant", tone: "slate" },
 };
-const KIND_LABEL: Record<Proposal["kind"], string> = { booking: "Bookings", itinerary: "Itinerary & schedule", resource: "Resources", checklist: "Checklist" };
+const KIND_LABEL: Record<Proposal["kind"], string> = { booking: "Bookings", itinerary: "Itinerary & schedule", insurance: "Insurance", resource: "Resources", checklist: "Checklist" };
 
 function detail(p: Proposal): string {
   const d = p.data;
   if (p.kind === "booking") return [d.traveler && `for ${d.traveler}`, d.provider, d.confirmationNo && `ref ${d.confirmationNo}`, d.startAt && shortDate(d.startAt) + (d.endAt && d.endAt.slice(0, 10) !== d.startAt.slice(0, 10) ? ` → ${shortDate(d.endAt)}` : ""), d.cost != null && money(d.cost, d.currency), d.location].filter(Boolean).join(" · ");
   if (p.kind === "itinerary") return [d.startAt ? shortDate(d.startAt) : d.day ? `Day ${d.day}` : null, d.time, d.location, d.cost != null && money(d.cost, d.currency)].filter(Boolean).join(" · ");
   if (p.kind === "resource") return [d.category, d.url].filter(Boolean).join(" · ");
+  if (p.kind === "insurance") return [d.policyNumber && `policy ${d.policyNumber}`, d.coverageStart && `covered ${shortDate(d.coverageStart)}${d.coverageEnd ? ` → ${shortDate(d.coverageEnd)}` : ""}`, d.travelers?.length && d.travelers.join(", ")].filter(Boolean).join(" · ");
   return [d.category, d.dueDate && `due ${shortDate(d.dueDate)}`].filter(Boolean).join(" · ");
 }
-const title = (p: Proposal) => p.data.title ?? p.data.text;
+const title = (p: Proposal) => p.data.title ?? p.data.text ?? [p.data.provider, p.data.planName].filter(Boolean).join(" · ");
 
 /** One place to bring anything into a trip: files, screenshots, pasted text and emails, web addresses. */
 export default function ImportCard({ tripId, onClose, reload, initialResults, onApplied }: { tripId: string; onClose: () => void; reload: () => void; initialResults?: Result[]; onApplied?: () => void }) {
@@ -185,7 +186,7 @@ export default function ImportCard({ tripId, onClose, reload, initialResults, on
           {results && (
             <div className="space-y-4">
               {results.map((r, ri) => {
-                const groups = (["booking", "itinerary", "resource", "checklist"] as const).map((k) => ({ k, items: r.proposals.map((p, pi) => ({ p, pi })).filter((x) => x.p.kind === k) })).filter((g) => g.items.length);
+                const groups = (["booking", "itinerary", "insurance", "resource", "checklist"] as const).map((k) => ({ k, items: r.proposals.map((p, pi) => ({ p, pi })).filter((x) => x.p.kind === k) })).filter((g) => g.items.length);
                 return (
                   <div key={ri} className="rounded-md border border-slate-200 dark:border-slate-800">
                     <div className="flex flex-wrap items-center gap-2 border-b border-slate-100 dark:border-slate-800 px-3 py-2">
