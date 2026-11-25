@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from "react";
 import { lazyWithReload, LazyBoundary } from "../lib/lazyReload";
 import ResourceThumb from "../components/ResourceThumb";
-import { useNavigate, useParams } from "react-router-dom";
+import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { api } from "../lib/api";
 import { BookingAgent, BookingStatus, BudgetLine, Conflict, RoadmapData, RoadmapDest, Trip, TripItem, TripItemType } from "../types";
 import { Badge, BadgeSelect, Button, Card, Input, Label, PageHeader, Select, Textarea } from "../components/ui";
@@ -113,7 +113,11 @@ export default function TripDetail() {
   const [trip, setTrip] = useState<Trip | null>(null);
   const [conflicts, setConflicts] = useState<Conflict[]>([]);
   const [agents, setAgents] = useState<BookingAgent[]>([]);
-  const [tab, setTab] = useState<Tab>("Overview");
+  const [params] = useSearchParams();
+  const tabParam = params.get("tab") as Tab | null;
+  const [tab, setTab] = useState<Tab>(tabParam && TABS.includes(tabParam) ? tabParam : "Overview");
+  // search results link to a tab (?tab=Bookings); follow it when it changes on the same trip page
+  useEffect(() => { if (tabParam && TABS.includes(tabParam)) setTab(tabParam); }, [tabParam, id]);
   const [showItemForm, setShowItemForm] = useState(false);
   const [roadmap, setRoadmap] = useState<RoadmapData | null>(null);
   const [importOpen, setImportOpen] = useState(false);

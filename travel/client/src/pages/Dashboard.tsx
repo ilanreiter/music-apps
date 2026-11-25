@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Link, useNavigate } from "react-router-dom";
+import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import {
   DndContext, DragEndEvent, DragOverlay, DragStartEvent, KeyboardSensor, PointerSensor,
   closestCorners, pointerWithin, CollisionDetection, useDraggable, useDroppable, useSensor, useSensors,
@@ -306,6 +306,10 @@ export default function Dashboard() {
   const [error, setError] = useState("");
   const [dragId, setDragId] = useState<string | null>(null);
   const [selected, setSelected] = useState<string | null>(null);
+  const [params] = useSearchParams();
+  const destParam = params.get("dest");
+  // search results open a destination's details (/?dest=<id>)
+  useEffect(() => { if (destParam) setSelected(destParam); }, [destParam]);
   const [showRules, setShowRules] = useState(false);
   const [adding, setAdding] = useState(false);
   const [newName, setNewName] = useState("");
