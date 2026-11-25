@@ -146,6 +146,7 @@ model Trip {
 }
 
 model TripItem {
+  sourceInboxId String? // the Import card (email, upload, pasted text, web page) this came from
   id              String        @id @default(cuid())
   tripId          String
   trip            Trip          @relation(fields: [tripId], references: [id], onDelete: Cascade)
@@ -214,6 +215,7 @@ model BookingAgent {
 }
 
 model Resource {
+  sourceInboxId String? // the Import card (email, upload, pasted text, web page) this came from
   id            String       @id @default(cuid())
   title         String
   url           String?
@@ -299,6 +301,7 @@ model RoadmapSettings {
 
 // A pre-trip to-do (visa, insurance, packing, ...) in a trip's checklist.
 model ChecklistItem {
+  sourceInboxId String? // the Import card (email, upload, pasted text, web page) this came from
   id        String    @id @default(cuid())
   tripId    String
   trip      Trip      @relation(fields: [tripId], references: [id], onDelete: Cascade)
@@ -361,6 +364,8 @@ model TripDocument {
   inboxItemId String?
   name        String
   relPath     String   // relative to DOCS_ROOT
+  role        String   @default("attachment") // source = the imported thing itself (email, upload, text, page) | attachment
+  sourceUrl   String?  // for saved web pages
   size        Int
   mime        String
   createdAt   DateTime @default(now())
@@ -371,6 +376,7 @@ model TripDocument {
 
 // A travel-insurance policy covering a trip (from an imported policy document or entered by hand).
 model InsurancePolicy {
+  sourceInboxId String? // the Import card (email, upload, pasted text, web page) this came from
   id             String    @id @default(cuid())
   tripId         String
   trip           Trip      @relation(fields: [tripId], references: [id], onDelete: Cascade)

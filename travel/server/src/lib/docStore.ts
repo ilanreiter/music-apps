@@ -52,14 +52,14 @@ async function uniquePath(dir: string, name: string) {
 }
 
 /** Saves an incoming original into the Wander Inbox folder. Returns null (and keeps nothing) when no folder is set up. */
-export async function saveIncoming(buf: Buffer, name: string, mime: string, inboxItemId: string) {
+export async function saveIncoming(buf: Buffer, name: string, mime: string, inboxItemId: string, opts: { role?: "source" | "attachment"; sourceUrl?: string | null } = {}) {
   const { folder } = await docsSettings();
   if (!folder || !(await rootAvailable())) return null;
   const dir = path.join(resolveRel(folder), INBOX_DIR);
   await fs.mkdir(dir, { recursive: true });
   const dest = await uniquePath(dir, cleanName(name));
   await fs.writeFile(dest, buf);
-  return prisma.tripDocument.create({ data: { inboxItemId, name: path.basename(dest), relPath: toRel(dest), size: buf.length, mime: mime || "application/octet-stream" } });
+  return prisma.tripDocument.create({ data: { inboxItemId, name: path.basename(dest), relPath: toRel(dest), size: buf.length, mime: mime || "application/octet-stream", role: opts.role ?? "attachment", sourceUrl: opts.sourceUrl ?? null } });
 }
 
 export function tripFolderName(trip: { title: string; startDate: Date | null; destination?: { name: string } | null }, naming: "month" | "title") {
@@ -94,4 +94,9 @@ export async function fileDocumentsToTrip(inboxItemId: string, tripId: string) {
     } catch (e: any) { console.error("docs: could not file", d.name, String(e?.message ?? e).slice(0, 120)); }
   }
   return moved;
+}
+
+/** File name for a saved source: the subject / first line, made safe, with the right extension. */
+export function sourceFileName(label: string, ext: string) {
+  return `${cleanName(label).slice(0, 90)}.${ext}`;
 }

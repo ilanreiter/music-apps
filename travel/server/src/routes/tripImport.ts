@@ -41,12 +41,13 @@ router.post("/apply", async (req, res) => {
     proposals: z.array(proposalSchema).max(500),
     sources: z.array(z.object({ hash: z.string().min(8), name: z.string(), category: z.string(), summary: z.string().nullable() })).max(12),
     travelers: z.array(z.string()).max(40).default([]),
+    sourceInboxId: z.string().max(60).nullable().optional(),
   }).safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
   const trip = await prisma.trip.findUnique({ where: { id: tripId(req) } });
   if (!trip) return res.status(404).json({ error: "Trip not found" });
   try {
-    res.json(await applyProposals(trip.id, parsed.data.proposals, parsed.data.sources, parsed.data.travelers));
+    res.json(await applyProposals(trip.id, parsed.data.proposals, parsed.data.sources, parsed.data.travelers, parsed.data.sourceInboxId ?? null));
   } catch (e: any) {
     console.error("import apply failed:", String(e?.message ?? e).slice(0, 300));
     res.status(500).json({ error: "Could not save the import. Nothing was lost; try again." });

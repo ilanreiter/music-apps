@@ -306,7 +306,7 @@ async function reconcileStayEdges(tripId: string) {
   }
 }
 
-export async function applyProposals(tripId: string, proposals: Proposal[], sources: { hash: string; name: string; category: string; summary: string | null }[], travelers: string[]): Promise<ApplyResult> {
+export async function applyProposals(tripId: string, proposals: Proposal[], sources: { hash: string; name: string; category: string; summary: string | null }[], travelers: string[], sourceInboxId: string | null = null): Promise<ApplyResult> {
   const res: ApplyResult = { created: 0, updated: 0, skipped: 0, travelers: [], datesSet: false };
   // dates first, so day-numbered items land on the real calendar
   const dated = proposals.filter((p) => (p.kind === "booking" || p.kind === "itinerary") && p.data.startAt) as Extract<Proposal, { kind: "booking" | "itinerary" }>[];
@@ -320,10 +320,10 @@ export async function applyProposals(tripId: string, proposals: Proposal[], sour
       const e = matchBooking(trip.items, p.data);
       if (e) {
         const patch = bookingPatch(e, p.data);
-        if (Object.keys(patch).length) { await prisma.tripItem.update({ where: { id: e.id }, data: patch as any }); res.updated++; } else res.skipped++;
+        if (Object.keys(patch).length) { await prisma.tripItem.update({ where: { id: e.id }, data: { ...patch, ...(!e.sourceInboxId && sourceInboxId ? { sourceInboxId } : {}) } as any }); res.updated++; } else res.skipped++;
       } else {
         await prisma.tripItem.create({ data: {
-          tripId, type: p.data.type, title: p.data.title, provider: p.data.provider, confirmationNo: p.data.confirmationNo, traveler: p.data.traveler,
+          tripId, sourceInboxId, type: p.data.type, title: p.data.title, provider: p.data.provider, confirmationNo: p.data.confirmationNo, traveler: p.data.traveler,
           startAt: p.data.startAt ? new Date(p.data.startAt) : undefined, endAt: p.data.endAt ? new Date(p.data.endAt) : undefined, location: p.data.location,
           cost: p.data.cost, currency: p.data.currency ?? undefined, freeCancelUntil: p.data.freeCancelUntil ? new Date(p.data.freeCancelUntil) : undefined,
           bookingUrl: p.data.bookingUrl, notes: p.data.notes, bookingStatus: p.data.bookingStatus, sortOrder: order++,
@@ -341,23 +341,23 @@ export async function applyProposals(tripId: string, proposals: Proposal[], sour
         if (p.data.durationHours) endAt = new Date(startAt.getTime() + p.data.durationHours * 3600_000);
       }
       await prisma.tripItem.create({ data: {
-        tripId, type: p.data.type, title: p.data.title, location: p.data.location, startAt, endAt, notes: p.data.notes, cost: p.data.cost,
+        tripId, sourceInboxId, type: p.data.type, title: p.data.title, location: p.data.location, startAt, endAt, notes: p.data.notes, cost: p.data.cost,
         currency: p.data.currency ?? undefined, traveler: p.data.traveler, bookingStatus: "IDEA", sortOrder: order++,
       } });
       res.created++;
     } else if (p.kind === "resource") {
       if (trip.resources.some((r) => (p.data.url && r.url === p.data.url) || norm(r.title) === norm(p.data.title))) { res.skipped++; continue; }
       const imageUrl = p.data.url ? (await pageImage(p.data.url)) ?? "" : undefined;
-      await prisma.resource.create({ data: { tripId, imageUrl, title: p.data.title, url: p.data.url, category: p.data.category, notes: p.data.notes, destinationId: trip.destinationId } });
+      await prisma.resource.create({ data: { tripId, sourceInboxId, imageUrl, title: p.data.title, url: p.data.url, category: p.data.category, notes: p.data.notes, destinationId: trip.destinationId } });
       res.created++;
     } else if (p.kind === "insurance") {
       if (sameInsurance(trip.insurance, p.data)) { res.skipped++; continue; }
       const d = p.data;
-      await prisma.insurancePolicy.create({ data: { tripId, provider: d.provider, planName: d.planName, policyNumber: d.policyNumber, coverageStart: d.coverageStart ? new Date(d.coverageStart) : null, coverageEnd: d.coverageEnd ? new Date(d.coverageEnd) : null, travelers: d.travelers, emergencyPhone: d.emergencyPhone, claimsContact: d.claimsContact, url: d.url, notes: d.notes } });
+      await prisma.insurancePolicy.create({ data: { tripId, sourceInboxId, provider: d.provider, planName: d.planName, policyNumber: d.policyNumber, coverageStart: d.coverageStart ? new Date(d.coverageStart) : null, coverageEnd: d.coverageEnd ? new Date(d.coverageEnd) : null, travelers: d.travelers, emergencyPhone: d.emergencyPhone, claimsContact: d.claimsContact, url: d.url, notes: d.notes } });
       res.created++;
     } else if (p.kind === "checklist") {
       if (trip.checklist.some((c) => norm(c.text) === norm(p.data.text))) { res.skipped++; continue; }
-      await prisma.checklistItem.create({ data: { tripId, text: p.data.text, category: p.data.category, dueDate: p.data.dueDate ? new Date(p.data.dueDate) : undefined, sortOrder: trip.checklist.length } });
+      await prisma.checklistItem.create({ data: { tripId, sourceInboxId, text: p.data.text, category: p.data.category, dueDate: p.data.dueDate ? new Date(p.data.dueDate) : undefined, sortOrder: trip.checklist.length } });
       res.created++;
     }
   }

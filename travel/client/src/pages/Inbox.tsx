@@ -348,7 +348,7 @@ export default function Inbox() {
       )}
       <DocViewer doc={viewing} onClose={() => setViewing(null)} />
       {review && (
-        <ImportCard tripId={review.tripId} initialResults={review.results} reload={() => {}} onClose={() => { setReview(null); load(); }}
+        <ImportCard tripId={review.tripId} sourceInboxId={review.id} initialResults={review.results} reload={() => {}} onClose={() => { setReview(null); load(); }}
           onApplied={() => { api.post(`/inbox/${review.id}/filed`, { tripId: review.tripId }).catch(() => {}); }} />
       )}
     </div>

@@ -42,6 +42,7 @@ export interface BookingAgent {
 
 export interface TripItem {
   id: string;
+  sourceInboxId?: string | null;
   tripId: string;
   type: TripItemType;
   title: string;
@@ -71,6 +72,7 @@ export interface TripItem {
 }
 
 export interface ChecklistItem {
+  sourceInboxId?: string | null;
   id: string;
   tripId: string;
   text: string;

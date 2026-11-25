@@ -1,4 +1,5 @@
 import { useState } from "react";
+import SourceLink from "../SourceLink";
 import { Loader2, Plus, Sparkles, Trash2 } from "lucide-react";
 import { api } from "../../lib/api";
 import { ChecklistItem, Trip } from "../../types";
@@ -74,7 +75,7 @@ export default function ChecklistTab({ trip, reload }: { trip: Trip; reload: () 
               return (
                 <li key={i.id} className="flex items-center gap-3 py-2 text-sm">
                   <input type="checkbox" checked={i.done} onChange={(e) => patch(i, { done: e.target.checked })} className="h-4 w-4 accent-brand-600" aria-label={`Done: ${i.text}`} />
-                  <span className={`flex-1 ${i.done ? "line-through text-slate-400" : ""}`}>{i.text}</span>
+                  <span className={`flex-1 ${i.done ? "line-through text-slate-400" : ""}`}>{i.text} <SourceLink inboxId={i.sourceInboxId} className="ml-1" /></span>
                   <input type="date" value={isoToDate(i.dueDate)} onChange={(e) => patch(i, { dueDate: dateToIso(e.target.value) })} aria-label="Due date"
                     className={`rounded border px-1.5 py-0.5 text-xs bg-white dark:bg-slate-900 ${overdue ? "border-red-400 text-red-600" : "border-slate-200 dark:border-slate-700 text-slate-500"}`} />
                   <button type="button" onClick={() => remove(i)} aria-label={`Delete ${i.text}`} className="text-slate-400 hover:text-red-600"><Trash2 className="h-4 w-4" /></button>

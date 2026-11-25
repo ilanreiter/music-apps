@@ -3,11 +3,12 @@ import { Link } from "react-router-dom";
 import { FileText, Pencil, Phone, Plus, ShieldCheck, Trash2 } from "lucide-react";
 import { api } from "../../lib/api";
 import DocViewer, { ViewDoc } from "../DocViewer";
+import SourceLink from "../SourceLink";
 import { Button, Card, Input, Label, Textarea } from "../ui";
 
 interface Policy {
   id: string; provider: string; planName: string | null; policyNumber: string | null; coverageStart: string | null; coverageEnd: string | null;
-  travelers: string[]; emergencyPhone: string | null; claimsContact: string | null; url: string | null; notes: string | null;
+  travelers: string[]; emergencyPhone: string | null; claimsContact: string | null; url: string | null; notes: string | null; sourceInboxId?: string | null;
 }
 interface Doc { id: string; name: string; mime: string }
 type Form = { provider: string; planName: string; policyNumber: string; coverageStart: string; coverageEnd: string; travelers: string; emergencyPhone: string; claimsContact: string; url: string; notes: string };
@@ -83,7 +84,7 @@ export default function InsuranceTab({ tripId }: { tripId: string }) {
           <div className="flex flex-wrap items-start gap-3">
             <ShieldCheck className="mt-0.5 h-5 w-5 shrink-0 text-emerald-600" />
             <div className="min-w-0 flex-1">
-              <div className="font-semibold">{p.provider}{p.planName && <span className="font-normal text-slate-500"> · {p.planName}</span>}</div>
+              <div className="font-semibold">{p.provider}{p.planName && <span className="font-normal text-slate-500"> · {p.planName}</span>} <SourceLink inboxId={p.sourceInboxId} className="ml-1 align-middle font-normal" /></div>
               <div className="text-xs text-slate-500">{[p.policyNumber && `Policy ${p.policyNumber}`, (p.coverageStart || p.coverageEnd) && `Covered ${day(p.coverageStart) ?? "?"} – ${day(p.coverageEnd) ?? "?"}`, p.travelers.length && p.travelers.join(", ")].filter(Boolean).join(" · ")}</div>
             </div>
             <button type="button" onClick={() => startEdit(p)} className="text-slate-400 hover:text-brand-600" aria-label="Edit policy"><Pencil className="h-4 w-4" /></button>

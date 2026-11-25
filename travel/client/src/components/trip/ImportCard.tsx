@@ -28,7 +28,7 @@ function detail(p: Proposal): string {
 const title = (p: Proposal) => p.data.title ?? p.data.text ?? [p.data.provider, p.data.planName].filter(Boolean).join(" · ");
 
 /** One place to bring anything into a trip: files, screenshots, pasted text and emails, web addresses. */
-export default function ImportCard({ tripId, onClose, reload, initialResults, onApplied }: { tripId: string; onClose: () => void; reload: () => void; initialResults?: Result[]; onApplied?: () => void }) {
+export default function ImportCard({ tripId, onClose, reload, initialResults, onApplied, sourceInboxId }: { tripId: string; onClose: () => void; reload: () => void; initialResults?: Result[]; onApplied?: () => void; sourceInboxId?: string }) {
   const [sources, setSources] = useState<Source[]>([]);
   const [text, setText] = useState("");
   const [url, setUrl] = useState("");
@@ -87,7 +87,7 @@ export default function ImportCard({ tripId, onClose, reload, initialResults, on
         const remember = !r.error && !r.alreadyImported && r.hash && (mine.length > 0 || r.category === "irrelevant" || r.proposals.every((p) => p.action === "duplicate"));
         if (remember) { chosen.push(...mine); srcs.push({ hash: r.hash, name: r.name, category: r.category, summary: r.summary || null }); r.travelers.forEach((t) => names.add(t)); }
       });
-      const a = await api.post<Applied>(`/trips/${tripId}/import/apply`, { proposals: chosen.map(({ kind, data, action }) => ({ kind, data, action })), sources: srcs, travelers: [...names] });
+      const a = await api.post<Applied>(`/trips/${tripId}/import/apply`, { proposals: chosen.map(({ kind, data, action }) => ({ kind, data, action })), sources: srcs, travelers: [...names], sourceInboxId: sourceInboxId ?? null });
       setApplied(a); setResults(null); setSources([]); reload(); onApplied?.();
     } catch (e: any) { setError(e.message); }
     setBusy("");

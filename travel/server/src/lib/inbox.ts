@@ -6,7 +6,7 @@ import { prisma } from "../db";
 import { bytesToText, htmlToText } from "./sourceText";
 import { askJson } from "./tripPlanningAi";
 import { analyzeSource, annotate } from "./tripImport";
-import { saveIncoming } from "./docStore";
+import { saveIncoming, sourceFileName } from "./docStore";
 
 const env = process.env;
 export const inboxConfigured = () => !!(env.IMAP_USER && env.IMAP_PASSWORD);
@@ -122,7 +122,12 @@ export async function pollInbox(): Promise<{ added: number; skipped: number }> {
         const earlier = (await prisma.inboxItem.findMany({ where: { fromAddr: from, createdAt: { gte: new Date(Date.now() - 30 * 86400_000) } }, select: { id: true, subject: true } }))
           .find((x) => x.subject.replace(/^((fwd?|re)\s*:\s*)+/i, "").trim().toLowerCase() === baseSubject);
         const created = await prisma.inboxItem.create({ data: { status: filterReason ? "FILTERED" : "PENDING", filterReason, dupOfId: earlier?.id ?? null, messageId, fromAddr: from, subject, receivedAt: mail.date ?? new Date(), bodyText: body.slice(0, 400_000), bodyHtml: typeof mail.html === "string" && mail.html.length < 1_500_000 ? mail.html : null, attachments: attachments as any, suggestedTripId: sg.tripId, suggestionNote: sg.note, newTripHint: (sg.newTrip ?? undefined) as any } });
-        if (!filterReason) { added++; for (const f of keep) await saveIncoming(f.buf, f.name, f.mime, created.id).catch((e) => console.error("inbox: could not keep", f.name, String(e?.message ?? e).slice(0, 120))); }
+        if (!filterReason) {
+          added++;
+          // the email itself (as the original .eml) and its attachments
+          await saveIncoming(msg.source, sourceFileName(subject, "eml"), "message/rfc822", created.id, { role: "source" }).catch((e) => console.error("inbox: could not keep the email", String(e?.message ?? e).slice(0, 120)));
+          for (const f of keep) await saveIncoming(f.buf, f.name, f.mime, created.id).catch((e) => console.error("inbox: could not keep", f.name, String(e?.message ?? e).slice(0, 120)));
+        }
         if (!filterReason && sg.tripId) await parseInboxItem(created.id, sg.tripId).catch((e) => console.error("inbox: parse failed:", String(e?.message ?? e).slice(0, 120)));
       }
     } finally { lock.release(); }

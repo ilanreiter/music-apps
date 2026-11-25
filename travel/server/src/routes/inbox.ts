@@ -6,7 +6,7 @@ import { annotate } from "../lib/tripImport";
 import express from "express";
 import { simpleParser } from "mailparser";
 import { bytesToText, htmlToText, urlToText } from "../lib/sourceText";
-import { fileDocumentsToTrip, saveIncoming } from "../lib/docStore";
+import { fileDocumentsToTrip, saveIncoming, sourceFileName } from "../lib/docStore";
 import { inboxConfigured, originalSender, parseInboxItem, pollInbox, suggestTrip } from "../lib/inbox";
 
 const router = Router();
@@ -72,14 +72,26 @@ router.post("/:id/block-sender", async (req, res) => {
   res.json({ addr, moved: swept.count });
 });
 
-async function createUploadCard(name: string, text: string, tripId?: string, original?: { buf: Buffer; mime: string }) {
+/** A copy of a web page as it was when imported (its HTML), saved next to the trip's other documents. */
+export async function pageSnapshot(url: string, title: string) {
+  try {
+    const r = await fetch(url, { signal: AbortSignal.timeout(15_000), headers: { "User-Agent": "Mozilla/5.0 (compatible; WanderTripPlanner/1.0)" } });
+    if (!r.ok || !/html/i.test(r.headers.get("content-type") ?? "")) return undefined;
+    const html = (await r.text()).slice(0, 5_000_000);
+    const base = `<base href="${url.replace(/"/g, "&quot;")}">`;
+    const page = /<head[^>]*>/i.test(html) ? html.replace(/<head[^>]*>/i, (m) => m + base) : base + html;
+    return { buf: Buffer.from(page, "utf8"), mime: "text/html; charset=utf-8", fileName: sourceFileName(title, "html"), sourceUrl: url };
+  } catch { return undefined; }
+}
+
+async function createUploadCard(name: string, text: string, tripId?: string, original?: { buf: Buffer; mime: string; fileName?: string; sourceUrl?: string | null }) {
   const chosen = tripId ? await prisma.trip.findUnique({ where: { id: tripId } }) : null;
   const sg = chosen ? { tripId: chosen.id, note: "Imported from this trip's page", newTrip: null } : await suggestTrip(name, text);
   const item = await prisma.inboxItem.create({ data: {
     source: "upload", messageId: `upload-${crypto.randomUUID()}`, fromAddr: "", subject: name.slice(0, 300), receivedAt: new Date(), bodyText: text.slice(0, 400_000), attachments: [],
     suggestedTripId: sg.tripId, suggestionNote: sg.note, newTripHint: (sg.newTrip ?? undefined) as any,
   } });
-  if (original) await saveIncoming(original.buf, name, original.mime, item.id).catch((e) => console.error("import: could not keep", name, String(e?.message ?? e).slice(0, 120)));
+  if (original) await saveIncoming(original.buf, original.fileName ?? name, original.mime, item.id, { role: "source", sourceUrl: original.sourceUrl ?? null }).catch((e) => console.error("import: could not keep", name, String(e?.message ?? e).slice(0, 120)));
   if (sg.tripId) await parseInboxItem(item.id, sg.tripId).catch((e) => console.error("import: parse failed:", String(e?.message ?? e).slice(0, 120)));
   return item;
 }
@@ -109,10 +121,16 @@ router.post("/upload", async (req, res) => {
   if (!p.success) return res.status(400).json({ error: p.error.flatten() });
   try {
     let text = p.data.text ?? "", name = p.data.name;
-    if (p.data.kind === "url") { const u = /^https?:\/\//i.test(p.data.url ?? "") ? p.data.url! : `https://${p.data.url}`; const r = await urlToText(u); text = `${u}\n\n${r.text}`; name = r.title || u; }
+    let original: { buf: Buffer; mime: string; fileName: string; sourceUrl?: string | null } | undefined;
+    if (p.data.kind === "url") {
+      const u = /^https?:\/\//i.test(p.data.url ?? "") ? p.data.url! : `https://${p.data.url}`;
+      const r = await urlToText(u); text = `${u}\n\n${r.text}`; name = r.title || u;
+      original = await pageSnapshot(u, name);
+    }
     if (text.trim().length < 15) return res.status(422).json({ error: `${name}: there is no readable text in it.` });
     if (p.data.kind === "text" && name === "Pasted text") name = `Pasted: ${text.trim().split(/\n/)[0].slice(0, 70)}${text.trim().split(/\n/)[0].length > 70 ? "…" : ""}`;
-    res.json({ id: (await createUploadCard(name, text, p.data.tripId)).id });
+    if (p.data.kind === "text") original = { buf: Buffer.from(text, "utf8"), mime: "text/plain; charset=utf-8", fileName: sourceFileName(name, "txt") };
+    res.json({ id: (await createUploadCard(name, text, p.data.tripId, original)).id });
   } catch (e: any) { res.status(500).json({ error: `${p.data.name}: ${String(e?.message ?? "could not be read").slice(0, 200)}` }); }
 });
 

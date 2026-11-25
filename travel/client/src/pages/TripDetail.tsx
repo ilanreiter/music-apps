@@ -14,6 +14,7 @@ import PlacesImport from "../components/trip/PlacesImport";
 import ImportCard from "../components/trip/ImportCard";
 import DocumentsTab from "../components/trip/DocumentsTab";
 import InsuranceTab from "../components/trip/InsuranceTab";
+import SourceLink from "../components/SourceLink";
 import { WorldMapDefs } from "../components/WorldMap";
 import { Card_, GroupCard } from "./Dashboard";
 import { AlertTriangleIcon } from "../components/icons";
@@ -628,7 +629,7 @@ function ItineraryItemRow({
           <Badge tone={CATEGORY_TONE[budgetCategoryForItem(item)]}>{categoryLabel(budgetCategoryForItem(item))}</Badge>
         </div>
         <div className="min-w-0">
-          <div className="font-medium">{item.title}</div>
+          <div className="font-medium">{item.title} <SourceLink inboxId={item.sourceInboxId} className="ml-1 align-middle" /></div>
           <div className="text-xs text-slate-500">
             {item.traveler && `for ${item.traveler} · `}
             {item.provider && `${item.provider} · `}

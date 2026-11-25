@@ -1,4 +1,5 @@
 import { useNavigate } from "react-router-dom";
+import SourceLink from "../SourceLink";
 import { useEffect, useState } from "react";
 import { FileText, Loader2, Mail, Plus, Trash2 } from "lucide-react";
 import { api } from "../../lib/api";
@@ -129,7 +130,7 @@ export default function BookingsTab({ trip, agents, reload, openPanel, onPanelOp
                 return (
                   <tr key={i.id} className={i.bookingStatus === "CANCELLED" ? "opacity-50" : ""}>
                     <td className="p-3 align-top">
-                      <div className="font-medium">{i.title}</div>
+                      <div className="font-medium">{i.title} <SourceLink inboxId={i.sourceInboxId} className="ml-1 align-middle" /></div>
                       <div className="text-xs text-slate-500">{[i.type[0] + i.type.slice(1).toLowerCase(), i.provider, i.bookingAgent?.name, i.location].filter(Boolean).join(" · ")}</div>
                       <div className="mt-0.5 flex items-center gap-1 text-xs text-slate-500">for
                         <RefInput value={i.traveler ?? ""} onSave={(v) => patch(i, { traveler: v || null })} placeholder="Add traveler name" label="Traveler" list="trip-travelers" wide />
