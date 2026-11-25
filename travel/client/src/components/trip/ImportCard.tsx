@@ -7,7 +7,7 @@ import { money, readDocumentText, shortDate } from "./shared";
 type Category = "booking" | "itinerary" | "schedule" | "general" | "irrelevant";
 type Action = "new" | "update" | "duplicate";
 interface Proposal { kind: "booking" | "itinerary" | "resource" | "checklist"; action: Action; matchTitle?: string; data: any }
-interface Result { name: string; hash: string; category: Category; reason: string; summary: string; travelers: string[]; alreadyImported: boolean; proposals: Proposal[]; error?: string }
+interface Result { name: string; hash: string; category: Category; reason: string; summary: string; travelers: string[]; alreadyImported: boolean; proposals: Proposal[]; error?: string; mismatch?: { place: string | null; reason: string; otherTrip: { id: string; title: string } | null } | null }
 interface Source { id: number; name: string; kind: "text" | "url"; text?: string; url?: string; note?: string }
 interface Applied { created: number; updated: number; skipped: number; travelers: string[]; datesSet: boolean }
 
@@ -38,7 +38,7 @@ export default function ImportCard({ tripId, onClose, reload, initialResults, on
   const [error, setError] = useState("");
   const [results, setResults] = useState<Result[] | null>(initialResults ?? null);
   // opened from the Inbox with the email already read: duplicates start unticked, same as after a fresh read
-  const [pick, setPick] = useState<Set<string>>(() => new Set((initialResults ?? []).flatMap((r, ri) => r.proposals.map((p, pi) => (p.action === "duplicate" ? null : `${ri}:${pi}`)).filter(Boolean) as string[])));
+  const [pick, setPick] = useState<Set<string>>(() => new Set((initialResults ?? []).flatMap((r, ri) => r.proposals.map((p, pi) => (p.action === "duplicate" || r.mismatch ? null : `${ri}:${pi}`)).filter(Boolean) as string[])));
   const [applied, setApplied] = useState<Applied | null>(null);
   const idRef = useRef(1);
   const fileRef = useRef<HTMLInputElement>(null);
@@ -71,7 +71,7 @@ export default function ImportCard({ tripId, onClose, reload, initialResults, on
       } catch (e: any) { out.push({ name: s.name, hash: "", category: "irrelevant", reason: "", summary: "", travelers: [], alreadyImported: false, proposals: [], error: e.message }); }
     }
     setResults(out);
-    setPick(new Set(out.flatMap((r, ri) => r.proposals.map((p, pi) => (p.action === "duplicate" ? null : `${ri}:${pi}`)).filter(Boolean) as string[])));
+    setPick(new Set(out.flatMap((r, ri) => r.proposals.map((p, pi) => (p.action === "duplicate" || r.mismatch ? null : `${ri}:${pi}`)).filter(Boolean) as string[])));
     setBusy(""); setProgress("");
   };
 
@@ -90,6 +90,20 @@ export default function ImportCard({ tripId, onClose, reload, initialResults, on
       setApplied(a); setResults(null); setSources([]); reload(); onApplied?.();
     } catch (e: any) { setError(e.message); }
     setBusy("");
+  };
+
+  // Claude judged a document "not relevant" but the user knows it is a booking: read that one again with that hint.
+  const [rereading, setRereading] = useState<number | null>(null);
+  const rereadAsBooking = async (ri: number) => {
+    const src = sources[ri]; if (!src) return;
+    setRereading(ri); setError("");
+    try {
+      const r = await api.post<{ results: Result[] }>(`/trips/${tripId}/import/analyze`, { sources: [{ name: src.name, kind: src.kind, text: src.text, url: src.url, userSaysBooking: true }] });
+      const fresh = r.results[0];
+      setResults((l) => l && l.map((x, k) => (k === ri ? fresh : x)));
+      setPick((p) => { const n = new Set([...p].filter((k) => !k.startsWith(`${ri}:`))); fresh.proposals.forEach((q, pi) => { if (q.action !== "duplicate" && !fresh.mismatch) n.add(`${ri}:${pi}`); }); return n; });
+    } catch (e: any) { setError(e.message); }
+    setRereading(null);
   };
 
   const toggle = (k: string) => setPick((s) => { const n = new Set(s); n.has(k) ? n.delete(k) : n.add(k); return n; });
@@ -181,7 +195,18 @@ export default function ImportCard({ tripId, onClose, reload, initialResults, on
                     <div className="space-y-2 px-3 py-2 text-sm">
                       {r.error && <p className="flex items-start gap-1.5 text-xs text-red-600"><AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />{r.error}</p>}
                       {r.alreadyImported && <p className="text-xs text-amber-600">{r.reason}. Nothing to add again.</p>}
+                      {r.mismatch && !r.alreadyImported && (
+                        <div className="flex items-start gap-1.5 rounded-md border border-amber-300 bg-amber-50 p-2 text-xs text-amber-800 dark:border-amber-800 dark:bg-amber-950/30 dark:text-amber-300">
+                          <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                          <span>This looks like it's for {r.mismatch.place ?? "a different trip"}, not this trip.{r.mismatch.reason ? ` ${r.mismatch.reason}` : ""}{r.mismatch.otherTrip ? <> It may belong to <a href={`/trips/${r.mismatch.otherTrip.id}`} className="font-medium underline">{r.mismatch.otherTrip.title}</a>.</> : ""} Its items are left unticked; tick them only if they really belong here.</span>
+                        </div>
+                      )}
                       {!r.error && !r.alreadyImported && (r.summary || r.reason) && <p className="text-xs text-slate-500">{r.summary} {r.category === "irrelevant" && r.reason ? r.reason : ""}</p>}
+                      {!r.error && !r.alreadyImported && r.category === "irrelevant" && sources[ri] && (
+                        <button type="button" onClick={() => rereadAsBooking(ri)} disabled={rereading !== null} className="inline-flex items-center gap-1 text-xs font-medium text-brand-600 hover:underline disabled:text-slate-400">
+                          {rereading === ri && <Loader2 className="h-3 w-3 animate-spin" />}This is a booking for this trip: read it again
+                        </button>
+                      )}
                       {r.travelers.length > 0 && !r.alreadyImported && <p className="text-xs text-slate-500">Travelers found: {r.travelers.join(", ")}</p>}
                       {groups.map((g) => (
                         <div key={g.k}>

@@ -1,4 +1,5 @@
 import React from "react";
+import { lazyWithReload, LazyBoundary } from "../../lib/lazyReload";
 import { AlertTriangle, BookOpen, CalendarClock, CheckSquare, ExternalLink, MapPin, Plane, Wallet } from "lucide-react";
 import type { MapPoint } from "../RouteMap";
 import ResourceThumb from "../ResourceThumb";
@@ -6,7 +7,7 @@ import { Trip } from "../../types";
 import { Badge, Card } from "../ui";
 import { daysFromNow, isBookable, isBooked, money, shortDate } from "./shared";
 
-const RouteMap = React.lazy(() => import("../RouteMap"));
+const RouteMap = lazyWithReload(() => import("../RouteMap"));
 
 export type PlanTab = "Overview" | "Itinerary" | "Schedule" | "Bookings" | "Checklist" | "Route" | "Budget" | "Resources";
 
@@ -105,9 +106,9 @@ export default function OverviewTab({ trip, goTo, onImportBookings, mapPoints = 
           {mapPoints.length === 0 ? (
             <p className="text-sm text-slate-500">No places with map locations yet. Add stays and activities, then fill in map locations on the Route tab.</p>
           ) : (
-            <React.Suspense fallback={<div className="flex h-[260px] items-center justify-center text-sm text-slate-400">Loading map…</div>}>
+            <LazyBoundary label="The map couldn’t load."><React.Suspense fallback={<div className="flex h-[260px] items-center justify-center text-sm text-slate-400">Loading map…</div>}>
               <RouteMap points={mapPoints} height={260} />
-            </React.Suspense>
+            </React.Suspense></LazyBoundary>
           )}
         </Card>
 

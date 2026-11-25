@@ -6,7 +6,7 @@ import ImportCard from "../components/trip/ImportCard";
 import { Badge, Button, Card, PageHeader, Select } from "../components/ui";
 
 interface Item { id: string; fromAddr: string; subject: string; receivedAt: string; preview: string; attachmentNames: string[]; suggestedTripId: string | null; suggestionNote: string | null; parsed: Parsed | null; duplicateOf: string | null; legacyParse?: boolean }
-interface PSource { name: string; category: string; summary: string; reason: string; travelers: string[]; alreadyImported: boolean; error?: string; proposals: { kind: string; action: string; title: string; when: string | null; matchTitle: string | null }[] }
+interface PSource { name: string; category: string; summary: string; reason: string; travelers: string[]; alreadyImported: boolean; error?: string; mismatch?: { place: string | null; otherTrip: { id: string; title: string } | null } | null; proposals: { kind: string; action: string; title: string; when: string | null; matchTitle: string | null }[] }
 interface Parsed { tripId: string; sources: PSource[] }
 const CAT: Record<string, { label: string; tone: string }> = { booking: { label: "Booking", tone: "green" }, itinerary: { label: "Itinerary", tone: "blue" }, schedule: { label: "Schedule", tone: "blue" }, general: { label: "General material", tone: "purple" }, irrelevant: { label: "Not relevant", tone: "slate" } };
 const KIND: Record<string, string> = { booking: "Booking", itinerary: "Itinerary", resource: "Resource", checklist: "To-do" };
@@ -114,6 +114,7 @@ export default function Inbox() {
                             {src.alreadyImported && <Badge tone="amber">Already imported</Badge>}
                           </div>
                           {src.error ? <p className="text-xs text-red-600">{src.error}</p> : <p className="mt-0.5 text-xs text-slate-500">{src.summary || src.reason}</p>}
+                          {src.mismatch && !src.alreadyImported && <p className="mt-0.5 text-xs font-medium text-amber-700 dark:text-amber-400">Looks like it's for {src.mismatch.place ?? "a different trip"}, not this trip{src.mismatch.otherTrip ? `. Try ${src.mismatch.otherTrip.title}` : ""}.</p>}
                           {src.proposals.length > 0 && (
                             <ul className="mt-1 space-y-0.5">
                               {src.proposals.map((p, pi) => (

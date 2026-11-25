@@ -7,7 +7,7 @@ import { analyzeSource, annotate, applyProposals, Proposal } from "../lib/tripIm
 const router = Router({ mergeParams: true });
 const tripId = (req: any) => (req.params as Record<string, string>).tripId as string;
 
-const sourceSchema = z.object({ name: z.string().max(200).default("pasted text"), kind: z.enum(["text", "url"]), text: z.string().max(400_000).optional(), url: z.string().max(2000).optional() });
+const sourceSchema = z.object({ name: z.string().max(200).default("pasted text"), kind: z.enum(["text", "url"]), text: z.string().max(400_000).optional(), url: z.string().max(2000).optional(), userSaysBooking: z.boolean().optional() });
 
 // Read every source (files arrive as text, URLs are fetched), classify it and propose what to file where. Nothing is saved yet.
 router.post("/analyze", async (req, res) => {
@@ -23,7 +23,7 @@ router.post("/analyze", async (req, res) => {
       let text = s.text ?? "", name = s.name, url: string | null = null;
       if (s.kind === "url") { const r = await urlToText(s.url ?? ""); text = r.text; name = r.title || s.url!; url = s.url!.trim(); }
       if (text.trim().length < 15) throw new Error("There is no readable text in this item.");
-      const r = await analyzeSource(trip, name, text, url, known);
+      const r = await analyzeSource(trip, name, text, url, known, !!s.userSaysBooking);
       r.proposals = await annotate(trip.id, r.proposals);
       results.push(r);
     } catch (e: any) {

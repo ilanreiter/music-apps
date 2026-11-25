@@ -101,7 +101,7 @@ router.post("/:id/results", async (req, res) => {
     for (const s of parsed.sources) {
       const seen = s.hash ? await prisma.tripImport.findUnique({ where: { tripId_hash: { tripId: p.data.tripId, hash: s.hash } } }) : null;
       const proposals = s.error || seen ? [] : await annotate(p.data.tripId, s.proposals.map((x: any) => ({ kind: x.kind, data: x.data, action: "new" })));
-      results.push({ name: s.name, hash: s.hash, category: s.category, reason: seen ? `Already imported on ${seen.createdAt.toLocaleDateString("en-US")}` : s.reason, summary: s.summary, travelers: s.travelers, alreadyImported: !!seen, proposals, error: s.error });
+      results.push({ name: s.name, hash: s.hash, category: s.category, reason: seen ? `Already imported on ${seen.createdAt.toLocaleDateString("en-US")}` : s.reason, summary: s.summary, travelers: s.travelers, alreadyImported: !!seen, mismatch: s.mismatch ?? null, proposals, error: s.error });
     }
     res.json({ results });
   } catch { res.status(500).json({ error: "Could not load this email. Try again." }); }

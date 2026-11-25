@@ -31,6 +31,8 @@ export type Proposal =
 export interface SourceResult {
   name: string; hash: string; category: Category; reason: string; summary: string; travelers: string[];
   alreadyImported: boolean; proposals: Proposal[]; error?: string;
+  /** Set when the material looks like it is for a different destination or different dates than this trip. */
+  mismatch?: { place: string | null; reason: string; otherTrip: { id: string; title: string } | null } | null;
 }
 
 const norm = (s: string | null | undefined) => (s ?? "").toLowerCase().replace(/[^a-z0-9֐-׿]+/g, " ").trim();
@@ -42,14 +44,15 @@ const STATUS_RANK: Record<string, number> = { IDEA: 0, RESEARCHING: 1, READY_TO_
 
 // ---------------------------------------------------------------- analysis
 
-export async function analyzeSource(trip: { id: string; title: string; startDate: Date | null; endDate: Date | null; destination?: { name: string } | null; travelers: string[] }, name: string, text: string, url: string | null, knownTravelers: string[]): Promise<SourceResult> {
+export async function analyzeSource(trip: { id: string; title: string; startDate: Date | null; endDate: Date | null; destination?: { name: string } | null; travelers: string[] }, name: string, text: string, url: string | null, knownTravelers: string[], userSaysBooking = false): Promise<SourceResult> {
   const hash = hashText(text);
   const base: SourceResult = { name, hash, category: "irrelevant", reason: "", summary: "", travelers: [], alreadyImported: false, proposals: [] };
   const seen = await prisma.tripImport.findUnique({ where: { tripId_hash: { tripId: trip.id, hash } } });
-  if (seen) return { ...base, category: seen.category as Category, summary: seen.summary ?? "", alreadyImported: true, reason: `Already imported on ${seen.createdAt.toLocaleDateString("en-US")}` };
+  // a document once judged "not relevant" is read again when the user says it is a booking
+  if (seen && !(userSaysBooking && seen.category === "irrelevant")) return { ...base, category: seen.category as Category, summary: seen.summary ?? "", alreadyImported: true, reason: `Already imported on ${seen.createdAt.toLocaleDateString("en-US")}` };
 
   const today = new Date().toISOString().slice(0, 10);
-  const j = await askJson(`Today is ${today}. You file material into a trip planner for the trip "${trip.title}"${trip.destination ? ` (destination: ${trip.destination.name})` : ""}${trip.startDate ? `, dates ${trip.startDate.toISOString().slice(0, 10)} to ${trip.endDate?.toISOString().slice(0, 10) ?? "?"}` : ", dates not set yet"}.
+  const prompt = `Today is ${today}. You file material into a trip planner for the trip "${trip.title}"${trip.destination ? ` (destination: ${trip.destination.name})` : ""}${trip.startDate ? `, dates ${trip.startDate.toISOString().slice(0, 10)} to ${trip.endDate?.toISOString().slice(0, 10) ?? "?"}` : ", dates not set yet"}.
 Travelers known so far (for reference only; material may name other people): ${knownTravelers.join(", ") || "none"}.
 Read the material and decide what it is, then extract EVERYTHING useful. Return ONLY strict JSON:
 {"category":"booking|itinerary|schedule|general|irrelevant","reason":"one short sentence why","summary":"one or two sentences on what this material is",
@@ -58,21 +61,40 @@ Read the material and decide what it is, then extract EVERYTHING useful. Return 
  "startAt":"YYYY-MM-DDTHH:MM or YYYY-MM-DD","endAt":"same or null","location":null,"cost":number or null,"currency":"ISO code or null","freeCancelUntil":"YYYY-MM-DD or null","bookingUrl":null,"notes":"seat, room, baggage, check-in rules, etc.","status":"BOOKED|CONFIRMED"}],
 "itinerary":[{"type":"POI|ACTIVITY|TRANSPORT|STAY|OTHER","title":"","date":"YYYY-MM-DD or null","day":day number of the trip or null,"time":"HH:MM or null","durationHours":number or null,"location":null,"notes":null,"cost":number or null,"currency":null,"traveler":null}],
 "checklist":[{"text":"a to-do the material implies, e.g. 'Check in online 24h before the flight'","category":"Documents|Health & insurance|Money|Bookings|Packing|Home & other","dueDate":"YYYY-MM-DD or null"}],
-"resource":{"title":"short title","category":"Guide|Visa & entry|Insurance|Transport|Accommodation|Food|Other","notes":"the key facts worth keeping, as short bullet lines (max about 1500 characters)"} or null}
+"resource":{"title":"short title","category":"Guide|Visa & entry|Insurance|Transport|Accommodation|Food|Other","notes":"the key facts worth keeping, as short bullet lines (max about 1500 characters)"} or null,
+"tripMatch":"yes|no|unsure","materialPlace":"the main country/region/city this material's travel is in, or null","tripMatchReason":"one short sentence"}
 Rules:
+- tripMatch = "no" only when the material is clearly about travel to a different destination than this trip (e.g. a tour of another country), or clearly about dates far outside this trip's dates. A layover city, a flight home, or a trip with no destination/dates set is not a mismatch; use "unsure" when in doubt.
 - booking = a confirmation, ticket, reservation, receipt or invoice for something already booked; fill "bookings" (one entry per flight leg, stay, car, tour, per traveler when tickets are per person).
+  An invoice, receipt or payment record from a travel agency, tour operator, airline, hotel, car-rental or booking site is a booking even when it shows only a package or service name, a reference, dates and payment lines; extract the booked service(s) from it. A payment record for travel is never irrelevant.
 - itinerary or schedule = a plan of places/activities/days; fill "itinerary" (use "date" when given, else "day").
 - general = useful reference (guide, article, visa rules, policy, packing list, map notes); fill "resource".
-- irrelevant = contains no travel information at all (e.g. a recipe or an unrelated bill); leave all lists empty. Never call material irrelevant because a name does not match the known travelers (guests and companions vary) or because it mentions another city; classify it by what it is and let the user decide.
+- irrelevant = contains no travel information at all (e.g. a recipe or a bill for something that is not travel, such as utilities or groceries); leave all lists empty. Never call material irrelevant because a name does not match the known travelers (guests and companions vary) or because it mentions another city; classify it by what it is and let the user decide.
 - A document may contain several kinds: fill every list that applies, and set category to the main one.
 - When a date has no year, use the weekday if given, otherwise the next occurrence after today. Never invent data that is not in the material.
-Material${url ? ` (from ${url})` : ""} named "${name}":
+${userSaysBooking ? "The user confirms this material is a booking, invoice or receipt for THIS trip. Do not classify it as irrelevant: use category \"booking\" and extract every booked service you can find, even from terse invoice lines.\n" : ""}Material${url ? ` (from ${url})` : ""} named "${name}":
 """
 ${text.slice(0, 28000)}
-"""`, 12000);
+"""`;
+  let j = await askJson(prompt, 12000);
+  // Readings vary from run to run; a "not relevant" verdict on a substantial document gets a second, more careful read before it is shown.
+  if (j.category === "irrelevant" && text.trim().length >= 200) {
+    try {
+      const again = await askJson(prompt + `\nA first read judged this material irrelevant. Read it again carefully: if it contains any booking, invoice, receipt, ticket, reservation, itinerary or other travel information, classify it accordingly and extract it.`, 12000);
+      if (again.category && again.category !== "irrelevant") j = again;
+    } catch { /* keep the first answer */ }
+  }
 
   const cat = (["booking", "itinerary", "schedule", "general", "irrelevant"].includes(j.category) ? j.category : "irrelevant") as Category;
   const out: SourceResult = { ...base, category: cat, reason: str(j.reason) ?? "", summary: str(j.summary) ?? "", travelers: (Array.isArray(j.travelers) ? j.travelers : []).map(str).filter(Boolean) as string[] };
+  if (j.tripMatch === "no" && cat !== "irrelevant") {
+    const place = str(j.materialPlace);
+    // name the trip this material probably belongs to: one whose destination or title mentions the material's place (or the reverse)
+    const others = await prisma.trip.findMany({ where: { id: { not: trip.id }, status: { not: "CANCELLED" } }, include: { destination: { select: { name: true } } } });
+    const n = (x: string | null | undefined) => norm(x).replace(/\btrip to\b/g, "").trim();
+    const other = place ? others.find((t) => [t.destination?.name, t.title].some((x) => { const a = n(x), b = n(place); return !!a && !!b && (a.includes(b) || b.includes(a)); })) : undefined;
+    out.mismatch = { place, reason: str(j.tripMatchReason) ?? "", otherTrip: other ? { id: other.id, title: other.title } : null };
+  }
   const props: Proposal[] = [];
   for (const b of Array.isArray(j.bookings) ? j.bookings : []) {
     if (!str(b?.title)) continue;

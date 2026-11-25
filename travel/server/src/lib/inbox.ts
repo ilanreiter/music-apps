@@ -150,7 +150,7 @@ export async function parseInboxItem(id: string, tripId: string) {
         const when = [d.startAt ? String(d.startAt).slice(0, 10) : d.day ? `Day ${d.day}` : d.dueDate ? String(d.dueDate).slice(0, 10) : null, d.location].filter(Boolean).join(" · ");
         return { kind: p.kind, action: p.action, title: d.title ?? d.text, when: when || null, matchTitle: p.matchTitle ?? null, data: p.data };
       });
-      out.push({ name: s.name, hash: r.hash, category: r.category, summary: r.summary, reason: r.reason, travelers: r.travelers, alreadyImported: r.alreadyImported, proposals });
+      out.push({ name: s.name, hash: r.hash, category: r.category, summary: r.summary, reason: r.reason, travelers: r.travelers, alreadyImported: r.alreadyImported, mismatch: r.mismatch ?? null, proposals });
     } catch (e: any) {
       out.push({ name: s.name, hash: "", category: "irrelevant", summary: "", reason: "", travelers: [], alreadyImported: false, proposals: [], error: String(e?.message ?? "Could not read this item.").slice(0, 200) });
     }

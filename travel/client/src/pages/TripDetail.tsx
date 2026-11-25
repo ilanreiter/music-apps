@@ -1,4 +1,5 @@
 import React, { useEffect, useState } from "react";
+import { lazyWithReload, LazyBoundary } from "../lib/lazyReload";
 import ResourceThumb from "../components/ResourceThumb";
 import { useNavigate, useParams } from "react-router-dom";
 import { api } from "../lib/api";
@@ -17,7 +18,7 @@ import { AlertTriangleIcon } from "../components/icons";
 import type { MapPoint } from "../components/RouteMap";
 import { colorForDay } from "../lib/dayColors";
 
-const RouteMap = React.lazy(() => import("../components/RouteMap"));
+const RouteMap = lazyWithReload(() => import("../components/RouteMap"));
 
 const TABS: PlanTab[] = ["Overview", "Itinerary", "Schedule", "Bookings", "Checklist", "Route", "Budget", "Resources"];
 type Tab = PlanTab;
@@ -330,16 +331,9 @@ function RouteTab({ trip, reload }: { trip: Trip; reload: () => void }) {
             : 'No itinerary items have coordinates yet. Use "Fill in missing map locations with AI" above, or add a latitude/longitude when creating a transport, stay, or POI item.'}
         </p>
       ) : (
-        <div className="space-y-4">
-          <React.Suspense fallback={<div className="h-[420px] rounded-lg border border-slate-200 dark:border-slate-800 flex items-center justify-center text-sm text-slate-400">Loading map…</div>}>
-            <RouteMap points={displayPoints} />
-          </React.Suspense>
-          <Card className="p-4">
-            <ol className="list-decimal list-inside text-sm space-y-1 text-slate-700 dark:text-slate-300">
-              {displayPoints.map((p) => <li key={p.id}>{p.title}</li>)}
-            </ol>
-          </Card>
-        </div>
+        <LazyBoundary label="The map couldn’t load."><React.Suspense fallback={<div className="h-[420px] rounded-lg border border-slate-200 dark:border-slate-800 flex items-center justify-center text-sm text-slate-400">Loading map…</div>}>
+          <RouteMap points={displayPoints} height="fill" showList />
+        </React.Suspense></LazyBoundary>
       )}
     </div>
   );

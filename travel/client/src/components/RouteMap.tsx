@@ -1,4 +1,5 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { List, Maximize2, X } from "lucide-react";
 import { MapContainer, TileLayer, Marker, Polyline, CircleMarker, Tooltip, useMap, useMapEvents } from "react-leaflet";
 import L from "leaflet";
 import "leaflet/dist/leaflet.css";
@@ -31,13 +32,32 @@ const arrowIcon = (deg: number, color: string, size: number) => L.divIcon({
   iconSize: [size, size], iconAnchor: [size / 2, size / 2],
 });
 
-function FitToPoints({ points }: { points: MapPoint[] }) {
+function FitToPoints({ points, fitKey = 0 }: { points: MapPoint[]; fitKey?: number }) {
   const map = useMap();
   useEffect(() => {
     if (points.length === 0) return;
     if (points.length === 1) { map.setView([points[0].lat, points[0].lng], 13); return; }
     map.fitBounds(L.latLngBounds(points.flatMap((p) => [[p.lat, p.lng], ...(p.from ? [[p.from.lat, p.from.lng]] : [])] as [number, number][])), { padding: [56, 56] });
-  }, [points, map]);
+  }, [points, map, fitKey]);
+  return null;
+}
+
+/** Zooms to one stop picked from the locations list. */
+function FocusOn({ point }: { point: { lat: number; lng: number; seq: number } | null }) {
+  const map = useMap();
+  useEffect(() => { if (point) map.flyTo([point.lat, point.lng], Math.max(map.getZoom(), 14), { duration: 0.6 }); }, [point, map]);
+  return null;
+}
+
+/** Tells Leaflet to re-measure when the map box changes size (it only measures once on mount). */
+function ResizeWatcher() {
+  const map = useMap();
+  useEffect(() => {
+    const el = map.getContainer();
+    const ro = new ResizeObserver(() => map.invalidateSize());
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [map]);
   return null;
 }
 
@@ -174,15 +194,54 @@ function MapLayers({ points }: { points: MapPoint[] }) {
   );
 }
 
-export default function RouteMap({ points, height = 420 }: { points: MapPoint[]; height?: number }) {
+/** `height="fill"` makes the map take the rest of the window below where it starts (at least 420px). `showList` adds a Locations button with a list of the stops. */
+export default function RouteMap({ points, height = 420, showList = false }: { points: MapPoint[]; height?: number | "fill"; showList?: boolean }) {
+  const box = useRef<HTMLDivElement>(null);
+  const [fillHeight, setFillHeight] = useState(600);
+  const [listOpen, setListOpen] = useState(false);
+  const [focus, setFocus] = useState<{ lat: number; lng: number; seq: number } | null>(null);
+  const [fitKey, setFitKey] = useState(0);
+  useLayoutEffect(() => {
+    if (height !== "fill") return;
+    const measure = () => { if (box.current) setFillHeight(Math.max(420, Math.round(window.innerHeight * 0.75), window.innerHeight - box.current.getBoundingClientRect().top - 24)); };
+    measure();
+    window.addEventListener("resize", measure);
+    return () => window.removeEventListener("resize", measure);
+  }, [height]);
   if (points.length === 0) return null;
   return (
-    <div className="rounded-lg overflow-hidden border border-slate-200 dark:border-slate-800" style={{ height }}>
+    <div ref={box} className="relative rounded-lg overflow-hidden border border-slate-200 dark:border-slate-800" style={{ height: height === "fill" ? fillHeight : height }}>
       <MapContainer center={[points[0].lat, points[0].lng]} zoom={12} scrollWheelZoom style={{ height: "100%", width: "100%" }}>
         <TileLayer attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors' url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" />
         <MapLayers points={points} />
-        <FitToPoints points={points} />
+        <FitToPoints points={points} fitKey={fitKey} />
+        <FocusOn point={focus} />
+        <ResizeWatcher />
       </MapContainer>
+      {showList && (
+        <div className="absolute right-3 top-3 z-[1000] flex max-h-[calc(100%-1.5rem)] flex-col items-end gap-2">
+          <div className="flex gap-2">
+            <button type="button" onClick={() => { setFocus(null); setFitKey((k) => k + 1); }} title="Show all stops" className="flex items-center gap-1.5 rounded-md bg-white/95 px-2.5 py-1.5 text-xs font-medium text-slate-700 shadow ring-1 ring-slate-200 hover:bg-white dark:bg-slate-900/95 dark:text-slate-200 dark:ring-slate-700">
+              <Maximize2 className="h-3.5 w-3.5" />Show all
+            </button>
+            <button type="button" onClick={() => setListOpen((v) => !v)} aria-expanded={listOpen} className="flex items-center gap-1.5 rounded-md bg-white/95 px-2.5 py-1.5 text-xs font-medium text-slate-700 shadow ring-1 ring-slate-200 hover:bg-white dark:bg-slate-900/95 dark:text-slate-200 dark:ring-slate-700">
+              {listOpen ? <X className="h-3.5 w-3.5" /> : <List className="h-3.5 w-3.5" />}Locations ({points.length})
+            </button>
+          </div>
+          {listOpen && (
+            <ol className="w-72 max-w-[calc(100vw-5rem)] min-h-0 overflow-y-auto rounded-md bg-white/95 py-1 text-sm shadow-lg ring-1 ring-slate-200 dark:bg-slate-900/95 dark:ring-slate-700">
+              {points.map((p, i) => (
+                <li key={p.id}>
+                  <button type="button" onClick={() => setFocus({ lat: p.lat, lng: p.lng, seq: Date.now() })} className="flex w-full items-start gap-2 px-3 py-1.5 text-left hover:bg-slate-100 dark:hover:bg-slate-800">
+                    <span className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full text-[11px] font-semibold text-white" style={{ background: colorForDay(p.day) }}>{i + 1}</span>
+                    <span className="min-w-0 flex-1 text-slate-700 dark:text-slate-200">{p.title}{p.day != null && <span className="block text-[11px] text-slate-400">Day {p.day}</span>}</span>
+                  </button>
+                </li>
+              ))}
+            </ol>
+          )}
+        </div>
+      )}
     </div>
   );
 }
